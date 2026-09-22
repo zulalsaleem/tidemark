@@ -15,35 +15,129 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 
 class Base(DeclarativeBase):
     """Declarative base for all Tidemark ORM models."""
 
 
+class UTCDateTime(TypeDecorator):
+    """A datetime column that is always UTC-aware on the Python side.
+
+    SQLite has no native timezone-aware datetime type — values would
+    otherwise round-trip as naive datetimes. This stores naive UTC and
+    re-attaches `tzinfo=UTC` on read, and refuses to bind a naive input,
+    so every timestamp that comes out of the store is UTC-aware.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: dt.datetime | None, dialect) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("naive datetime given; all stored timestamps must be UTC-aware")
+        return value.astimezone(dt.UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: dt.datetime | None, dialect) -> dt.datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=dt.UTC)
+
+
 class Candle(Base):
-    """A single closed OHLCV candle for one asset/timeframe.
+    """A single closed OHLCV candle for one venue/symbol/timeframe.
 
     Tidemark only ever stores and evaluates closed candles — there is no
-    field for an in-progress candle, by design.
+    field for an in-progress candle, by design. Mixing venues within one
+    symbol's history is not allowed; see
+    docs/adr/0002-canonical-market-data-venue.md.
     """
 
     __tablename__ = "candles"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue", "symbol", "timeframe", "open_time", name="uq_candles_venue_symbol_tf_open"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    venue: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False, index=True)
     timeframe: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    open_time: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    close_time: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
+    open_time: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    close_time: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
     open: Mapped[float] = mapped_column(Float, nullable=False)
     high: Mapped[float] = mapped_column(Float, nullable=False)
     low: Mapped[float] = mapped_column(Float, nullable=False)
     close: Mapped[float] = mapped_column(Float, nullable=False)
     volume: Mapped[float] = mapped_column(Float, nullable=False)
+    fetched_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+
+
+class RejectedCandle(Base):
+    """A candle row that failed sanity checks and was never stored as a
+    `Candle`. Tidemark never silently "fixes" bad data — it records the
+    rejection with a reason instead.
+    """
+
+    __tablename__ = "rejected_candles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    timeframe: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    open_time: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    close_time: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    open: Mapped[float] = mapped_column(Float, nullable=False)
+    high: Mapped[float] = mapped_column(Float, nullable=False)
+    low: Mapped[float] = mapped_column(Float, nullable=False)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    rejected_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+
+
+class Run(Base):
+    """One execution of a data-layer command (backfill/update).
+
+    `status` is exactly one of COMPLETED, PARTIAL, or FAILED. A run that
+    fetched nothing new because the data was already current is
+    COMPLETED, not FAILED.
+    """
+
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    command: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    finished_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class RunSymbolStat(Base):
+    """Per symbol/timeframe counts for one `Run`."""
+
+    __tablename__ = "run_symbol_stats"
+    __table_args__ = (
+        UniqueConstraint("run_id", "symbol", "timeframe", name="uq_run_symbol_stats_run_symbol_tf"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String, ForeignKey("runs.run_id"), nullable=False, index=True
+    )
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String, nullable=False)
+    fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duplicates_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class Swing(Base):

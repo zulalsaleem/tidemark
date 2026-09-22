@@ -1,16 +1,26 @@
 """SQLite persistence via SQLAlchemy.
 
-Engine/session construction is plumbing and is implemented here. Read/write
-operations against the store are strategy-adjacent and are left as
-`NotImplementedError` until the corresponding rulebook-driven logic exists.
+Candle ingestion (Part C/D of Phase 1): idempotent upserts, per-candle
+sanity checks, rejected-candle recording, gap detection, and run
+bookkeeping. Reads/writes for swings, levels, and context records remain
+unimplemented — they land once the corresponding rulebook logic exists.
 """
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, create_engine
+import datetime as dt
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from tidemark.data.models import Base
+from tidemark.data.exchange import RawCandle
+from tidemark.data.models import Base, Candle, RejectedCandle, Run, RunSymbolStat
+from tidemark.data.timeframes import TIMEFRAME_DURATIONS
+
+VALID_RUN_STATUSES = {"COMPLETED", "PARTIAL", "FAILED"}
 
 
 def create_store_engine(database_url: str) -> Engine:
@@ -28,23 +38,238 @@ def get_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine)
 
 
-class TidemarkStore:
-    """Read/write access to candles, swings, levels, and context records.
+@dataclass(frozen=True)
+class CandleUpsertResult:
+    """Outcome of upserting one batch of candles for a symbol/timeframe."""
 
-    Not implemented in Phase 0 — this class defines the surface that later
-    phases will fill in once the corresponding rulebook logic exists.
+    fetched: int
+    inserted: int
+    duplicates_skipped: int
+    rejected: int
+
+
+def _validate_candle(candle: RawCandle) -> str | None:
+    """Return a rejection reason, or None if the candle is sane.
+
+    Never "fixes" a bad row — only classifies it.
     """
+    reasons = []
+    if not (candle.open > 0 and candle.high > 0 and candle.low > 0 and candle.close > 0):
+        reasons.append("non-positive price")
+    if candle.high < max(candle.open, candle.close):
+        reasons.append("high < max(open, close)")
+    if candle.low > min(candle.open, candle.close):
+        reasons.append("low > min(open, close)")
+    if candle.volume < 0:
+        reasons.append("volume < 0")
+    return "; ".join(reasons) if reasons else None
+
+
+class TidemarkStore:
+    """Read/write access to candles, runs, and (later) rulebook records."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+        self._session_factory = get_session_factory(engine)
 
-    def save_candles(self, candles: list) -> None:
-        """Persist a batch of closed candles."""
-        raise NotImplementedError
+    # -- candles ----------------------------------------------------------
 
-    def get_candles(self, asset: str, timeframe: str, limit: int) -> list:
-        """Fetch the most recent closed candles for an asset/timeframe."""
-        raise NotImplementedError
+    def upsert_candles(
+        self,
+        venue: str,
+        symbol: str,
+        timeframe: str,
+        candles: Sequence[RawCandle],
+        fetched_at: dt.datetime,
+    ) -> CandleUpsertResult:
+        """Validate and idempotently insert a batch of closed candles.
+
+        Invalid rows are rejected and recorded in `rejected_candles`
+        instead of being stored or "fixed". Running the same fetch twice
+        inserts zero new rows the second time.
+        """
+        fetched = len(candles)
+        rejected = 0
+        valid_rows = []
+
+        with self._session_factory() as session:
+            for candle in candles:
+                reason = _validate_candle(candle)
+                if reason is not None:
+                    rejected += 1
+                    session.add(
+                        RejectedCandle(
+                            venue=venue,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            open_time=candle.open_time,
+                            close_time=candle.close_time,
+                            open=candle.open,
+                            high=candle.high,
+                            low=candle.low,
+                            close=candle.close,
+                            volume=candle.volume,
+                            reason=reason,
+                            rejected_at=fetched_at,
+                        )
+                    )
+                    continue
+                valid_rows.append(
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "open_time": candle.open_time,
+                        "close_time": candle.close_time,
+                        "open": candle.open,
+                        "high": candle.high,
+                        "low": candle.low,
+                        "close": candle.close,
+                        "volume": candle.volume,
+                        "fetched_at": fetched_at,
+                    }
+                )
+
+            inserted = 0
+            if valid_rows:
+                stmt = sqlite_insert(Candle).values(valid_rows)
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=["venue", "symbol", "timeframe", "open_time"]
+                )
+                result = session.execute(stmt)
+                inserted = result.rowcount if result.rowcount and result.rowcount > 0 else 0
+
+            session.commit()
+
+        return CandleUpsertResult(
+            fetched=fetched,
+            inserted=inserted,
+            duplicates_skipped=len(valid_rows) - inserted,
+            rejected=rejected,
+        )
+
+    def get_candles(
+        self,
+        venue: str,
+        symbol: str,
+        timeframe: str,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+    ) -> list[Candle]:
+        """Fetch stored closed candles ordered oldest to newest.
+
+        `start` is inclusive, `end` is exclusive, both compare on
+        `open_time`.
+        """
+        with self._session_factory() as session:
+            stmt = select(Candle).where(
+                Candle.venue == venue, Candle.symbol == symbol, Candle.timeframe == timeframe
+            )
+            if start is not None:
+                stmt = stmt.where(Candle.open_time >= start)
+            if end is not None:
+                stmt = stmt.where(Candle.open_time < end)
+            stmt = stmt.order_by(Candle.open_time)
+            return list(session.scalars(stmt))
+
+    def latest_candle(self, venue: str, symbol: str, timeframe: str) -> Candle | None:
+        """Fetch the most recently closed stored candle, if any."""
+        with self._session_factory() as session:
+            stmt = (
+                select(Candle)
+                .where(
+                    Candle.venue == venue, Candle.symbol == symbol, Candle.timeframe == timeframe
+                )
+                .order_by(Candle.open_time.desc())
+                .limit(1)
+            )
+            return session.scalars(stmt).first()
+
+    def count_candles(self, venue: str, symbol: str, timeframe: str) -> int:
+        """Count stored candles for a venue/symbol/timeframe."""
+        with self._session_factory() as session:
+            stmt = (
+                select(func.count())
+                .select_from(Candle)
+                .where(
+                    Candle.venue == venue, Candle.symbol == symbol, Candle.timeframe == timeframe
+                )
+            )
+            return session.scalar(stmt) or 0
+
+    # -- gap detection ------------------------------------------------------
+
+    def find_gaps(self, venue: str, symbol: str, timeframe: str) -> list[dt.datetime]:
+        """Report missing `open_time`s between the first and last stored
+        candle. Never fabricates or interpolates candles — only reports.
+        """
+        duration = TIMEFRAME_DURATIONS[timeframe]
+        candles = self.get_candles(venue, symbol, timeframe)
+        if len(candles) < 2:
+            return []
+
+        existing = {c.open_time for c in candles}
+        last = candles[-1].open_time
+        expected = candles[0].open_time
+        missing: list[dt.datetime] = []
+        while expected < last:
+            if expected not in existing:
+                missing.append(expected)
+            expected += duration
+        return missing
+
+    # -- runs ---------------------------------------------------------------
+
+    def record_run(
+        self,
+        run_id: str,
+        command: str,
+        started_at: dt.datetime,
+        finished_at: dt.datetime,
+        status: str,
+        stats: dict[tuple[str, str], CandleUpsertResult],
+    ) -> None:
+        """Record a completed run and its per symbol/timeframe counts."""
+        if status not in VALID_RUN_STATUSES:
+            raise ValueError(f"invalid run status: {status!r}")
+
+        with self._session_factory() as session:
+            session.add(
+                Run(
+                    run_id=run_id,
+                    command=command,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    status=status,
+                )
+            )
+            for (symbol, timeframe), result in stats.items():
+                session.add(
+                    RunSymbolStat(
+                        run_id=run_id,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        fetched=result.fetched,
+                        inserted=result.inserted,
+                        duplicates_skipped=result.duplicates_skipped,
+                        rejected=result.rejected,
+                    )
+                )
+            session.commit()
+
+    def latest_run(self) -> Run | None:
+        """Fetch the most recently recorded run, if any."""
+        with self._session_factory() as session:
+            stmt = select(Run).order_by(Run.started_at.desc()).limit(1)
+            return session.scalars(stmt).first()
+
+    def run_symbol_stats(self, run_id: str) -> list[RunSymbolStat]:
+        """Fetch per symbol/timeframe stats for one run."""
+        with self._session_factory() as session:
+            stmt = select(RunSymbolStat).where(RunSymbolStat.run_id == run_id)
+            return list(session.scalars(stmt))
+
+    # -- not yet implemented (later phases) ----------------------------------
 
     def save_context_record(self, record: object) -> None:
         """Persist a Section 1 output record."""
