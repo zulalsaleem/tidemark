@@ -44,7 +44,10 @@ closed candles (exchange, read-only)
 
 Persistence (SQLite via SQLAlchemy) sits alongside this pipeline in
 `data/store.py`, holding candles, swings, levels, and emitted context
-records.
+records. Market data comes from `data/exchange.py`, a ccxt-backed client
+with no exchange credentials — see
+[docs/adr/0002-canonical-market-data-venue.md](docs/adr/0002-canonical-market-data-venue.md)
+for the canonical-venue rationale.
 
 ## How the rulebook works
 
@@ -65,20 +68,28 @@ Requires Python 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                        # install dependencies
-cp .env.example .env           # fill in Telegram/exchange config
+cp .env.example .env           # fill in Telegram config (market data needs no credentials)
 uv run tidemark --help         # verify the CLI is wired up
 uv run pytest                  # run the test suite
 uv run ruff check .            # lint
+
+# fetch and inspect market data (public, read-only)
+uv run tidemark data backfill --symbols BTC/USDT:USDT --timeframes 4h --days 7
+uv run tidemark data status
+uv run tidemark data gaps
 ```
 
 ## Project status
 
-**Phase 0 — repository skeleton.** Tooling, CI, data models, and
-documentation are in place. Strategy logic (indicators, swing/level
-detection, rulebook evaluation, data fetching, Telegram sending) is not
-yet implemented — modules raise `NotImplementedError` where that logic
-will go. Section 1 of the rulebook (HTF context) is locked at v1.0;
-Section 2 (1H behavior) is still in draft.
+**Phase 1 — data layer.** The market-data pipeline is implemented: a
+ccxt-backed exchange client (public data only, no credentials, closed
+candles only), idempotent SQLite storage with per-row sanity checks and
+gap detection, and `tidemark data backfill/update/gaps/status` CLI
+commands. Strategy logic (indicators, swing/level detection, Fibonacci,
+rulebook evaluation, Telegram sending) is still not implemented — those
+modules raise `NotImplementedError` where that logic will go. Section 1
+of the rulebook (HTF context) is locked at v1.0; Section 2 (1H behavior)
+is still in draft.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
