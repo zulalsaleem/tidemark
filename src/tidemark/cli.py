@@ -1,7 +1,8 @@
 """Tidemark CLI entrypoint.
 
-Read-only copilot: the CLI can evaluate the rulebook and emit alerts, but
-it never places orders and never touches exchange trading permissions.
+Read-only copilot: the CLI can fetch/store market data, evaluate the
+rulebook, and emit alerts, but it never places orders and never touches
+exchange trading permissions.
 """
 
 from __future__ import annotations
@@ -9,6 +10,11 @@ from __future__ import annotations
 import typer
 
 from tidemark import __version__
+from tidemark.config.settings import Settings, get_settings
+from tidemark.data.exchange import ExchangeClient
+from tidemark.data.ingest import RunOutcome, run_backfill, run_update
+from tidemark.data.store import TidemarkStore, create_store_engine, init_db
+from tidemark.data.timeframes import TIMEFRAMES
 
 app = typer.Typer(
     name="tidemark",
@@ -19,21 +25,173 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+data_app = typer.Typer(
+    name="data",
+    help="Market-data ingestion: backfill, update, gaps, status.",
+    no_args_is_help=True,
+)
+app.add_typer(data_app, name="data")
+
 
 @app.command()
 def run() -> None:
     """Evaluate the rulebook against closed candles and emit alerts.
 
-    Not implemented in Phase 0 — this is a repository/tooling skeleton
-    only. Strategy logic lands in a later phase.
+    Not implemented yet — rulebook evaluation lands in a later phase.
     """
-    raise NotImplementedError("Pipeline execution is not implemented in Phase 0.")
+    raise NotImplementedError("Rulebook evaluation is not implemented yet.")
 
 
 @app.command()
 def version() -> None:
     """Print the installed Tidemark version."""
     typer.echo(__version__)
+
+
+def _parse_csv(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def _store(settings: Settings) -> TidemarkStore:
+    engine = create_store_engine(settings.database_url)
+    init_db(engine)
+    return TidemarkStore(engine)
+
+
+def _print_run_outcome(outcome: RunOutcome) -> None:
+    typer.echo(f"run {outcome.run_id}: {outcome.status}")
+    for o in outcome.outcomes:
+        if o.error is not None:
+            typer.echo(f"  {o.symbol:<16} {o.timeframe:<5} FAILED: {o.error}")
+        else:
+            r = o.result
+            typer.echo(
+                f"  {o.symbol:<16} {o.timeframe:<5} "
+                f"fetched={r.fetched} inserted={r.inserted} "
+                f"duplicates={r.duplicates_skipped} rejected={r.rejected}"
+            )
+
+
+@data_app.command("backfill")
+def data_backfill(
+    symbols: str = typer.Option(
+        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    ),
+    timeframes: str = typer.Option(
+        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    ),
+    days: int = typer.Option(
+        None, "--days", help="Backfill depth in days; defaults to TIDEMARK_BACKFILL_DAYS."
+    ),
+) -> None:
+    """Backfill closed candles from the exchange into the store."""
+    settings = get_settings()
+    store = _store(settings)
+    exchange = ExchangeClient(venue=settings.venue)
+
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    timeframe_list = _parse_csv(timeframes) or list(TIMEFRAMES)
+    depth = days if days is not None else settings.backfill_days
+
+    outcome = run_backfill(store, exchange, settings.venue, symbol_list, timeframe_list, depth)
+    _print_run_outcome(outcome)
+
+
+@data_app.command("update")
+def data_update(
+    symbols: str = typer.Option(
+        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    ),
+    timeframes: str = typer.Option(
+        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    ),
+) -> None:
+    """Fetch closed candles from the last stored candle up to now."""
+    settings = get_settings()
+    store = _store(settings)
+    exchange = ExchangeClient(venue=settings.venue)
+
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    timeframe_list = _parse_csv(timeframes) or list(TIMEFRAMES)
+
+    outcome = run_update(
+        store,
+        exchange,
+        settings.venue,
+        symbol_list,
+        timeframe_list,
+        fallback_days=settings.backfill_days,
+    )
+    _print_run_outcome(outcome)
+
+
+@data_app.command("gaps")
+def data_gaps(
+    symbols: str = typer.Option(
+        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    ),
+    timeframes: str = typer.Option(
+        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    ),
+) -> None:
+    """Report missing candles per symbol/timeframe. Never fabricates data."""
+    settings = get_settings()
+    store = _store(settings)
+
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    timeframe_list = _parse_csv(timeframes) or list(TIMEFRAMES)
+
+    header = f"{'SYMBOL':<16} {'TIMEFRAME':<9} {'GAPS':<6} FIRST_MISSING"
+    typer.echo(header)
+    for symbol in symbol_list:
+        for timeframe in timeframe_list:
+            row_count = store.count_candles(settings.venue, symbol, timeframe)
+            if row_count < 2:
+                typer.echo(f"{symbol:<16} {timeframe:<9} {'-':<6} no data")
+                continue
+            gaps = store.find_gaps(settings.venue, symbol, timeframe)
+            first_missing = gaps[0].isoformat() if gaps else "-"
+            typer.echo(f"{symbol:<16} {timeframe:<9} {len(gaps):<6} {first_missing}")
+
+
+@data_app.command("status")
+def data_status(
+    symbols: str = typer.Option(
+        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    ),
+    timeframes: str = typer.Option(
+        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    ),
+) -> None:
+    """Show latest candle time, row counts, and the last run's status."""
+    settings = get_settings()
+    store = _store(settings)
+
+    last_run = store.latest_run()
+    if last_run is None:
+        typer.echo("last run: none yet")
+    else:
+        typer.echo(
+            f"last run: {last_run.run_id} ({last_run.command}) {last_run.status} "
+            f"started={last_run.started_at.isoformat()} "
+            f"finished={last_run.finished_at.isoformat()}"
+        )
+
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    timeframe_list = _parse_csv(timeframes) or list(TIMEFRAMES)
+
+    typer.echo("")
+    header = f"{'SYMBOL':<16} {'TIMEFRAME':<9} {'ROWS':<6} LATEST_CLOSE"
+    typer.echo(header)
+    for symbol in symbol_list:
+        for timeframe in timeframe_list:
+            row_count = store.count_candles(settings.venue, symbol, timeframe)
+            latest = store.latest_candle(settings.venue, symbol, timeframe)
+            latest_close = latest.close_time.isoformat() if latest else "no data"
+            typer.echo(f"{symbol:<16} {timeframe:<9} {row_count:<6} {latest_close}")
 
 
 def main() -> None:
