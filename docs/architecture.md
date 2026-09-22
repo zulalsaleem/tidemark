@@ -4,13 +4,21 @@
 
 ```
                  +----------------------------+
-                 |  exchange (read-only data) |
+                 |  data/exchange.py (ccxt)    |
+                 |  public data, no creds      |
                  +--------------+-------------+
                                 |  closed candles only
                                 v
                  +----------------------------+
+                 |  data/ingest.py             |
+                 |  fetch + upsert + run log   |
+                 +--------------+-------------+
+                                |
+                                v
+                 +----------------------------+
                  |  data/store.py (SQLite)     |
-                 |  candles, swings, levels,   |
+                 |  candles, rejected_candles, |
+                 |  runs, swings, levels,      |
                  |  context records            |
                  +--------------+-------------+
                                 |
@@ -53,10 +61,12 @@
 
 | Module | Responsibility |
 | --- | --- |
-| `config/settings.py` | Load configuration from environment variables (via `.env` in development). No secrets in code; secret fields are `SecretStr` and never logged. |
-| `data/models.py` | SQLAlchemy ORM models: `Candle`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. |
-| `data/store.py` | SQLite persistence: engine/session setup and CRUD against the above models. |
-| `data/exchange.py` | Read-only market-data client. Fetches closed candles only; no trading endpoints are ever called. |
+| `config/settings.py` | Load configuration from environment variables (via `.env` in development). No secrets in code; secret fields are `SecretStr` and never logged; no field may hold an exchange credential. |
+| `data/models.py` | SQLAlchemy ORM models: `Candle`, `RejectedCandle`, `Run`, `RunSymbolStat`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`. A `UTCDateTime` type keeps every stored timestamp UTC-aware despite SQLite having no native timezone type. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. |
+| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, and run bookkeeping. |
+| `data/exchange.py` | ccxt-backed market-data client. Venue is configuration (default `binanceusdm`; also works with `bitget`, `mexc`, ... unchanged). Constructed with no credentials — `apiKey`/`secret` are asserted empty. Fetches closed candles only, with bounded-retry backoff on transient network errors. |
+| `data/timeframes.py` | The stored timeframe set (5m, 15m, 1h, 4h, 1d, 1w) and their durations — the single source of truth shared by the exchange client, store, and CLI. |
+| `data/ingest.py` | Orchestrates exchange fetch + store upsert + run recording for `backfill`/`update`. One symbol/timeframe failing never aborts the others; run status is COMPLETED/PARTIAL/FAILED. |
 | `core/atr.py` | ATR(14) on 4H — the distance unit used throughout Section 1. |
 | `core/swings.py` | Fractal swing detection (`formed_at`/`confirmed_at`). |
 | `core/levels.py` | Swing clustering into levels/zones; previous day/week high & low. |
