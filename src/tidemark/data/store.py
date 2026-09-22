@@ -20,6 +20,7 @@ from tidemark.data.exchange import RawCandle
 from tidemark.data.models import Base, Candle, RejectedCandle, Run, RunSymbolStat
 from tidemark.data.timeframes import TIMEFRAME_DURATIONS
 
+RUNNING_STATUS = "RUNNING"
 VALID_RUN_STATUSES = {"COMPLETED", "PARTIAL", "FAILED"}
 
 
@@ -220,29 +221,43 @@ class TidemarkStore:
 
     # -- runs ---------------------------------------------------------------
 
-    def record_run(
-        self,
-        run_id: str,
-        command: str,
-        started_at: dt.datetime,
-        finished_at: dt.datetime,
-        status: str,
-        stats: dict[tuple[str, str], CandleUpsertResult],
-    ) -> None:
-        """Record a completed run and its per symbol/timeframe counts."""
-        if status not in VALID_RUN_STATUSES:
-            raise ValueError(f"invalid run status: {status!r}")
+    def start_run(self, run_id: str, command: str, started_at: dt.datetime) -> None:
+        """Insert a run row in the transient RUNNING status.
 
+        Callers must always follow this with `finish_run` — including on
+        the exception path, via try/finally — so a crash never leaves a
+        run with no row at all.
+        """
         with self._session_factory() as session:
             session.add(
                 Run(
                     run_id=run_id,
                     command=command,
                     started_at=started_at,
-                    finished_at=finished_at,
-                    status=status,
+                    finished_at=None,
+                    status=RUNNING_STATUS,
                 )
             )
+            session.commit()
+
+    def finish_run(
+        self,
+        run_id: str,
+        finished_at: dt.datetime,
+        status: str,
+        stats: dict[tuple[str, str], CandleUpsertResult],
+    ) -> None:
+        """Update a RUNNING row with its final status and per
+        symbol/timeframe counts. `status` must be COMPLETED, PARTIAL, or
+        FAILED — RUNNING is only ever set by `start_run`.
+        """
+        if status not in VALID_RUN_STATUSES:
+            raise ValueError(f"invalid run status: {status!r}")
+
+        with self._session_factory() as session:
+            run = session.execute(select(Run).where(Run.run_id == run_id)).scalar_one()
+            run.finished_at = finished_at
+            run.status = status
             for (symbol, timeframe), result in stats.items():
                 session.add(
                     RunSymbolStat(
@@ -258,10 +273,21 @@ class TidemarkStore:
             session.commit()
 
     def latest_run(self) -> Run | None:
-        """Fetch the most recently recorded run, if any."""
+        """Fetch the most recently started run, if any (any status)."""
         with self._session_factory() as session:
             stmt = select(Run).order_by(Run.started_at.desc()).limit(1)
             return session.scalars(stmt).first()
+
+    def running_runs(self) -> list[Run]:
+        """Fetch all runs still in the transient RUNNING status.
+
+        A RUNNING row that has been sitting for a long time did not
+        reach `finish_run` — most likely the process that started it
+        crashed or was killed.
+        """
+        with self._session_factory() as session:
+            stmt = select(Run).where(Run.status == RUNNING_STATUS).order_by(Run.started_at)
+            return list(session.scalars(stmt))
 
     def run_symbol_stats(self, run_id: str) -> list[RunSymbolStat]:
         """Fetch per symbol/timeframe stats for one run."""

@@ -105,9 +105,10 @@ class RejectedCandle(Base):
 class Run(Base):
     """One execution of a data-layer command (backfill/update).
 
-    `status` is exactly one of COMPLETED, PARTIAL, or FAILED. A run that
-    fetched nothing new because the data was already current is
-    COMPLETED, not FAILED.
+    `status` starts as the transient RUNNING and ends at exactly one of
+    COMPLETED, PARTIAL, or FAILED. A run that fetched nothing new because
+    the data was already current is COMPLETED, not FAILED. `finished_at`
+    is null while a run is still RUNNING.
     """
 
     __tablename__ = "runs"
@@ -116,7 +117,7 @@ class Run(Base):
     run_id: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
     command: Mapped[str] = mapped_column(String, nullable=False)
     started_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
-    finished_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
 
 
