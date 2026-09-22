@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=2.2",
     "typer>=0.12",
     "pydantic-settings>=2.4",
+    "ccxt>=4.5.82",
 ]
 
 [project.scripts]
