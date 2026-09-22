@@ -31,8 +31,7 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
 
-    # Market data (read-only; no exchange trading permissions)
-    exchange_api_key: SecretStr | None = None
+    # Market data (read-only, public endpoints only)
     exchange_base_url: str | None = None
 
     # Storage

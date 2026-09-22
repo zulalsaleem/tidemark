@@ -14,9 +14,8 @@ class ExchangeClient:
     Not implemented in Phase 0.
     """
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None) -> None:
+    def __init__(self, base_url: str | None = None) -> None:
         self._base_url = base_url
-        self._api_key = api_key
 
     def fetch_closed_candles(self, asset: str, timeframe: str, limit: int) -> list:
         """Fetch the most recent *closed* candles for an asset/timeframe.
