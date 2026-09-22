@@ -7,6 +7,7 @@ import datetime as dt
 import ccxt
 import pytest
 
+from tidemark.data import ingest as ingest_module
 from tidemark.data.exchange import ExchangeClient, RawCandle
 from tidemark.data.ingest import run_backfill, run_update
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
@@ -128,3 +129,28 @@ def test_run_update_without_prior_data_uses_fallback_lookback(store: TidemarkSto
 
     assert outcome.status == "COMPLETED"
     assert store.count_candles(VENUE, "BTC/USDT:USDT", "4h") == 1
+
+
+def test_crash_mid_run_leaves_a_failed_row_not_no_row(store: TidemarkStore, monkeypatch) -> None:
+    """An exception escaping `_execute` (not a per-symbol failure caught by
+    `_fetch_and_store`) must still leave a Run row, and that row must be
+    FAILED rather than stuck RUNNING or missing entirely.
+    """
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(ingest_module, "_fetch_and_store", boom)
+
+    now = dt.datetime(2026, 9, 22, 12, tzinfo=dt.UTC)
+    fake = _FakeExchange(rows_by_symbol={})
+    exchange = ExchangeClient(exchange=fake, now_fn=lambda: now)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_backfill(store, exchange, VENUE, ["BTC/USDT:USDT"], ["4h"], days=1, now=now)
+
+    run = store.latest_run()
+    assert run is not None
+    assert run.status == "FAILED"
+    assert run.finished_at is not None
+    assert store.running_runs() == []

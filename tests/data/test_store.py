@@ -122,20 +122,37 @@ def test_stored_timestamps_are_utc_aware(store: TidemarkStore) -> None:
     assert candle.open_time == base
 
 
-def test_record_run_rejects_invalid_status(store: TidemarkStore) -> None:
+def test_start_run_inserts_running_row(store: TidemarkStore) -> None:
+    started = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+
+    store.start_run("run-1", "backfill", started)
+
+    run = store.latest_run()
+    assert run is not None
+    assert run.run_id == "run-1"
+    assert run.status == "RUNNING"
+    assert run.finished_at is None
+    assert run.started_at.tzinfo is not None
+
+    [running] = store.running_runs()
+    assert running.run_id == "run-1"
+
+
+def test_finish_run_rejects_invalid_status(store: TidemarkStore) -> None:
     now = dt.datetime.now(dt.UTC)
+    store.start_run("run-bad", "backfill", now)
     with pytest.raises(ValueError, match="invalid run status"):
-        store.record_run(
-            run_id="run-bad",
-            command="backfill",
-            started_at=now,
-            finished_at=now,
-            status="BOGUS",
-            stats={},
-        )
+        store.finish_run(run_id="run-bad", finished_at=now, status="BOGUS", stats={})
 
 
-def test_record_run_and_latest_run(store: TidemarkStore) -> None:
+def test_finish_run_rejects_running_as_a_final_status(store: TidemarkStore) -> None:
+    now = dt.datetime.now(dt.UTC)
+    store.start_run("run-bad", "backfill", now)
+    with pytest.raises(ValueError, match="invalid run status"):
+        store.finish_run(run_id="run-bad", finished_at=now, status="RUNNING", stats={})
+
+
+def test_start_then_finish_run_and_latest_run(store: TidemarkStore) -> None:
     started = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
     finished = started + dt.timedelta(minutes=1)
     stats = {
@@ -144,15 +161,28 @@ def test_record_run_and_latest_run(store: TidemarkStore) -> None:
         ),
     }
 
-    store.record_run("run-1", "backfill", started, finished, "COMPLETED", stats)
+    store.start_run("run-1", "backfill", started)
+    store.finish_run("run-1", finished, "COMPLETED", stats)
 
     run = store.latest_run()
     assert run is not None
     assert run.run_id == "run-1"
     assert run.status == "COMPLETED"
     assert run.started_at.tzinfo is not None
+    assert run.finished_at is not None
     assert run.finished_at.tzinfo is not None
+    assert store.running_runs() == []
 
     [stat] = store.run_symbol_stats("run-1")
     assert stat.symbol == SYMBOL
     assert stat.inserted == 5
+
+
+def test_running_runs_excludes_finished_ones(store: TidemarkStore) -> None:
+    now = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.start_run("run-done", "backfill", now)
+    store.finish_run("run-done", now, "COMPLETED", {})
+    store.start_run("run-stuck", "update", now)
+
+    [running] = store.running_runs()
+    assert running.run_id == "run-stuck"

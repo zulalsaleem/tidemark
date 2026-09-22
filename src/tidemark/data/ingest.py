@@ -93,26 +93,35 @@ def _execute(
 ) -> RunOutcome:
     run_id = uuid.uuid4().hex
     started_at = now
+    store.start_run(run_id, command, started_at)
 
-    outcomes = [
-        _fetch_and_store(
-            store, exchange, venue, symbol, timeframe, since_fn(symbol, timeframe), now
-        )
-        for symbol in symbols
-        for timeframe in timeframes
-    ]
+    # If an exception escapes below, `status` stays FAILED and `finally`
+    # still records that — a crash mid-run must never leave a RUNNING row
+    # with no final update, or no row at all.
+    status = "FAILED"
+    outcomes: list[SymbolTimeframeOutcome] = []
+    stats: dict[tuple[str, str], CandleUpsertResult] = {}
+    try:
+        outcomes = [
+            _fetch_and_store(
+                store, exchange, venue, symbol, timeframe, since_fn(symbol, timeframe), now
+            )
+            for symbol in symbols
+            for timeframe in timeframes
+        ]
 
-    fail_count = sum(1 for o in outcomes if o.error is not None)
-    success_count = len(outcomes) - fail_count
-    if fail_count == 0:
-        status = "COMPLETED"
-    elif success_count == 0:
-        status = "FAILED"
-    else:
-        status = "PARTIAL"
+        fail_count = sum(1 for o in outcomes if o.error is not None)
+        success_count = len(outcomes) - fail_count
+        if fail_count == 0:
+            status = "COMPLETED"
+        elif success_count == 0:
+            status = "FAILED"
+        else:
+            status = "PARTIAL"
 
-    stats = {(o.symbol, o.timeframe): o.result for o in outcomes if o.result is not None}
-    store.record_run(run_id, command, started_at, now, status, stats)
+        stats = {(o.symbol, o.timeframe): o.result for o in outcomes if o.result is not None}
+    finally:
+        store.finish_run(run_id, now, status, stats)
 
     return RunOutcome(run_id=run_id, status=status, outcomes=outcomes)
 

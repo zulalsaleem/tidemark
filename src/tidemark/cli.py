@@ -7,6 +7,8 @@ exchange trading permissions.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import typer
 
 from tidemark import __version__
@@ -31,6 +33,8 @@ data_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(data_app, name="data")
+
+STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
 
 @app.command()
@@ -170,14 +174,28 @@ def data_status(
     settings = get_settings()
     store = _store(settings)
 
+    now = dt.datetime.now(dt.UTC)
+    running = store.running_runs()
+    if running:
+        typer.echo("running:")
+        for r in running:
+            stale = (
+                " — STALE — likely crashed" if now - r.started_at > STALE_RUNNING_THRESHOLD else ""
+            )
+            typer.echo(
+                f"  {r.run_id} ({r.command}) RUNNING since={r.started_at.isoformat()}{stale}"
+            )
+        typer.echo("")
+
     last_run = store.latest_run()
     if last_run is None:
         typer.echo("last run: none yet")
     else:
+        finished = last_run.finished_at.isoformat() if last_run.finished_at is not None else "-"
         typer.echo(
             f"last run: {last_run.run_id} ({last_run.command}) {last_run.status} "
             f"started={last_run.started_at.isoformat()} "
-            f"finished={last_run.finished_at.isoformat()}"
+            f"finished={finished}"
         )
 
     symbol_list = _parse_csv(symbols) or settings.symbol_list()
