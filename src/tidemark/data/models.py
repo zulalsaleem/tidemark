@@ -155,8 +155,8 @@ class Swing(Base):
     timeframe: Mapped[str] = mapped_column(String, nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String, nullable=False)  # e.g. HH, HL, LH, LL
     price: Mapped[float] = mapped_column(Float, nullable=False)
-    formed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    confirmed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    formed_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    confirmed_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     fractal_n: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
@@ -179,7 +179,7 @@ class Level(Base):
     touches: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_major: Mapped[bool] = mapped_column(nullable=False, default=False)
     source: Mapped[str] = mapped_column(String, nullable=False)
-    formed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    formed_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
 class ContextRecord(Base):
@@ -193,9 +193,7 @@ class ContextRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    evaluated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
+    evaluated_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
     rule_version: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
     watch: Mapped[str] = mapped_column(String, nullable=False)
@@ -218,6 +216,6 @@ class JournalEntry(Base):
     context_record_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("context_records.id"), nullable=False
     )
-    recorded_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     rule_version: Mapped[str] = mapped_column(String, nullable=False)
     note: Mapped[str] = mapped_column(String, nullable=False)
