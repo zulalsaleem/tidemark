@@ -31,8 +31,17 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
 
-    # Market data (read-only, public endpoints only)
-    exchange_base_url: str | None = None
+    # Market data (read-only, public endpoints only; ccxt venue id, e.g.
+    # "binanceusdm", "bitget", "mexc" — see docs/adr/0002)
+    venue: str = "binanceusdm"
+
+    # Comma-separated ccxt unified perpetual symbols, e.g. "BTC/USDT:USDT".
+    # The rule for selecting a larger universe than this default is
+    # NOT_DEFINED — see docs/architecture.md.
+    symbols: str = "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT"
+
+    # Default backfill depth in days.
+    backfill_days: int = 180
 
     # Storage
     database_url: str = "sqlite:///tidemark.db"
@@ -42,6 +51,10 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+
+    def symbol_list(self) -> list[str]:
+        """Parse `symbols` into a trimmed, non-empty list."""
+        return [s.strip() for s in self.symbols.split(",") if s.strip()]
 
 
 def get_settings() -> Settings:

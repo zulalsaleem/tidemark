@@ -67,6 +67,13 @@
 | `notify/telegram.py` | Sends read-only alerts to Telegram. No order-placement code path exists anywhere in this project. |
 | `cli.py` | Typer entrypoint wiring the above together. |
 
+## TODO
+
+- Symbol universe: the default set (`TIDEMARK_SYMBOLS`) is BTC, ETH, SOL,
+  XRP, and DOGE perpetuals. The rule for selecting a larger universe is
+  `NOT_DEFINED` in `docs/rulebook/` — do not invent one. Ask the rulebook
+  author before expanding beyond the configured list.
+
 ## Design constraints (see `CLAUDE.md` for the full list)
 
 - Closed candles only, everywhere — no calculation may see future information.

@@ -9,6 +9,13 @@ def test_settings_load_with_defaults(monkeypatch) -> None:
     assert settings.telegram_bot_token is None
     assert settings.database_url == "sqlite:///tidemark.db"
     assert settings.rulebook_dir == "docs/rulebook"
+    assert settings.venue == "binanceusdm"
+    assert settings.backfill_days == 180
+
+
+def test_symbol_list_parses_and_trims_csv() -> None:
+    settings = Settings(_env_file=None, symbols=" BTC/USDT:USDT ,ETH/USDT:USDT,, ")
+    assert settings.symbol_list() == ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
 
 def test_secret_fields_never_render_in_repr() -> None:
