@@ -214,14 +214,34 @@ class ContextRecord(Base):
 
 
 class JournalEntry(Base):
-    """An append-only observation log entry (see `journal/records.py`)."""
+    """An append-only research record: one row per Section 1 evaluation,
+    including every WAIT (see `journal/records.py`).
+
+    Never updated after insert, with one narrow exception: `alert_sent`
+    and `alert_reason`, set once the change detector and Telegram send
+    (if any) have run for this evaluation — never the evaluation fields
+    themselves (state, watch, grade, reason_code, active_levels, fib,
+    swings_used), which are fixed at insert time.
+    """
 
     __tablename__ = "journal_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "asset", "evaluated_at", "rule_version", name="uq_journal_asset_evaluated_at_rule"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    context_record_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("context_records.id"), nullable=False
-    )
+    asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    evaluated_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
     recorded_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     rule_version: Mapped[str] = mapped_column(String, nullable=False)
-    note: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    watch: Mapped[str] = mapped_column(String, nullable=False)
+    grade: Mapped[str | None] = mapped_column(String, nullable=True)
+    reason_code: Mapped[str] = mapped_column(String, nullable=False)
+    active_levels: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    fib: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    swings_used: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    alert_sent: Mapped[bool] = mapped_column(nullable=False, default=False)
+    alert_reason: Mapped[str | None] = mapped_column(String, nullable=True)

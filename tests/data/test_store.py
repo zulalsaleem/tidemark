@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import inspect
 
 from tidemark.data.exchange import RawCandle
-from tidemark.data.models import ContextRecord, RejectedCandle
+from tidemark.data.models import ContextRecord, JournalEntry, RejectedCandle
 from tidemark.data.store import CandleUpsertResult, TidemarkStore, create_store_engine, init_db
 
 VENUE = "binanceusdm"
@@ -305,3 +305,126 @@ def test_reading_back_a_v1_0_record_does_not_mutate_its_rule_version(
     assert {record.rule_version for record in history} == {"section-01-v1.0", "section-01-v1.1"}
     v1_0_record = next(r for r in history if r.rule_version == "section-01-v1.0")
     assert v1_0_record.state == "BULLISH"  # the original _context_record default, untouched
+
+
+# -- journal (Phase 3) --------------------------------------------------------
+
+
+def _journal_entry(evaluated_at: dt.datetime, state: str = "BULLISH", **overrides) -> JournalEntry:
+    defaults = dict(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        recorded_at=evaluated_at + dt.timedelta(seconds=5),
+        rule_version="section-01-v1.1",
+        state=state,
+        watch="LONG_WATCH",
+        grade="B",
+        reason_code="MAJOR_SUPPORT",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+        alert_sent=False,
+        alert_reason=None,
+    )
+    defaults.update(overrides)
+    return JournalEntry(**defaults)
+
+
+def test_save_journal_entry_inserts_a_new_row(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+
+    result = store.save_journal_entry(_journal_entry(evaluated_at))
+
+    assert result.inserted is True
+    assert len(store.journal_history(SYMBOL)) == 1
+
+
+def test_save_journal_entry_is_idempotent_on_repeat(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+
+    first = store.save_journal_entry(_journal_entry(evaluated_at, state="BULLISH"))
+    second = store.save_journal_entry(_journal_entry(evaluated_at, state="BEARISH"))
+
+    assert first.inserted is True
+    assert second.inserted is False
+    # Append-only: unlike ContextRecord, the repeat's differing state is
+    # NOT written back - the original row is returned untouched.
+    assert second.entry.state == "BULLISH"
+
+    history = store.journal_history(SYMBOL)
+    assert len(history) == 1
+    assert history[0].state == "BULLISH"
+
+
+def test_save_journal_entry_keys_on_asset_evaluated_at_and_rule_version(
+    store: TidemarkStore,
+) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_journal_entry(_journal_entry(evaluated_at, rule_version="section-01-v1.0"))
+    store.save_journal_entry(_journal_entry(evaluated_at, rule_version="section-01-v1.1"))
+
+    assert len(store.journal_history(SYMBOL)) == 2
+
+
+def test_latest_journal_entry_scoped_to_rule_version(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_journal_entry(_journal_entry(base, rule_version="section-01-v1.0"))
+    store.save_journal_entry(
+        _journal_entry(base + dt.timedelta(hours=4), rule_version="section-01-v1.1")
+    )
+
+    latest_v1_0 = store.latest_journal_entry(SYMBOL, "section-01-v1.0")
+    latest_v1_1 = store.latest_journal_entry(SYMBOL, "section-01-v1.1")
+
+    assert latest_v1_0 is not None
+    assert latest_v1_0.evaluated_at == base
+    assert latest_v1_1 is not None
+    assert latest_v1_1.evaluated_at == base + dt.timedelta(hours=4)
+
+
+def test_latest_journal_entry_none_when_missing(store: TidemarkStore) -> None:
+    assert store.latest_journal_entry(SYMBOL, "section-01-v1.1") is None
+
+
+def test_record_alert_outcome_updates_only_alert_fields(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    result = store.save_journal_entry(_journal_entry(evaluated_at, state="BULLISH", grade="B"))
+
+    store.record_alert_outcome(result.entry.id, alert_sent=True, alert_reason="WATCH_OPENED")
+
+    [entry] = store.journal_history(SYMBOL)
+    assert entry.alert_sent is True
+    assert entry.alert_reason == "WATCH_OPENED"
+    # Nothing else on the row moved.
+    assert entry.state == "BULLISH"
+    assert entry.grade == "B"
+
+
+def test_a_telegram_failure_leaves_the_journal_row_intact(store: TidemarkStore) -> None:
+    """PART E: a Telegram failure still leaves the journal row intact,
+    with alert_sent=false and the attempted reason recorded."""
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    result = store.save_journal_entry(_journal_entry(evaluated_at, state="BULLISH"))
+
+    # Simulate a failed send: alert_sent=False, but the reason the change
+    # detector produced is still recorded.
+    store.record_alert_outcome(result.entry.id, alert_sent=False, alert_reason="WATCH_OPENED")
+
+    [entry] = store.journal_history(SYMBOL)
+    assert entry.alert_sent is False
+    assert entry.alert_reason == "WATCH_OPENED"
+    assert entry.state == "BULLISH"  # the evaluation itself is untouched
+
+
+def test_journal_alerts_only_returns_sent_rows(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    no_alert = store.save_journal_entry(_journal_entry(base))
+    sent_alert = store.save_journal_entry(_journal_entry(base + dt.timedelta(hours=4)))
+    store.record_alert_outcome(sent_alert.entry.id, alert_sent=True, alert_reason="WATCH_OPENED")
+    store.record_alert_outcome(no_alert.entry.id, alert_sent=False, alert_reason=None)
+
+    alerts = store.journal_alerts()
+
+    assert len(alerts) == 1
+    assert alerts[0].evaluated_at == base + dt.timedelta(hours=4)
+    assert alerts[0].alert_reason == "WATCH_OPENED"
