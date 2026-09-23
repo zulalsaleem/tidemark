@@ -17,6 +17,7 @@ failure here (see `journal/records.py` and PART D wiring in `cli.py`).
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import time
@@ -29,6 +30,7 @@ from pydantic import SecretStr
 
 from tidemark.context.htf import BEARISH, BULLISH, LONG_WATCH, MATRIX_ROW_TEXT
 from tidemark.data.models import ContextRecord
+from tidemark.health.checks import FAIL, OK, WARN, HealthReport, format_age
 from tidemark.journal.changes import (
     GRADE_DOWNGRADED,
     GRADE_UPGRADED,
@@ -100,6 +102,65 @@ def build_message(record: ContextRecord, alert_reason: str, symbol: str) -> str:
     header = _header(alert_reason, record, display)
     body = "\n".join(_body_lines(record))
     return f"{header}\n\n{body}\n\nRulebook: {record.rule_version}\n\n{DISCLAIMER}"
+
+
+_HEARTBEAT_HEADERS = {
+    OK: ("✅", "Tidemark healthy"),
+    WARN: ("⚠️", "Tidemark degraded"),
+    FAIL: ("❌", "Tidemark unhealthy"),
+}
+
+
+def _fmt_ts(value: dt.datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def build_heartbeat_message(report: HealthReport) -> str:
+    """Render the health/PART C heartbeat shape. Unlike `build_message`,
+    this carries no support/resistance/fib content and no "context only"
+    disclaimer — it reports system status, not a trading signal, so
+    there is nothing here for that disclaimer to negate. Never includes
+    entry/stop/target/R:R language, per the standing rule.
+    """
+    emoji, heading = _HEARTBEAT_HEADERS[report.status]
+
+    if report.last_candle_close_time is not None:
+        age = format_age(report.generated_at - report.last_candle_close_time)
+        candle_line = f"Last 4H candle: {_fmt_ts(report.last_candle_close_time)} ({age} ago)"
+    else:
+        candle_line = "Last 4H candle: none recorded"
+
+    if report.last_evaluation_recorded_at is not None:
+        evaluation_line = (
+            f"Last evaluation: {_fmt_ts(report.last_evaluation_recorded_at)} — "
+            f"{report.last_evaluation_state} / {report.last_evaluation_watch}"
+        )
+    else:
+        evaluation_line = "Last evaluation: none recorded"
+
+    run_line = f"Last run: {report.last_run_status or 'none recorded'}"
+    gaps_line = f"Gaps: {'none' if report.total_gaps == 0 else report.total_gaps}"
+    journal_line = f"Journal: {report.journal_count} entries"
+
+    lines = [
+        f"{emoji} {heading}",
+        "",
+        candle_line,
+        evaluation_line,
+        run_line,
+        gaps_line,
+        journal_line,
+    ]
+
+    if report.status != OK:
+        failing = [c for c in report.checks if c.status != OK]
+        lines.append("")
+        lines.append("Failing checks:")
+        lines.extend(f"- {c.name}: {c.detail}" for c in failing)
+
+    lines.append("")
+    lines.append(f"Rulebook: {report.rule_version}")
+    return "\n".join(lines)
 
 
 def _http_send(token: str, chat_id: str, text: str) -> None:
