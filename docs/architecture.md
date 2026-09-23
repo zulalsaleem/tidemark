@@ -33,7 +33,7 @@
                                 v
                  +----------------------------+
                  |  context/htf.py             |
-                 |  Section 1 (4H, LOCKED v1.0)|
+                 |  Section 1 (4H, LOCKED v1.1)|
                  |  recalculated at every       |
                  |  4H close                    |
                  +--------------+-------------+
@@ -73,7 +73,7 @@
 | `core/swings.py` | Fractal swing detection (N=2), each swing storing `formed_at`/`confirmed_at` separately; `confirmed_swings_as_of` is the only way downstream code sees a swing. |
 | `core/levels.py` | Swing clustering into support/resistance levels/zones (0.5x ATR cluster distance, 120-candle lookback); previous day/week high & low. |
 | `core/fib.py` | Retracement leg detection (min 2x ATR), the 0.500-0.786 Fib zone, and invalidation on a 4H close beyond the leg start. |
-| `context/htf.py` | Section 1 — full state machine (bias, break, broken-state persistence) and the 9-row decision matrix against 4H closes; see [ADR 0003](adr/0003-rulebook-as-single-source-of-truth.md). |
+| `context/htf.py` | Section 1 — full state machine (bias, break, broken-state persistence) and the 9-row decision matrix against 4H closes; see [ADR 0003](adr/0003-rulebook-as-single-source-of-truth.md). Level role (support/resistance) is computed fresh each evaluation via `core.levels.level_role`, per v1.1's RULE 1.7a — see [ADR 0004](adr/0004-dynamic-level-role.md). |
 | `context/mtf.py` | Section 2 — 1H behavior. Currently DRAFT/PENDING; not yet active. |
 | `journal/records.py` | Append-only log of every evaluation run, including runs where no setup is found. |
 | `notify/telegram.py` | Sends read-only alerts to Telegram. No order-placement code path exists anywhere in this project. |

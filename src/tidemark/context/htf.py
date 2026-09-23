@@ -19,7 +19,7 @@ from tidemark.core import levels as levels_module
 from tidemark.core.swings import HIGH, LOW, confirmed_swings_as_of, find_swings
 from tidemark.data.models import ContextRecord, Level, Swing
 
-RULE_VERSION = "section-01-v1.0"
+RULE_VERSION = "section-01-v1.1"
 
 # Structural bias states.
 INSUFFICIENT_STRUCTURE = "INSUFFICIENT_STRUCTURE"
@@ -155,9 +155,16 @@ def _holds_zone(candle: pd.Series, level: Level, *, is_support: bool) -> bool:
     return touched and candle["close"] <= level.zone_high
 
 
-def _level_to_dict(level: Level) -> dict:
+def _level_to_dict(level: Level, close: float) -> dict:
+    # "role" (Section 1 v1.1, RULE 1.7a) is computed fresh here, from this
+    # evaluation's close — it is never read from `level.kind`, which is a
+    # permanent fact about the level's origin (which swing type or which
+    # half of an OHLC pair produced it), not its current role. `source`
+    # already names that origin precisely (e.g. "swing_high_cluster"), so
+    # `kind` is intentionally left out of this output to avoid it being
+    # mistaken for role.
     return {
-        "kind": level.kind,
+        "role": levels_module.level_role(level, close),
         "price": level.price,
         "zone_low": level.zone_low,
         "zone_high": level.zone_high,
@@ -250,15 +257,20 @@ def evaluate(
     if candles_1w is not None and len(candles_1w) > 0:
         active_levels += levels_module.prev_period_levels(candles_1w, "week", atr_value)
 
+    # Section 1 v1.1, RULE 1.7a: a level's role is evaluated fresh here
+    # against this candle's close, never read from a static kind/origin —
+    # a level born from a swing high can hold as SUPPORT if price has
+    # since moved above it.
+    close = latest_candle["close"]
     holds_major_support = any(
-        level.kind == levels_module.SUPPORT
-        and level.is_major
+        level.is_major
+        and levels_module.level_role(level, close) == levels_module.SUPPORT
         and _holds_zone(latest_candle, level, is_support=True)
         for level in active_levels
     )
     holds_major_resistance = any(
-        level.kind == levels_module.RESISTANCE
-        and level.is_major
+        level.is_major
+        and levels_module.level_role(level, close) == levels_module.RESISTANCE
         and _holds_zone(latest_candle, level, is_support=False)
         for level in active_levels
     )
@@ -270,7 +282,7 @@ def evaluate(
     elif result.state == BEARISH:
         leg = fib_module.find_valid_leg(confirmed, atr_value, fib_module.BEARISH, candles_4h)
     if leg is not None and leg.invalidated_at is None:
-        price_in_fib_zone = fib_module.in_fib_zone(latest_candle["close"], leg)
+        price_in_fib_zone = fib_module.in_fib_zone(close, leg)
 
     state = result.state
     if state == INSUFFICIENT_STRUCTURE:
@@ -302,7 +314,7 @@ def evaluate(
         watch=watch,
         grade=grade,
         reason_code=reason_code,
-        active_levels=[_level_to_dict(level) for level in active_levels],
-        fib=_fib_to_dict(leg, latest_candle["close"]),
+        active_levels=[_level_to_dict(level, close) for level in active_levels],
+        fib=_fib_to_dict(leg, close),
         swings_used=swings_used,
     )

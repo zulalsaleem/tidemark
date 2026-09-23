@@ -410,7 +410,7 @@ def context_explain(symbol: str = typer.Option(..., "--symbol")) -> None:
     for level in record.active_levels:
         major = "major" if level["is_major"] else "minor"
         typer.echo(
-            f"  {level['kind']:10} {level['price']:.2f}  "
+            f"  {level['role']:10} {level['price']:.2f}  "
             f"zone[{level['zone_low']:.2f},{level['zone_high']:.2f}]  "
             f"touches={level['touches']}  {major}  source={level['source']}"
         )

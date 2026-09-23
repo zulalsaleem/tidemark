@@ -277,14 +277,14 @@ def test_row9_not_in_zone() -> None:
 
 
 def test_rule_version_is_locked_section_identifier() -> None:
-    assert htf.RULE_VERSION == "section-01-v1.0"
+    assert htf.RULE_VERSION == "section-01-v1.1"
 
 
 def test_output_record_carries_rule_version_and_swings_used() -> None:
     candles = _append(_candles(_BULLISH_BASE), [135])
     record = htf.evaluate("BTCUSDT", candles, atr_value=ATR)
 
-    assert record.rule_version == "section-01-v1.0"
+    assert record.rule_version == "section-01-v1.1"
     assert record.asset == "BTCUSDT"
     assert len(record.swings_used) == 4
     for swing in record.swings_used:
@@ -295,3 +295,47 @@ def test_output_record_carries_rule_version_and_swings_used() -> None:
 def test_candles_4h_required() -> None:
     with pytest.raises(ValueError):
         htf.evaluate("BTCUSDT", pd.DataFrame(columns=["high", "low", "close", "close_time"]), 2.0)
+
+
+# --- Section 1 v1.1, RULE 1.7a: dynamic level role -------------------------
+
+
+def test_swing_high_origin_level_holds_as_support_once_price_moves_above_it() -> None:
+    """The crux of v1.1: a level whose ORIGIN is a swing-high cluster (kind
+    RESISTANCE at formation, per v1.0's static labeling) must satisfy
+    "holds major support" for a BULLISH state once the current close sits
+    above that level's price — role is evaluated fresh, never read from
+    the level's static origin.
+
+    Head produces a swing-high cluster at ~90.2 (swings 90.0 and 90.4,
+    confirmed early); the rest is the standard verified BULLISH base
+    structure (unaffected — see probe verification), so the final state
+    is BULLISH with watched_level 110.0. The tail candle's low touches
+    the cluster's zone ([89.7, 90.7]) and closes well above it and above
+    the watched_level (no break).
+    """
+    head = [70, 75, 80, 85, 90, 82, 74, 78, 90.4, 84, 78]
+    candles = _append(_candles(head), _BULLISH_BASE)
+
+    tail_start = candles["close_time"].iloc[-1] + dt.timedelta(hours=4)
+    tail = pd.DataFrame(
+        {
+            "high": [116.0],
+            "low": [90.0],  # touches the ~90.2 swing-high-cluster zone
+            "close": [115.0],  # > 90.2 (SUPPORT per RULE 1.7a) and > 110 (no break)
+            "close_time": [tail_start],
+        }
+    )
+    candles = pd.concat([candles, tail], ignore_index=True)
+
+    record = htf.evaluate("BTCUSDT", candles, atr_value=ATR)
+
+    assert record.state == htf.BULLISH
+    assert record.watch == htf.LONG_WATCH
+    assert record.reason_code == htf.MAJOR_SUPPORT
+
+    cluster_level = next(
+        level for level in record.active_levels if level["source"] == "swing_high_cluster"
+    )
+    assert cluster_level["role"] == "support"
+    assert cluster_level["price"] == pytest.approx(90.2)

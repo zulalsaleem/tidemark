@@ -3,6 +3,13 @@
 Section 1 parameters: swing cluster distance = 0.5 x ATR, level/zone
 tolerance = 0.25 x ATR, horizontal lookback = 120 x 4H candles (~20 days),
 major level = >=2 touches OR weekly high/low.
+
+Section 1 v1.1 (RULE 1.7a): a level's role (support/resistance) is
+dynamic, computed fresh at every evaluation from the level price and the
+current close — see `level_role`. `Level.source` records a level's
+origin (`swing_high_cluster`, `swing_low_cluster`, `prev_day_high`,
+`prev_day_low`, `prev_week_high`, `prev_week_low`), which is a permanent
+fact about where the level came from and is unrelated to role.
 """
 
 from __future__ import annotations
@@ -14,6 +21,9 @@ from tidemark.data.models import Level, Swing
 
 SUPPORT = "support"
 RESISTANCE = "resistance"
+
+SWING_HIGH_CLUSTER = "swing_high_cluster"
+SWING_LOW_CLUSTER = "swing_low_cluster"
 
 _CLUSTER_DISTANCE_ATR = 0.5
 _ZONE_TOLERANCE_ATR = 0.25
@@ -39,13 +49,18 @@ def cluster_swings_into_levels(swings: list[Swing], atr_value: float) -> list[Le
     (major = touches >= 2 OR weekly high/low).
     """
     levels: list[Level] = []
-    for kind, level_kind in ((HIGH, RESISTANCE), (LOW, SUPPORT)):
+    for kind, level_kind, origin in (
+        (HIGH, RESISTANCE, SWING_HIGH_CLUSTER),
+        (LOW, SUPPORT, SWING_LOW_CLUSTER),
+    ):
         members = sorted((s for s in swings if s.kind == kind), key=lambda s: s.price)
-        levels.extend(_cluster_same_kind(members, level_kind, atr_value))
+        levels.extend(_cluster_same_kind(members, level_kind, origin, atr_value))
     return levels
 
 
-def _cluster_same_kind(members: list[Swing], level_kind: str, atr_value: float) -> list[Level]:
+def _cluster_same_kind(
+    members: list[Swing], level_kind: str, origin: str, atr_value: float
+) -> list[Level]:
     clusters: list[list[Swing]] = []
     current: list[Swing] = []
     threshold = _CLUSTER_DISTANCE_ATR * atr_value
@@ -72,7 +87,7 @@ def _cluster_same_kind(members: list[Swing], level_kind: str, atr_value: float) 
                 zone_high=price + zone_tolerance,
                 touches=len(cluster),
                 is_major=True,
-                source="swing_cluster",
+                source=origin,
                 formed_at=max(s.confirmed_at for s in cluster),
             )
         )
@@ -129,3 +144,27 @@ def prev_period_levels(candles: pd.DataFrame, period: str, atr_value: float) -> 
             formed_at=formed_at,
         ),
     ]
+
+
+def level_role(level: Level, close: float) -> str:
+    """A level's current role (Section 1 v1.1, RULE 1.7a).
+
+    Dynamic: evaluated fresh from `close` and the level's price every
+    time this is called, never stored on the `Level` itself. The
+    comparison point is `level.price`, never a zone boundary — zone
+    tolerance decides whether price is NEAR a level, not which side of
+    the level price is on.
+
+        close > level.price -> SUPPORT
+        close < level.price -> RESISTANCE
+        close == level.price -> SUPPORT (registered tie-break)
+
+    A level's `kind` (set at construction, from which swing type or
+    which half of an OHLC pair it came from) and `source` (its origin,
+    e.g. `swing_high_cluster`) are permanent facts about the level and
+    play no part in this — a level born from a swing high can read as
+    SUPPORT here if price has since moved above it.
+    """
+    if close >= level.price:
+        return SUPPORT
+    return RESISTANCE

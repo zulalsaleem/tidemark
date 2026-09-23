@@ -118,7 +118,7 @@ market-data pipeline is implemented: a ccxt-backed exchange client
 SQLite storage with per-row sanity checks, rejected-candle recording, gap
 detection, and run bookkeeping, and `tidemark data backfill/update/gaps/
 status` CLI commands. Section 1 of the rulebook (HTF context, locked at
-v1.0) is fully implemented on top of that: ATR(14), fractal swing
+v1.1) is fully implemented on top of that: ATR(14), fractal swing
 detection, horizontal levels (swing clusters + previous day/week
 high/low), Fibonacci retracement legs, and the Section 1 state machine
 and 9-row decision matrix, all recalculated at every 4H close and

@@ -262,3 +262,46 @@ def test_context_record_evaluated_at_is_utc_aware(store: TidemarkStore) -> None:
     [record] = store.context_history(SYMBOL)
     assert record.evaluated_at.tzinfo is not None
     assert record.evaluated_at == evaluated_at
+
+
+def test_reading_back_a_v1_0_record_does_not_mutate_its_rule_version(
+    store: TidemarkStore,
+) -> None:
+    """Section 1 v1.1 changed engine behavior (dynamic level role) but a
+    v1.0 record is the historical account of what v1.0's engine actually
+    produced. Reading it back — via latest_context_record or
+    context_history, any number of times — must never rewrite its
+    rule_version to whatever the current engine emits.
+    """
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(evaluated_at))  # rule_version=section-01-v1.0
+
+    for _ in range(3):
+        latest = store.latest_context_record(SYMBOL)
+        assert latest is not None
+        assert latest.rule_version == "section-01-v1.0"
+
+        [history_record] = store.context_history(SYMBOL)
+        assert history_record.rule_version == "section-01-v1.0"
+
+    # A fresh v1.1 evaluation for the same asset/evaluated_at lands as a
+    # separate row (different rule_version key) rather than overwriting
+    # or otherwise touching the v1.0 row.
+    v1_1 = ContextRecord(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        rule_version="section-01-v1.1",
+        state="BULLISH",
+        watch="LONG_WATCH",
+        grade="B",
+        reason_code="MAJOR_SUPPORT",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
+    store.save_context_record(v1_1)
+
+    history = store.context_history(SYMBOL)
+    assert {record.rule_version for record in history} == {"section-01-v1.0", "section-01-v1.1"}
+    v1_0_record = next(r for r in history if r.rule_version == "section-01-v1.0")
+    assert v1_0_record.state == "BULLISH"  # the original _context_record default, untouched
