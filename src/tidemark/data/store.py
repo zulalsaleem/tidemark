@@ -2,8 +2,9 @@
 
 Candle ingestion (Part C/D of Phase 1): idempotent upserts, per-candle
 sanity checks, rejected-candle recording, gap detection, and run
-bookkeeping. Reads/writes for swings, levels, and context records remain
-unimplemented — they land once the corresponding rulebook logic exists.
+bookkeeping. Section 1 context-record persistence (Phase 2): idempotent
+upsert keyed on (asset, evaluated_at, rule_version), so re-evaluating the
+same 4H close overwrites rather than duplicates.
 """
 
 from __future__ import annotations
@@ -17,7 +18,14 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from tidemark.data.exchange import RawCandle
-from tidemark.data.models import Base, Candle, RejectedCandle, Run, RunSymbolStat
+from tidemark.data.models import (
+    Base,
+    Candle,
+    ContextRecord,
+    RejectedCandle,
+    Run,
+    RunSymbolStat,
+)
 from tidemark.data.timeframes import TIMEFRAME_DURATIONS
 
 RUNNING_STATUS = "RUNNING"
@@ -295,12 +303,67 @@ class TidemarkStore:
             stmt = select(RunSymbolStat).where(RunSymbolStat.run_id == run_id)
             return list(session.scalars(stmt))
 
-    # -- not yet implemented (later phases) ----------------------------------
+    # -- context records (Section 1) -----------------------------------------
 
-    def save_context_record(self, record: object) -> None:
-        """Persist a Section 1 output record."""
-        raise NotImplementedError
+    def save_context_record(self, record: ContextRecord) -> None:
+        """Persist a Section 1 output record.
 
-    def latest_context_record(self, asset: str) -> object | None:
+        Idempotent: re-evaluating the same (asset, evaluated_at,
+        rule_version) overwrites the existing row rather than duplicating
+        it. Query-then-write rather than a DB-level upsert, since
+        `ContextRecord` (unlike `Candle`) carries no unique constraint for
+        that key — this only ever runs from a single CLI invocation, so
+        there is no concurrent-writer race to guard against.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(ContextRecord).where(
+                    ContextRecord.asset == record.asset,
+                    ContextRecord.evaluated_at == record.evaluated_at,
+                    ContextRecord.rule_version == record.rule_version,
+                )
+            ).one_or_none()
+            if existing is not None:
+                existing.state = record.state
+                existing.watch = record.watch
+                existing.grade = record.grade
+                existing.reason_code = record.reason_code
+                existing.active_levels = record.active_levels
+                existing.fib = record.fib
+                existing.swings_used = record.swings_used
+            else:
+                session.add(
+                    ContextRecord(
+                        asset=record.asset,
+                        evaluated_at=record.evaluated_at,
+                        rule_version=record.rule_version,
+                        state=record.state,
+                        watch=record.watch,
+                        grade=record.grade,
+                        reason_code=record.reason_code,
+                        active_levels=record.active_levels,
+                        fib=record.fib,
+                        swings_used=record.swings_used,
+                    )
+                )
+            session.commit()
+
+    def latest_context_record(self, asset: str) -> ContextRecord | None:
         """Fetch the most recent context record for an asset, if any."""
-        raise NotImplementedError
+        with self._session_factory() as session:
+            stmt = (
+                select(ContextRecord)
+                .where(ContextRecord.asset == asset)
+                .order_by(ContextRecord.evaluated_at.desc())
+                .limit(1)
+            )
+            return session.scalars(stmt).first()
+
+    def context_history(self, asset: str, since: dt.datetime | None = None) -> list[ContextRecord]:
+        """Fetch context records for an asset, newest first."""
+        with self._session_factory() as session:
+            stmt = select(ContextRecord).where(ContextRecord.asset == asset)
+            if since is not None:
+                stmt = stmt.where(ContextRecord.evaluated_at >= since)
+            stmt = stmt.order_by(ContextRecord.evaluated_at.desc())
+            return list(session.scalars(stmt))

@@ -27,5 +27,9 @@ tunes them, or infers behavior they don't specify.
 
 | Section | File | Status |
 | --- | --- | --- |
-| 1 — HTF Context (4H) | [section-01-htf-context-v1.0.md](section-01-htf-context-v1.0.md) | LOCKED |
+| 1 — HTF Context (4H) | [section-01-htf-context-v1.1.md](section-01-htf-context-v1.1.md) (current); [v1.0](section-01-htf-context-v1.0.md) (superseded, kept for history) | LOCKED |
 | 2 — 1H Behavior | [section-02-1h-behavior-DRAFT.md](section-02-1h-behavior-DRAFT.md) | EXTRACTION IN PROGRESS |
+
+See [open-questions.md](open-questions.md) for behavior the current
+rulebook doesn't define, surfaced by running the engine — none of it is
+decided, and code does not guess at an answer while an entry is open.

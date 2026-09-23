@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pandas as pd
 import typer
 
 from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
+from tidemark.context import htf
+from tidemark.core.atr import atr as compute_atr
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, run_backfill, run_update
+from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
 
@@ -34,6 +38,13 @@ data_app = typer.Typer(
 )
 app.add_typer(data_app, name="data")
 
+context_app = typer.Typer(
+    name="context",
+    help="Section 1 HTF context: evaluate, history, explain.",
+    no_args_is_help=True,
+)
+app.add_typer(context_app, name="context")
+
 STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
 
@@ -52,10 +63,25 @@ def version() -> None:
     typer.echo(__version__)
 
 
-def _parse_csv(value: str | None) -> list[str] | None:
-    if value is None:
+def _parse_csv(values: list[str] | None) -> list[str] | None:
+    """Flatten repeated `--flag` occurrences and comma-separated values.
+
+    Accepts both `--symbols A --symbols B` and `--symbols A,B` (and a mix
+    of the two), so `--symbols`/`--timeframes` work whether the shell
+    delivers one token per occurrence or one token with embedded commas.
+
+    This matters on Windows: PowerShell parses an unquoted comma list as
+    an array-literal expression before the process ever starts, and a
+    token like `1d` matches its decimal-literal-with-suffix grammar
+    (`d` = System.Decimal), so it gets evaluated to the number 1 and
+    re-stringified as "1" — silently dropping the "d". Quoting
+    (`--timeframes "4h,1d,1w"`) avoids that, and so does the repeated-flag
+    form, since no single token then contains a comma for PowerShell's
+    parser to act on.
+    """
+    if not values:
         return None
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    items = [item.strip() for value in values for item in value.split(",") if item.strip()]
     return items or None
 
 
@@ -81,11 +107,24 @@ def _print_run_outcome(outcome: RunOutcome) -> None:
 
 @data_app.command("backfill")
 def data_backfill(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help=(
+            "Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS. "
+            'In PowerShell, quote a comma-separated value (e.g. --symbols "A,B") or '
+            "repeat --symbols instead of leaving it unquoted."
+        ),
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help=(
+            "Timeframes: repeat the flag or comma-separate; defaults to all stored "
+            "timeframes. In PowerShell, quote a comma-separated value (e.g. "
+            '--timeframes "4h,1d,1w") or repeat --timeframes instead of leaving it '
+            "unquoted — unquoted, PowerShell parses 1d as a number and drops the d."
+        ),
     ),
     days: int = typer.Option(
         None, "--days", help="Backfill depth in days; defaults to TIDEMARK_BACKFILL_DAYS."
@@ -106,11 +145,15 @@ def data_backfill(
 
 @data_app.command("update")
 def data_update(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Fetch closed candles from the last stored candle up to now."""
@@ -134,11 +177,15 @@ def data_update(
 
 @data_app.command("gaps")
 def data_gaps(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Report missing candles per symbol/timeframe. Never fabricates data."""
@@ -163,11 +210,15 @@ def data_gaps(
 
 @data_app.command("status")
 def data_status(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Show latest candle time, row counts, and the last run's status."""
@@ -210,6 +261,176 @@ def data_status(
             latest = store.latest_candle(settings.venue, symbol, timeframe)
             latest_close = latest.close_time.isoformat() if latest else "no data"
             typer.echo(f"{symbol:<16} {timeframe:<9} {row_count:<6} {latest_close}")
+
+
+def _candles_to_frame(candles: list[Candle]) -> pd.DataFrame:
+    """Adapt stored `Candle` rows into the DataFrame shape core/context expect."""
+    return pd.DataFrame(
+        {
+            "open_time": [c.open_time for c in candles],
+            "close_time": [c.close_time for c in candles],
+            "open": [c.open for c in candles],
+            "high": [c.high for c in candles],
+            "low": [c.low for c in candles],
+            "close": [c.close for c in candles],
+            "volume": [c.volume for c in candles],
+        }
+    )
+
+
+def _parse_as_of(value: str | None) -> dt.datetime | None:
+    if value is None:
+        return None
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed
+
+
+def _load_context_candles(
+    store: TidemarkStore, venue: str, symbol: str, as_of: dt.datetime | None
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fetch closed 4H/1D/1W candles for `symbol`, truncated to `as_of`.
+
+    Fetches the full stored history per timeframe and filters on
+    `close_time <= as_of` in Python — this is what lets `--as-of`
+    reproduce exactly what was known at that moment, per the rulebook's
+    look-ahead guard.
+    """
+    frames = []
+    for timeframe in ("4h", "1d", "1w"):
+        candles = store.get_candles(venue, symbol, timeframe)
+        if as_of is not None:
+            candles = [c for c in candles if c.close_time <= as_of]
+        frames.append(_candles_to_frame(candles))
+    return tuple(frames)  # type: ignore[return-value]
+
+
+def _evaluate_symbol(
+    store: TidemarkStore, venue: str, symbol: str, as_of: dt.datetime | None
+) -> ContextRecord:
+    candles_4h, candles_1d, candles_1w = _load_context_candles(store, venue, symbol, as_of)
+    if len(candles_4h) == 0:
+        typer.echo(f"No 4H candles for {symbol}. Run `tidemark data backfill` first.")
+        raise typer.Exit(code=1)
+
+    atr_series = compute_atr(candles_4h)
+    atr_value = atr_series.iloc[-1]
+
+    return htf.evaluate(
+        symbol,
+        candles_4h,
+        atr_value,
+        candles_1d=candles_1d if len(candles_1d) > 0 else None,
+        candles_1w=candles_1w if len(candles_1w) > 0 else None,
+    )
+
+
+@context_app.command("evaluate")
+def context_evaluate(
+    symbol: str = typer.Option(..., "--symbol"),
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="ISO timestamp; reproduces output as of that moment"
+    ),
+) -> None:
+    """Evaluate Section 1's decision matrix and persist the result."""
+    settings = get_settings()
+    store = _store(settings)
+    record = _evaluate_symbol(store, settings.venue, symbol, _parse_as_of(as_of))
+    store.save_context_record(record)
+
+    grade = record.grade or "-"
+    typer.echo(
+        f"{symbol} @ {record.evaluated_at.isoformat()}  "
+        f"state={record.state}  watch={record.watch}  grade={grade}  "
+        f"reason={record.reason_code}"
+    )
+    if record.watch == htf.WAIT:
+        typer.echo("No setups found.")
+
+
+@context_app.command("history")
+def context_history(
+    symbol: str = typer.Option(..., "--symbol"),
+    days: int = typer.Option(30, "--days"),
+) -> None:
+    """List past Section 1 evaluations for a symbol, newest first."""
+    settings = get_settings()
+    store = _store(settings)
+    since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    records = store.context_history(symbol, since=since)
+
+    if not records:
+        typer.echo("No setups found.")
+        return
+
+    for record in records:
+        grade = record.grade or "-"
+        typer.echo(
+            f"{record.evaluated_at.isoformat()}  {record.state:22}  "
+            f"{record.watch:11}  grade={grade}  {record.reason_code}"
+        )
+
+
+@context_app.command("explain")
+def context_explain(symbol: str = typer.Option(..., "--symbol")) -> None:
+    """Print a human-readable explanation of the latest Section 1 evaluation."""
+    settings = get_settings()
+    store = _store(settings)
+    record = store.latest_context_record(symbol)
+    if record is None:
+        typer.echo(
+            f"No context record for {symbol} yet. "
+            f"Run `tidemark context evaluate --symbol {symbol}` first."
+        )
+        raise typer.Exit(code=1)
+
+    grade = record.grade or "-"
+    typer.echo(f"{symbol} - Section 1 HTF Context ({record.rule_version})")
+    typer.echo(f"Evaluated at: {record.evaluated_at.isoformat()}")
+    typer.echo("")
+    typer.echo(f"State:  {record.state}")
+    typer.echo(f"Watch:  {record.watch}  (grade {grade})")
+    typer.echo(f"Reason: {record.reason_code}")
+
+    typer.echo("")
+    typer.echo("Swings used:")
+    if not record.swings_used:
+        typer.echo("  (none)")
+    for swing in record.swings_used:
+        typer.echo(
+            f"  {swing['kind']:5} {swing['price']:.2f}  "
+            f"formed {swing['formed_at']}  confirmed {swing['confirmed_at']}"
+        )
+
+    typer.echo("")
+    typer.echo("Active levels:")
+    if not record.active_levels:
+        typer.echo("  (none)")
+    for level in record.active_levels:
+        major = "major" if level["is_major"] else "minor"
+        typer.echo(
+            f"  {level['role']:10} {level['price']:.2f}  "
+            f"zone[{level['zone_low']:.2f},{level['zone_high']:.2f}]  "
+            f"touches={level['touches']}  {major}  source={level['source']}"
+        )
+
+    typer.echo("")
+    if record.fib:
+        fib = record.fib
+        typer.echo(
+            f"Fib ({fib['direction']} leg {fib['anchor_start']:.2f} -> "
+            f"{fib['anchor_end']:.2f}, valid_from {fib['valid_from']}):"
+        )
+        typer.echo(
+            f"  0.500={fib['level_500']:.2f}  0.618={fib['level_618']:.2f}  "
+            f"0.786={fib['level_786']:.2f}  "
+            f"zone[{fib['zone_low']:.2f},{fib['zone_high']:.2f}]  "
+            f"nearest={fib['nearest_level']}"
+        )
+        typer.echo(f"  invalidated_at: {fib['invalidated_at'] or 'none'}")
+    else:
+        typer.echo("Fib: (no valid leg)")
 
 
 def main() -> None:

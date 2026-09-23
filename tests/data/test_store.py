@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import inspect
 
 from tidemark.data.exchange import RawCandle
-from tidemark.data.models import RejectedCandle
+from tidemark.data.models import ContextRecord, RejectedCandle
 from tidemark.data.store import CandleUpsertResult, TidemarkStore, create_store_engine, init_db
 
 VENUE = "binanceusdm"
@@ -186,3 +186,122 @@ def test_running_runs_excludes_finished_ones(store: TidemarkStore) -> None:
 
     [running] = store.running_runs()
     assert running.run_id == "run-stuck"
+
+
+def _context_record(evaluated_at: dt.datetime, state: str = "BULLISH") -> ContextRecord:
+    return ContextRecord(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        rule_version="section-01-v1.0",
+        state=state,
+        watch="WAIT",
+        grade=None,
+        reason_code="NOT_IN_ZONE",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
+
+
+def test_save_context_record_is_idempotent(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+
+    store.save_context_record(_context_record(evaluated_at))
+    store.save_context_record(_context_record(evaluated_at, state="BEARISH"))
+
+    history = store.context_history(SYMBOL)
+    assert len(history) == 1
+    assert history[0].state == "BEARISH"
+
+
+def test_save_context_record_keys_on_asset_evaluated_at_and_rule_version(
+    store: TidemarkStore,
+) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    v1 = _context_record(evaluated_at)
+    v2 = ContextRecord(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        rule_version="section-01-v1.1",
+        state="NEUTRAL",
+        watch="WAIT",
+        grade=None,
+        reason_code="NEUTRAL_STRUCTURE",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
+
+    store.save_context_record(v1)
+    store.save_context_record(v2)
+
+    # Different rule_version at the same evaluated_at is a distinct row,
+    # not an overwrite.
+    assert len(store.context_history(SYMBOL)) == 2
+
+
+def test_latest_context_record_returns_most_recent(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(base))
+    store.save_context_record(_context_record(base + dt.timedelta(hours=4)))
+
+    latest = store.latest_context_record(SYMBOL)
+
+    assert latest is not None
+    assert latest.evaluated_at == base + dt.timedelta(hours=4)
+
+
+def test_latest_context_record_none_when_missing(store: TidemarkStore) -> None:
+    assert store.latest_context_record(SYMBOL) is None
+
+
+def test_context_record_evaluated_at_is_utc_aware(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(evaluated_at))
+
+    [record] = store.context_history(SYMBOL)
+    assert record.evaluated_at.tzinfo is not None
+    assert record.evaluated_at == evaluated_at
+
+
+def test_reading_back_a_v1_0_record_does_not_mutate_its_rule_version(
+    store: TidemarkStore,
+) -> None:
+    """Section 1 v1.1 changed engine behavior (dynamic level role) but a
+    v1.0 record is the historical account of what v1.0's engine actually
+    produced. Reading it back — via latest_context_record or
+    context_history, any number of times — must never rewrite its
+    rule_version to whatever the current engine emits.
+    """
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(evaluated_at))  # rule_version=section-01-v1.0
+
+    for _ in range(3):
+        latest = store.latest_context_record(SYMBOL)
+        assert latest is not None
+        assert latest.rule_version == "section-01-v1.0"
+
+        [history_record] = store.context_history(SYMBOL)
+        assert history_record.rule_version == "section-01-v1.0"
+
+    # A fresh v1.1 evaluation for the same asset/evaluated_at lands as a
+    # separate row (different rule_version key) rather than overwriting
+    # or otherwise touching the v1.0 row.
+    v1_1 = ContextRecord(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        rule_version="section-01-v1.1",
+        state="BULLISH",
+        watch="LONG_WATCH",
+        grade="B",
+        reason_code="MAJOR_SUPPORT",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
+    store.save_context_record(v1_1)
+
+    history = store.context_history(SYMBOL)
+    assert {record.rule_version for record in history} == {"section-01-v1.0", "section-01-v1.1"}
+    v1_0_record = next(r for r in history if r.rule_version == "section-01-v1.0")
+    assert v1_0_record.state == "BULLISH"  # the original _context_record default, untouched

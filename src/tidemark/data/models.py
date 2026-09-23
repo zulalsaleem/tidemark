@@ -162,10 +162,16 @@ class Swing(Base):
 
 
 class Level(Base):
-    """A horizontal support/resistance level or zone.
+    """A horizontal level or zone.
 
     May originate from a swing cluster or from a fixed reference (e.g.
-    previous day/week high/low) as defined by the rulebook.
+    previous day/week high/low) as defined by the rulebook. `source`
+    records that origin (e.g. `swing_high_cluster`, `prev_week_low`) — a
+    permanent fact about the level. There is no support/resistance
+    column: Section 1 v1.1 (RULE 1.7a) makes a level's role dynamic,
+    evaluated fresh from its price and the current close at every
+    evaluation (`core.levels.level_role`), and explicitly never stored
+    from formation.
     """
 
     __tablename__ = "levels"
@@ -173,7 +179,6 @@ class Level(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
     timeframe: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    kind: Mapped[str] = mapped_column(String, nullable=False)  # support, resistance
     price: Mapped[float] = mapped_column(Float, nullable=False)
     zone_low: Mapped[float] = mapped_column(Float, nullable=False)
     zone_high: Mapped[float] = mapped_column(Float, nullable=False)

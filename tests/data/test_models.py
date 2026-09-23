@@ -96,13 +96,12 @@ def test_every_model_datetime_round_trips_utc_aware() -> None:
         level = Level(
             asset="BTCUSDT",
             timeframe="4h",
-            kind="support",
             price=59000.0,
             zone_low=58500.0,
             zone_high=59500.0,
             touches=2,
             is_major=True,
-            source="swing_cluster",
+            source="swing_low_cluster",
             formed_at=now,
         )
         context_record = ContextRecord(
