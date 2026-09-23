@@ -43,8 +43,9 @@ closed candles (exchange, read-only)
 ```
 
 Persistence (SQLite via SQLAlchemy) sits alongside this pipeline in
-`data/store.py`, holding candles, swings, levels, and emitted context
-records.
+`data/store.py`, holding closed candles and emitted context records.
+Swings, levels, and Fib legs are pure calculations recomputed from stored
+candles at every evaluation rather than persisted separately.
 
 ## How the rulebook works
 
@@ -71,14 +72,39 @@ uv run pytest                  # run the test suite
 uv run ruff check .            # lint
 ```
 
+## Using Section 1
+
+```bash
+# Backfill closed 4H/1D/1W candles for a symbol (read-only, no API key needed
+# for public OHLCV on the default exchange).
+uv run tidemark data backfill --symbols BTC/USDT:USDT --timeframes 4h,1d,1w --days 180
+
+# Evaluate Section 1's decision matrix against the latest closed 4H candle
+# and persist the result.
+uv run tidemark context evaluate --symbol BTC/USDT:USDT
+
+# Reproduce exactly what Section 1 would have output as of an earlier 4H
+# close, using only data available at that moment.
+uv run tidemark context evaluate --symbol BTC/USDT:USDT --as-of 2026-06-01T00:00:00+00:00
+
+# Past evaluations, and a human-readable breakdown of the latest one.
+uv run tidemark context history --symbol BTC/USDT:USDT
+uv run tidemark context explain --symbol BTC/USDT:USDT
+```
+
 ## Project status
 
-**Phase 0 — repository skeleton.** Tooling, CI, data models, and
-documentation are in place. Strategy logic (indicators, swing/level
-detection, rulebook evaluation, data fetching, Telegram sending) is not
-yet implemented — modules raise `NotImplementedError` where that logic
-will go. Section 1 of the rulebook (HTF context) is locked at v1.0;
-Section 2 (1H behavior) is still in draft.
+**Phase 2 — Section 1 HTF context engine.** Section 1 of the rulebook
+(HTF context, locked at v1.0) is fully implemented: ATR(14), fractal
+swing detection, horizontal levels (swing clusters + previous day/week
+high/low), Fibonacci retracement legs, and the Section 1 state machine
+and 9-row decision matrix, all recalculated at every 4H close and
+persisted idempotently. Market data comes from a read-only exchange
+client (`tidemark data backfill`); `tidemark context evaluate/history/
+explain` drive the engine from the CLI, including `--as-of` for
+point-in-time reproduction. Section 2 (1H behavior) is still in draft
+and unimplemented. Telegram alert delivery and the end-to-end `run`
+pipeline are not yet wired up.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
