@@ -1,6 +1,7 @@
 """Smoke test: the CLI is wired up end to end, plus context evaluate/history/explain."""
 
 import datetime as dt
+import json
 
 import pytest
 from typer.testing import CliRunner
@@ -307,6 +308,7 @@ class _FakeNotifier:
     # notify_test's message branching - the connection-vs-http-error
     # distinction itself is covered directly in tests/notify/test_telegram.py.
     last_error = None
+    is_configured: bool = True
 
     def __init__(self, bot_token, chat_id) -> None:  # noqa: ARG002
         pass
@@ -323,6 +325,8 @@ class _FakeNotifier:
 def _fake_notifier(monkeypatch: pytest.MonkeyPatch):
     _FakeNotifier.sent_messages = []
     _FakeNotifier.succeed = True
+    _FakeNotifier.last_error = None
+    _FakeNotifier.is_configured = True
     monkeypatch.setattr(cli_module, "TelegramNotifier", _FakeNotifier)
     return _FakeNotifier
 
@@ -505,3 +509,158 @@ def test_notify_test_reports_http_400_chat_not_found_with_hint(
     assert "HTTP 400" in result.stdout
     assert "chat not found" in result.stdout
     assert "TIDEMARK_TELEGRAM_CHAT_ID" in result.stdout
+
+
+# -- health check / heartbeat (Phase 4B) --------------------------------------
+
+
+def _healthy_setup(url: str, monkeypatch: pytest.MonkeyPatch, now: dt.datetime) -> None:
+    """Seeds a store with fresh candles, a recently-completed run, and a
+    recent journal entry - everything OK - and configures dummy Telegram
+    credentials so telegram_config is also OK.
+    """
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    for timeframe in ("4h", "1d", "1w"):
+        candle = RawCandle(
+            open_time=now - dt.timedelta(hours=5),
+            close_time=now - dt.timedelta(hours=1),
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1.0,
+        )
+        store.upsert_candles(VENUE, SYMBOL, timeframe, [candle], now)
+    store.start_run("r1", "run", now - dt.timedelta(minutes=10))
+    store.finish_run("r1", now - dt.timedelta(minutes=5), "COMPLETED", {})
+
+    from tidemark.data.models import JournalEntry
+
+    with store._session_factory() as session:
+        session.add(
+            JournalEntry(
+                asset=SYMBOL,
+                evaluated_at=now - dt.timedelta(hours=1),
+                recorded_at=now - dt.timedelta(minutes=5),
+                rule_version="section-01-v1.1",
+                state="NEUTRAL",
+                watch="WAIT",
+                grade=None,
+                reason_code="NEUTRAL_STRUCTURE",
+                active_levels=[],
+                fib={},
+                swings_used=[],
+                alert_sent=False,
+                alert_reason=None,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+    monkeypatch.setenv("TIDEMARK_TELEGRAM_BOT_TOKEN", "dummy-token")
+    monkeypatch.setenv("TIDEMARK_TELEGRAM_CHAT_ID", "dummy-chat-id")
+
+
+def test_health_check_exit_code_ok_when_everything_healthy(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _healthy_setup(url, monkeypatch, dt.datetime.now(dt.UTC))
+
+    result = runner.invoke(app, ["health", "check"])
+
+    assert result.exit_code == 0
+    assert "Overall: OK" in result.stdout
+
+
+def test_health_check_exit_code_warn_when_telegram_not_configured(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    _healthy_setup(url, monkeypatch, now)
+    # Empty-string overrides, not delenv: a real .env file (if present in
+    # the working directory) would otherwise still supply real
+    # credentials, since pydantic-settings falls back to it when an OS
+    # env var is merely absent. An explicit empty value always wins.
+    monkeypatch.setenv("TIDEMARK_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("TIDEMARK_TELEGRAM_CHAT_ID", "")
+
+    result = runner.invoke(app, ["health", "check"])
+
+    assert result.exit_code == 1
+    assert "Overall: WARN" in result.stdout
+
+
+def test_health_check_exit_code_fail_on_stale_running_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    _healthy_setup(url, monkeypatch, now)
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    store.start_run("stuck", "update", now - dt.timedelta(hours=3))
+
+    result = runner.invoke(app, ["health", "check"])
+
+    assert result.exit_code == 2
+    assert "Overall: FAIL" in result.stdout
+    assert "crashed" in result.stdout
+
+
+def test_health_check_json_parses_and_contains_every_check(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _healthy_setup(url, monkeypatch, dt.datetime.now(dt.UTC))
+
+    result = runner.invoke(app, ["health", "check", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "OK"
+    assert isinstance(payload["checks"], list)
+    assert len(payload["checks"]) > 0
+    names = {c["name"] for c in payload["checks"]}
+    assert "database" in names
+    assert "telegram_config" in names
+    assert any(n.startswith("candles:") for n in names)
+    assert any(n.startswith("last_run:") for n in names)
+    for check in payload["checks"]:
+        assert check["status"] in ("OK", "WARN", "FAIL")
+        assert isinstance(check["detail"], str)
+
+
+def test_health_heartbeat_writes_no_journal_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    _healthy_setup(url, monkeypatch, now)
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    before = store.count_journal_entries()
+
+    result = runner.invoke(app, ["health", "heartbeat"])
+
+    assert result.exit_code == 0
+    assert len(_fake_notifier.sent_messages) == 1
+    after = store.count_journal_entries()
+    assert after == before
+
+
+def test_health_heartbeat_sends_via_notifier_and_includes_rulebook(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _healthy_setup(url, monkeypatch, dt.datetime.now(dt.UTC))
+
+    result = runner.invoke(app, ["health", "heartbeat"])
+
+    assert result.exit_code == 0
+    assert "Tidemark healthy" in _fake_notifier.sent_messages[0]
+    assert "Rulebook: section-01-v1.1" in _fake_notifier.sent_messages[0]
