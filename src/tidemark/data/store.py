@@ -22,6 +22,7 @@ from tidemark.data.models import (
     Base,
     Candle,
     ContextRecord,
+    JournalEntry,
     RejectedCandle,
     Run,
     RunSymbolStat,
@@ -55,6 +56,21 @@ class CandleUpsertResult:
     inserted: int
     duplicates_skipped: int
     rejected: int
+
+
+@dataclass(frozen=True)
+class JournalWriteResult:
+    """Outcome of writing one journal entry.
+
+    `inserted=False` means this (asset, evaluated_at, rule_version) was
+    already journaled — a no-op, not an error, and `entry` is the
+    existing row untouched. Callers use `inserted` to decide whether to
+    run the change detector at all: a repeat must trigger neither a new
+    row nor a re-alert.
+    """
+
+    entry: JournalEntry
+    inserted: bool
 
 
 def _validate_candle(candle: RawCandle) -> str | None:
@@ -366,4 +382,93 @@ class TidemarkStore:
             if since is not None:
                 stmt = stmt.where(ContextRecord.evaluated_at >= since)
             stmt = stmt.order_by(ContextRecord.evaluated_at.desc())
+            return list(session.scalars(stmt))
+
+    # -- journal (Phase 3) ----------------------------------------------------
+
+    def save_journal_entry(self, entry: JournalEntry) -> JournalWriteResult:
+        """Append one journal row. Append-only: unlike `save_context_record`,
+        an existing (asset, evaluated_at, rule_version) row is never
+        overwritten — re-evaluating the same candle is a no-op that
+        returns the existing row, not a second row and not an update.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(JournalEntry).where(
+                    JournalEntry.asset == entry.asset,
+                    JournalEntry.evaluated_at == entry.evaluated_at,
+                    JournalEntry.rule_version == entry.rule_version,
+                )
+            ).one_or_none()
+            if existing is not None:
+                return JournalWriteResult(entry=existing, inserted=False)
+
+            new_entry = JournalEntry(
+                asset=entry.asset,
+                evaluated_at=entry.evaluated_at,
+                recorded_at=entry.recorded_at,
+                rule_version=entry.rule_version,
+                state=entry.state,
+                watch=entry.watch,
+                grade=entry.grade,
+                reason_code=entry.reason_code,
+                active_levels=entry.active_levels,
+                fib=entry.fib,
+                swings_used=entry.swings_used,
+                alert_sent=entry.alert_sent,
+                alert_reason=entry.alert_reason,
+            )
+            session.add(new_entry)
+            session.commit()
+            session.refresh(new_entry)
+            return JournalWriteResult(entry=new_entry, inserted=True)
+
+    def record_alert_outcome(self, entry_id: int, alert_sent: bool, alert_reason: str) -> None:
+        """Set `alert_sent`/`alert_reason` on an already-inserted journal
+        row — the one exception to "journal rows are never updated after
+        insert". Runs once, immediately after the change detector and any
+        Telegram send for that same evaluation; nothing else on the row
+        is touched.
+        """
+        with self._session_factory() as session:
+            row = session.execute(
+                select(JournalEntry).where(JournalEntry.id == entry_id)
+            ).scalar_one()
+            row.alert_sent = alert_sent
+            row.alert_reason = alert_reason
+            session.commit()
+
+    def latest_journal_entry(self, asset: str, rule_version: str) -> JournalEntry | None:
+        """Fetch the most recent journal row for an asset at a given
+        rule_version, if any. Never crosses a rule_version boundary — a
+        rule_version change must not by itself look like a state/watch/
+        grade change to the change detector.
+        """
+        with self._session_factory() as session:
+            stmt = (
+                select(JournalEntry)
+                .where(JournalEntry.asset == asset, JournalEntry.rule_version == rule_version)
+                .order_by(JournalEntry.evaluated_at.desc())
+                .limit(1)
+            )
+            return session.scalars(stmt).first()
+
+    def journal_history(self, asset: str, since: dt.datetime | None = None) -> list[JournalEntry]:
+        """Fetch journal rows for an asset, newest first."""
+        with self._session_factory() as session:
+            stmt = select(JournalEntry).where(JournalEntry.asset == asset)
+            if since is not None:
+                stmt = stmt.where(JournalEntry.evaluated_at >= since)
+            stmt = stmt.order_by(JournalEntry.evaluated_at.desc())
+            return list(session.scalars(stmt))
+
+    def journal_alerts(self, since: dt.datetime | None = None) -> list[JournalEntry]:
+        """Fetch journal rows where an alert was actually sent, across all
+        assets, newest first.
+        """
+        with self._session_factory() as session:
+            stmt = select(JournalEntry).where(JournalEntry.alert_sent.is_(True))
+            if since is not None:
+                stmt = stmt.where(JournalEntry.evaluated_at >= since)
+            stmt = stmt.order_by(JournalEntry.evaluated_at.desc())
             return list(session.scalars(stmt))
