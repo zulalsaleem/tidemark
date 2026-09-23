@@ -6,10 +6,12 @@ import pytest
 from typer.testing import CliRunner
 
 from tidemark import __version__
+from tidemark import cli as cli_module
 from tidemark.cli import _parse_csv, app
 from tidemark.data.exchange import RawCandle
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.notify.telegram import build_message
 
 runner = CliRunner()
 
@@ -108,12 +110,6 @@ def test_version_command_prints_version() -> None:
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
     assert __version__ in result.stdout
-
-
-def test_run_command_not_yet_implemented() -> None:
-    result = runner.invoke(app, ["run"])
-    assert result.exit_code != 0
-    assert isinstance(result.exception, NotImplementedError)
 
 
 def test_data_status_flags_stale_running_run(tmp_path, monkeypatch) -> None:
@@ -297,3 +293,153 @@ def test_context_evaluate_as_of_matches_truncated_database(
         result_full.stdout.split("\n")[0].split("  ", 1)[1]
         == (result_truncated.stdout.split("\n")[0].split("  ", 1)[1])
     )
+
+
+# -- run / journal / notify (Phase 3) -----------------------------------------
+
+
+class _FakeNotifier:
+    """Stands in for TelegramNotifier: no real network anywhere."""
+
+    sent_messages: list[str] = []
+    succeed: bool = True
+
+    def __init__(self, bot_token, chat_id) -> None:  # noqa: ARG002
+        pass
+
+    def send_text(self, text: str) -> bool:
+        _FakeNotifier.sent_messages.append(text)
+        return _FakeNotifier.succeed
+
+    def send_alert(self, record, alert_reason, symbol) -> bool:
+        return self.send_text(build_message(record, alert_reason, symbol))
+
+
+@pytest.fixture(autouse=False)
+def _fake_notifier(monkeypatch: pytest.MonkeyPatch):
+    _FakeNotifier.sent_messages = []
+    _FakeNotifier.succeed = True
+    monkeypatch.setattr(cli_module, "TelegramNotifier", _FakeNotifier)
+    return _FakeNotifier
+
+
+def test_run_first_evaluation_journals_with_no_alert(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+    assert "journaled, no alert" in result.stdout
+    assert _fake_notifier.sent_messages == []
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.journal_history(SYMBOL)) == 1
+
+
+def test_run_twice_same_candle_writes_one_journal_row_and_sends_no_alert(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+
+    first = runner.invoke(app, ["run", "--symbols", SYMBOL])
+    second = runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert "repeat (already journaled, no alert)" in second.stdout
+    assert _fake_notifier.sent_messages == []
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.journal_history(SYMBOL)) == 1
+
+
+def test_run_one_symbol_missing_candles_gives_partial(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["run", "--symbols", SYMBOL, "--symbols", "NOPE/USDT:USDT"])
+
+    assert result.exit_code == 0
+    assert ": PARTIAL" in result.stdout
+    assert "NOPE/USDT:USDT" in result.stdout
+    assert "FAILED: no 4H candles" in result.stdout
+
+
+def test_run_missing_credentials_does_not_crash(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+    monkeypatch.delenv("TIDEMARK_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TIDEMARK_TELEGRAM_CHAT_ID", raising=False)
+
+    result = runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.journal_history(SYMBOL)) == 1
+
+
+def test_journal_list_shows_rows(tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+    runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    result = runner.invoke(app, ["journal", "list", "--symbol", SYMBOL, "--days", "36500"])
+
+    assert result.exit_code == 0
+    assert "alert_sent=False" in result.stdout
+
+
+def test_journal_list_reports_none_when_empty(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["journal", "list", "--symbol", SYMBOL])
+
+    assert result.exit_code == 0
+    assert "No journal rows found." in result.stdout
+
+
+def test_journal_alerts_reports_none_when_empty(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["journal", "alerts"])
+
+    assert result.exit_code == 0
+    assert "No alerts sent." in result.stdout
+
+
+def test_notify_test_sends_fixed_message_and_writes_nothing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code == 0
+    assert "Test message sent." in result.stdout
+    assert len(_fake_notifier.sent_messages) == 1
+
+    store = TidemarkStore(engine)
+    assert store.journal_alerts() == []
+
+
+def test_notify_test_reports_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+    _fake_notifier.succeed = False
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code != 0
+    assert "NOT sent" in result.stdout
