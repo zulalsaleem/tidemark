@@ -319,6 +319,22 @@ class TidemarkStore:
             stmt = select(RunSymbolStat).where(RunSymbolStat.run_id == run_id)
             return list(session.scalars(stmt))
 
+    def latest_runs_by_command(self) -> dict[str, Run]:
+        """The most recent run row for each distinct command that has
+        ever run (e.g. "backfill", "update", "run"), keyed by command.
+
+        A command that has never run is simply absent from the result —
+        callers should not treat that as a failure on its own, since a
+        deployment may legitimately never use every command.
+        """
+        with self._session_factory() as session:
+            stmt = select(Run).order_by(Run.started_at.desc())
+            rows = list(session.scalars(stmt))
+        latest: dict[str, Run] = {}
+        for row in rows:
+            latest.setdefault(row.command, row)
+        return latest
+
     # -- context records (Section 1) -----------------------------------------
 
     def save_context_record(self, record: ContextRecord) -> None:
@@ -472,3 +488,19 @@ class TidemarkStore:
                 stmt = stmt.where(JournalEntry.evaluated_at >= since)
             stmt = stmt.order_by(JournalEntry.evaluated_at.desc())
             return list(session.scalars(stmt))
+
+    def latest_journal_entry_overall(self) -> JournalEntry | None:
+        """Fetch the single most recently recorded journal row across all
+        assets (by `recorded_at` — when the write actually happened, not
+        the candle's own close time), if any. Used to answer "did the
+        system journal anything recently", independent of which asset.
+        """
+        with self._session_factory() as session:
+            stmt = select(JournalEntry).order_by(JournalEntry.recorded_at.desc()).limit(1)
+            return session.scalars(stmt).first()
+
+    def count_journal_entries(self) -> int:
+        """Count all journal rows, across every asset."""
+        with self._session_factory() as session:
+            stmt = select(func.count()).select_from(JournalEntry)
+            return session.scalar(stmt) or 0
