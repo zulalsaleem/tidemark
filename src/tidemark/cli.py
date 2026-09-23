@@ -21,6 +21,8 @@ from tidemark.data.ingest import RunOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
+from tidemark.notify.telegram import TelegramNotifier
 
 app = typer.Typer(
     name="tidemark",
@@ -45,16 +47,65 @@ context_app = typer.Typer(
 )
 app.add_typer(context_app, name="context")
 
+journal_app = typer.Typer(
+    name="journal",
+    help="Append-only research record: list, alerts.",
+    no_args_is_help=True,
+)
+app.add_typer(journal_app, name="journal")
+
+notify_app = typer.Typer(
+    name="notify",
+    help="Telegram connectivity: test.",
+    no_args_is_help=True,
+)
+app.add_typer(notify_app, name="notify")
+
 STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
 
-@app.command()
-def run() -> None:
-    """Evaluate the rulebook against closed candles and emit alerts.
+def _notifier(settings: Settings) -> TelegramNotifier:
+    return TelegramNotifier(
+        bot_token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id
+    )
 
-    Not implemented yet — rulebook evaluation lands in a later phase.
+
+@app.command()
+def run(
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
+    ),
+) -> None:
+    """Evaluate Section 1, journal every result, and alert on change.
+
+    For each symbol: evaluate against stored candles, write the journal
+    row (a no-op if this 4H candle was already journaled), run the
+    change detector, and send a Telegram alert if it returns a reason.
+    One symbol failing gives a PARTIAL run, not FAILED.
     """
-    raise NotImplementedError("Rulebook evaluation is not implemented yet.")
+    settings = get_settings()
+    store = _store(settings)
+    notifier = _notifier(settings)
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+
+    outcome = run_pipeline(store, notifier, settings.venue, symbol_list)
+    _print_pipeline_outcome(outcome)
+
+
+def _print_pipeline_outcome(outcome: PipelineRunOutcome) -> None:
+    typer.echo(f"run {outcome.run_id}: {outcome.status}")
+    for o in outcome.outcomes:
+        if o.error is not None:
+            typer.echo(f"  {o.symbol:<16} FAILED: {o.error}")
+        elif not o.journaled:
+            typer.echo(f"  {o.symbol:<16} repeat (already journaled, no alert)")
+        elif o.alert_reason is None:
+            typer.echo(f"  {o.symbol:<16} journaled, no alert")
+        else:
+            sent = "sent" if o.alert_sent else "FAILED TO SEND"
+            typer.echo(f"  {o.symbol:<16} journaled, alert={o.alert_reason} ({sent})")
 
 
 @app.command()
@@ -431,6 +482,73 @@ def context_explain(symbol: str = typer.Option(..., "--symbol")) -> None:
         typer.echo(f"  invalidated_at: {fib['invalidated_at'] or 'none'}")
     else:
         typer.echo("Fib: (no valid leg)")
+
+
+@journal_app.command("list")
+def journal_list(
+    symbol: str = typer.Option(..., "--symbol"),
+    days: int = typer.Option(30, "--days"),
+) -> None:
+    """List journal rows for a symbol, newest first."""
+    settings = get_settings()
+    store = _store(settings)
+    since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    entries = store.journal_history(symbol, since=since)
+
+    if not entries:
+        typer.echo("No journal rows found.")
+        return
+
+    for entry in entries:
+        grade = entry.grade or "-"
+        alert_reason = entry.alert_reason or "-"
+        typer.echo(
+            f"{entry.evaluated_at.isoformat()}  {entry.state:22}  {entry.watch:11}  "
+            f"grade={grade}  {entry.reason_code}  "
+            f"alert_sent={entry.alert_sent}  alert_reason={alert_reason}"
+        )
+
+
+@journal_app.command("alerts")
+def journal_alerts(days: int = typer.Option(30, "--days")) -> None:
+    """List journal rows where an alert was sent, across all symbols, newest first."""
+    settings = get_settings()
+    store = _store(settings)
+    since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    entries = store.journal_alerts(since=since)
+
+    if not entries:
+        typer.echo("No alerts sent.")
+        return
+
+    for entry in entries:
+        grade = entry.grade or "-"
+        typer.echo(
+            f"{entry.evaluated_at.isoformat()}  {entry.asset:<16}  {entry.state:22}  "
+            f"{entry.watch:11}  grade={grade}  alert_reason={entry.alert_reason}"
+        )
+
+
+_TEST_MESSAGE = (
+    "✅ Tidemark connectivity test\n\n"
+    "This is a fixed test message confirming your Telegram credentials work.\n"
+    "No evaluation ran; nothing was written to the journal."
+)
+
+
+@notify_app.command("test")
+def notify_test() -> None:
+    """Send one fixed test message. Proves credentials work; writes nothing to the journal."""
+    settings = get_settings()
+    notifier = _notifier(settings)
+    sent = notifier.send_text(_TEST_MESSAGE)
+    if sent:
+        typer.echo("Test message sent.")
+    else:
+        typer.echo(
+            "Test message NOT sent - check TIDEMARK_TELEGRAM_BOT_TOKEN / TIDEMARK_TELEGRAM_CHAT_ID."
+        )
+        raise typer.Exit(code=1)
 
 
 def main() -> None:
