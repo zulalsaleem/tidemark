@@ -8,6 +8,7 @@ exchange trading permissions.
 from __future__ import annotations
 
 import datetime as dt
+import json as json_module
 
 import pandas as pd
 import typer
@@ -21,8 +22,9 @@ from tidemark.data.ingest import RunOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
-from tidemark.notify.telegram import TelegramNotifier
+from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 
 app = typer.Typer(
     name="tidemark",
@@ -60,6 +62,13 @@ notify_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(notify_app, name="notify")
+
+health_app = typer.Typer(
+    name="health",
+    help="Prove the system actually ran: check, heartbeat.",
+    no_args_is_help=True,
+)
+app.add_typer(health_app, name="health")
 
 STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
@@ -571,6 +580,100 @@ def notify_test() -> None:
         elif error.status_code == 400 and "chat not found" in error.detail.lower():
             typer.echo("This usually means TIDEMARK_TELEGRAM_CHAT_ID is invalid.")
     raise typer.Exit(code=1)
+
+
+def _build_health_report(settings: Settings) -> HealthReport:
+    # Deliberately does NOT call init_db(): health check must see the
+    # database exactly as it is, not a freshly-patched version of it -
+    # calling init_db first would silently create any missing tables and
+    # make the DATABASE check unable to ever catch a broken/uninitialized
+    # database.
+    engine = create_store_engine(settings.database_url)
+    store = TidemarkStore(engine)
+    notifier = _notifier(settings)
+    now = dt.datetime.now(dt.UTC)
+    return run_all_checks(
+        store=store,
+        engine=engine,
+        venue=settings.venue,
+        symbols=settings.symbol_list(),
+        is_telegram_configured=notifier.is_configured,
+        rule_version=htf.RULE_VERSION,
+        now=now,
+    )
+
+
+def _report_to_dict(report: HealthReport) -> dict:
+    return {
+        "status": report.status,
+        "generated_at": report.generated_at.isoformat(),
+        "rule_version": report.rule_version,
+        "checks": [{"name": c.name, "status": c.status, "detail": c.detail} for c in report.checks],
+        "last_candle_symbol": report.last_candle_symbol,
+        "last_candle_timeframe": report.last_candle_timeframe,
+        "last_candle_close_time": (
+            report.last_candle_close_time.isoformat()
+            if report.last_candle_close_time is not None
+            else None
+        ),
+        "last_evaluation_recorded_at": (
+            report.last_evaluation_recorded_at.isoformat()
+            if report.last_evaluation_recorded_at is not None
+            else None
+        ),
+        "last_evaluation_state": report.last_evaluation_state,
+        "last_evaluation_watch": report.last_evaluation_watch,
+        "last_run_status": report.last_run_status,
+        "total_gaps": report.total_gaps,
+        "journal_count": report.journal_count,
+    }
+
+
+@health_app.command("check")
+def health_check(
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Run every health check and report the result.
+
+    Exit codes: 0 for OK, 1 for WARN, 2 for FAIL - a Telegram failure
+    never affects this, since this command never sends anything.
+    """
+    settings = get_settings()
+    report = _build_health_report(settings)
+
+    if json:
+        typer.echo(json_module.dumps(_report_to_dict(report), indent=2))
+    else:
+        typer.echo(f"Overall: {report.status}")
+        typer.echo("")
+        for check in report.checks:
+            typer.echo(f"{check.name:<28} {check.status:<5} {check.detail}")
+
+    raise typer.Exit(code=EXIT_CODES[report.status])
+
+
+@health_app.command("heartbeat")
+def health_heartbeat() -> None:
+    """Run every health check and send one Telegram summary.
+
+    The only command in `health` that sends anything. Never writes to
+    the journal - a heartbeat is a system-status message, not a research
+    observation.
+    """
+    settings = get_settings()
+    report = _build_health_report(settings)
+    notifier = _notifier(settings)
+
+    message = build_heartbeat_message(report)
+    sent = notifier.send_text(message)
+
+    typer.echo(message)
+    if not sent:
+        typer.echo("")
+        typer.echo("(Telegram send failed - see above for details.)")
+        raise typer.Exit(code=2)
+
+    raise typer.Exit(code=EXIT_CODES[report.status])
 
 
 def main() -> None:
