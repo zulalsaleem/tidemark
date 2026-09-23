@@ -59,6 +59,17 @@
                  |  CHANGE DETECTOR -> TELEGRAM |
                  |  read-only, filtered alert   |
                  +----------------------------+
+
+                 +----------------------------+
+                 |  health/checks.py           |
+                 |  reads data/store.py only    |
+                 |  (own side branch, not in    |
+                 |  the evaluate/journal/alert  |
+                 |  flow above) -> `health check`|
+                 |  or, via notify/telegram.py's |
+                 |  build_heartbeat_message,     |
+                 |  `health heartbeat`           |
+                 +----------------------------+
 ```
 
 `journal/pipeline.py` orchestrates the last three stages for `tidemark
@@ -66,7 +77,9 @@ run`, mirroring `data/ingest.py`'s per-symbol failure isolation and
 COMPLETED/PARTIAL/FAILED run status. `context/mtf.py` (Section 2, 1H
 behavior) is DRAFT and not wired into this pipeline. See
 [ADR 0005](adr/0005-journal-and-alert-separation.md) for why the journal
-and Telegram stages are never coupled.
+and Telegram stages are never coupled, and
+[ADR 0006](adr/0006-health-check-design.md) for why `health/checks.py`
+is a separate read-only side branch rather than part of that pipeline.
 
 ## Module responsibilities
 
@@ -87,8 +100,9 @@ and Telegram stages are never coupled.
 | `journal/records.py` | Builds the append-only journal row (`JournalEntry`) from an evaluated `ContextRecord`. One row per evaluation, including every WAIT — "no setups found" is a successful run, not a failure. |
 | `journal/changes.py` | Pure change detector: previous journal row + current evaluation -> an alert reason or `None`. No I/O. See [ADR 0005](adr/0005-journal-and-alert-separation.md) for why this stays decoupled from the journal write and from Telegram. |
 | `journal/pipeline.py` | Orchestrates `tidemark run`: evaluate -> journal -> change detector -> Telegram, per symbol, with per-symbol failure isolation and the run lifecycle (COMPLETED/PARTIAL/FAILED), mirroring `data/ingest.py`'s pattern. |
-| `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape, with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. No order-placement code path exists anywhere in this project. |
-| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal. |
+| `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
+| `health/checks.py` | Pure health checks reading only `data/store.py`: database reachability/schema, candle freshness, last run per command, journal activity, gap counts, Telegram config presence. Never sends anything itself — see [ADR 0006](adr/0006-health-check-design.md). |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive. |
 
 ## TODO
 
@@ -108,3 +122,7 @@ and Telegram stages are never coupled.
   prevent or roll back a journal write. The journal write always happens
   first and is committed before the change detector or Telegram are ever
   invoked.
+- `health check` never sends anything and a Telegram failure never affects
+  its exit code; `health heartbeat` is the only health command that sends,
+  and it never writes to the journal — a heartbeat is a system-status
+  message, not a research observation.
