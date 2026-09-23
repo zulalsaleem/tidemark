@@ -55,6 +55,22 @@ def detect_change(previous: JournalEntry | None, current: ContextRecord) -> str 
     # State-level transitions take priority over watch-level ones: a
     # break happens to always carry watch=WAIT, so without this order a
     # break out of an open watch would look like a mere WATCH_CLOSED.
+    #
+    # cur_state in _BROKEN_STATES also covers STRUCTURE_BROKEN_BULL ->
+    # STRUCTURE_BROKEN_BEAR (and the mirror): a different broken state is
+    # still reported as STRUCTURE_BROKEN, not STRUCTURE_RESOLVED. This
+    # transition is possible because context/htf.py's state machine can
+    # recompute bias and immediately re-break within the same candle
+    # (broken -> a new post-break swing confirms -> bias recomputes ->
+    # the same candle's close also breaches the newly-computed watched
+    # level). "Any state -> STRUCTURE_BROKEN_BULL/_BEAR" reads as "which
+    # structure is broken right now", not "structure just resolved" -
+    # structure never stopped being broken here, it just broke in the
+    # other direction, so STRUCTURE_RESOLVED (which means "no longer
+    # broken") would misdescribe it. The all-unchanged check above
+    # already excludes the case where cur_state equals prev_state, so by
+    # construction this branch is only reached when the broken direction
+    # actually changed.
     if cur_state in _BROKEN_STATES:
         return STRUCTURE_BROKEN
     if prev_state in _BROKEN_STATES:

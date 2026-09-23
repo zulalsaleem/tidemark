@@ -79,3 +79,11 @@ committed.
   the "no setups found" runs are exactly the runs a research record
   needs most, since they're what makes the alert-worthy runs
   statistically meaningful rather than a self-selected highlight reel.
+- One transition PART B names but doesn't spell out:
+  `STRUCTURE_BROKEN_BULL -> STRUCTURE_BROKEN_BEAR` (and the mirror) is
+  reported as `STRUCTURE_BROKEN`, not `STRUCTURE_RESOLVED`. Structure
+  never stopped being broken in that transition, it just broke in the
+  other direction, so `STRUCTURE_RESOLVED` ("no longer broken") would
+  misdescribe it; "any state -> STRUCTURE_BROKEN_BULL/_BEAR" is read as
+  naming which structure is broken right now. See the comment on that
+  branch in `journal/changes.py::detect_change`.
