@@ -37,27 +37,36 @@
                  |  recalculated at every       |
                  |  4H close                    |
                  +--------------+-------------+
-                                |  output record
-                                v
-                 +----------------------------+
-                 |  context/mtf.py             |
-                 |  Section 2 (1H, DRAFT)      |
-                 +--------------+-------------+
-                                |
+                                |  ContextRecord (every evaluation)
                                 v
                  +----------------------------+
                  |  journal/records.py         |
-                 |  append-only observation     |
-                 |  log (every run, incl.       |
-                 |  "no setups found")          |
+                 |  EVALUATION -> JOURNAL       |
+                 |  append-only: one row per    |
+                 |  evaluation, incl. every WAIT|
                  +--------------+-------------+
-                                |
+                                |  previous row + current evaluation
+                                v
+                 +----------------------------+
+                 |  journal/changes.py         |
+                 |  JOURNAL -> CHANGE DETECTOR  |
+                 |  pure function -> reason|None|
+                 +--------------+-------------+
+                                |  only when a reason was returned
                                 v
                  +----------------------------+
                  |  notify/telegram.py         |
-                 |  read-only alert            |
+                 |  CHANGE DETECTOR -> TELEGRAM |
+                 |  read-only, filtered alert   |
                  +----------------------------+
 ```
+
+`journal/pipeline.py` orchestrates the last three stages for `tidemark
+run`, mirroring `data/ingest.py`'s per-symbol failure isolation and
+COMPLETED/PARTIAL/FAILED run status. `context/mtf.py` (Section 2, 1H
+behavior) is DRAFT and not wired into this pipeline. See
+[ADR 0005](adr/0005-journal-and-alert-separation.md) for why the journal
+and Telegram stages are never coupled.
 
 ## Module responsibilities
 
@@ -65,7 +74,7 @@
 | --- | --- |
 | `config/settings.py` | Load configuration from environment variables (via `.env` in development). No secrets in code; secret fields are `SecretStr` and never logged; no field may hold an exchange credential. |
 | `data/models.py` | SQLAlchemy ORM models: `Candle`, `RejectedCandle`, `Run`, `RunSymbolStat`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`. A `UTCDateTime` type keeps every stored timestamp UTC-aware despite SQLite having no native timezone type. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. |
-| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, and idempotent context-record upserts (keyed on asset + evaluated_at + rule_version). |
+| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, idempotent context-record upserts (keyed on asset + evaluated_at + rule_version), and append-only journal writes (`UNIQUE(asset, evaluated_at, rule_version)` — a repeat is a no-op, never a second row or an update) plus the one narrow exception, `record_alert_outcome`. |
 | `data/exchange.py` | ccxt-backed market-data client. Venue is configuration (default `binanceusdm`; also works with `bitget`, `mexc`, ... unchanged). Constructed with no credentials — `apiKey`/`secret` are asserted empty. Fetches closed candles only, with bounded-retry backoff on transient network errors. |
 | `data/timeframes.py` | The stored timeframe set (5m, 15m, 1h, 4h, 1d, 1w) and their durations — the single source of truth shared by the exchange client, store, and CLI. |
 | `data/ingest.py` | Orchestrates exchange fetch + store upsert + run recording for `backfill`/`update`. One symbol/timeframe failing never aborts the others; run status is COMPLETED/PARTIAL/FAILED. |
@@ -75,9 +84,11 @@
 | `core/fib.py` | Retracement leg detection (min 2x ATR), the 0.500-0.786 Fib zone, and invalidation on a 4H close beyond the leg start. |
 | `context/htf.py` | Section 1 — full state machine (bias, break, broken-state persistence) and the 9-row decision matrix against 4H closes; see [ADR 0003](adr/0003-rulebook-as-single-source-of-truth.md). Level role (support/resistance) is computed fresh each evaluation via `core.levels.level_role`, per v1.1's RULE 1.7a — see [ADR 0004](adr/0004-dynamic-level-role.md). |
 | `context/mtf.py` | Section 2 — 1H behavior. Currently DRAFT/PENDING; not yet active. |
-| `journal/records.py` | Append-only log of every evaluation run, including runs where no setup is found. |
-| `notify/telegram.py` | Sends read-only alerts to Telegram. No order-placement code path exists anywhere in this project. |
-| `cli.py` | Typer entrypoint: `data backfill` pages the exchange client into the store; `context evaluate` (with optional `--as-of`), `context history`, and `context explain` drive Section 1 from stored candles. |
+| `journal/records.py` | Builds the append-only journal row (`JournalEntry`) from an evaluated `ContextRecord`. One row per evaluation, including every WAIT — "no setups found" is a successful run, not a failure. |
+| `journal/changes.py` | Pure change detector: previous journal row + current evaluation -> an alert reason or `None`. No I/O. See [ADR 0005](adr/0005-journal-and-alert-separation.md) for why this stays decoupled from the journal write and from Telegram. |
+| `journal/pipeline.py` | Orchestrates `tidemark run`: evaluate -> journal -> change detector -> Telegram, per symbol, with per-symbol failure isolation and the run lifecycle (COMPLETED/PARTIAL/FAILED), mirroring `data/ingest.py`'s pattern. |
+| `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape, with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. No order-placement code path exists anywhere in this project. |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal. |
 
 ## TODO
 
@@ -93,3 +104,7 @@
   marked `NOT_DEFINED`, never guessed.
 - Every emitted `ContextRecord` carries the `rule_version` that produced it.
 - Secrets are read from the environment and never logged.
+- The journal and Telegram are never coupled: a Telegram failure must never
+  prevent or roll back a journal write. The journal write always happens
+  first and is committed before the change detector or Telegram are ever
+  invoked.

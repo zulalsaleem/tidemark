@@ -33,21 +33,34 @@ closed candles (exchange, read-only)
   context/htf.py   Section 1 — 4H context, evaluated at every 4H close
         |
         v
-  context/mtf.py   Section 2 — 1H behavior (DRAFT, not yet active)
+  journal/records.py   EVALUATION -> JOURNAL
+                        append-only: one row per evaluation, incl. every WAIT
         |
         v
-  journal/records.py   append-only observation log (every run, incl. "no setups")
+  journal/changes.py   JOURNAL -> CHANGE DETECTOR
+                        pure function; previous journal row + current
+                        evaluation -> an alert reason, or None
         |
-        v
-  notify/telegram.py   read-only alert  ->  Telegram
+        v (only when a reason was returned)
+  notify/telegram.py   CHANGE DETECTOR -> TELEGRAM
+                        read-only, filtered alert
 ```
+
+The journal is the complete research record; Telegram is a filtered
+notification layer on top of it. They are never coupled — a Telegram
+failure never prevents or rolls back a journal write, and the journal
+write always happens first. See
+[docs/adr/0005-journal-and-alert-separation.md](docs/adr/0005-journal-and-alert-separation.md).
+`context/mtf.py` (Section 2, 1H behavior) is still DRAFT and not wired
+into this pipeline.
 
 Persistence (SQLite via SQLAlchemy) sits alongside this pipeline in
 `data/store.py`, holding closed candles, rejected candles, run records,
-and emitted context records. Swings, levels, and Fib legs are pure
-calculations recomputed from stored candles at every evaluation rather
-than persisted separately. Market data comes from `data/exchange.py`, a
-ccxt-backed client with no exchange credentials — see
+emitted context records, and journal rows. Swings, levels, and Fib legs
+are pure calculations recomputed from stored candles at every evaluation
+rather than persisted separately. Market data comes from
+`data/exchange.py`, a ccxt-backed client with no exchange credentials —
+see
 [docs/adr/0002-canonical-market-data-venue.md](docs/adr/0002-canonical-market-data-venue.md)
 for the canonical-venue rationale.
 
@@ -110,23 +123,46 @@ uv run tidemark context history --symbol BTC/USDT:USDT
 uv run tidemark context explain --symbol BTC/USDT:USDT
 ```
 
+## Using the run pipeline
+
+```bash
+# Evaluate Section 1 for each symbol, journal the result (a no-op if this
+# 4H candle is already journaled), and send a Telegram alert only if the
+# change detector finds a reason to. One symbol failing gives PARTIAL,
+# not FAILED.
+uv run tidemark run --symbols BTC/USDT:USDT
+
+# The full research record for a symbol, newest first — every evaluation,
+# including every WAIT.
+uv run tidemark journal list --symbol BTC/USDT:USDT
+
+# Only the rows where an alert actually went out, across all symbols.
+uv run tidemark journal alerts
+
+# Send one fixed message to prove TIDEMARK_TELEGRAM_BOT_TOKEN /
+# TIDEMARK_TELEGRAM_CHAT_ID work. Writes nothing to the journal.
+uv run tidemark notify test
+```
+
 ## Project status
 
-**Phase 1 + Phase 2 — data layer and Section 1 HTF context engine.** The
-market-data pipeline is implemented: a ccxt-backed exchange client
-(public data only, no credentials, closed candles only), idempotent
-SQLite storage with per-row sanity checks, rejected-candle recording, gap
-detection, and run bookkeeping, and `tidemark data backfill/update/gaps/
-status` CLI commands. Section 1 of the rulebook (HTF context, locked at
-v1.1) is fully implemented on top of that: ATR(14), fractal swing
-detection, horizontal levels (swing clusters + previous day/week
-high/low), Fibonacci retracement legs, and the Section 1 state machine
-and 9-row decision matrix, all recalculated at every 4H close and
-persisted idempotently. `tidemark context evaluate/history/explain` drive
-the engine from the CLI, including `--as-of` for point-in-time
-reproduction. Section 2 (1H behavior) is still in draft and
-unimplemented. Telegram alert delivery and the end-to-end `run` pipeline
-are not yet wired up.
+**Phase 1 + 2 + 3 — data layer, Section 1 HTF context engine, and the
+journal/alert pipeline.** The market-data pipeline is implemented: a
+ccxt-backed exchange client (public data only, no credentials, closed
+candles only), idempotent SQLite storage with per-row sanity checks,
+rejected-candle recording, gap detection, and run bookkeeping, and
+`tidemark data backfill/update/gaps/status` CLI commands. Section 1 of
+the rulebook (HTF context, locked at v1.1) is fully implemented on top
+of that: ATR(14), fractal swing detection, horizontal levels (swing
+clusters + previous day/week high/low), Fibonacci retracement legs, and
+the Section 1 state machine and 9-row decision matrix, all recalculated
+at every 4H close. `tidemark run` ties it together: evaluate -> append
+to the journal (the complete research record, one row per evaluation,
+including every WAIT) -> a pure change detector -> a filtered, read-only
+Telegram alert on change only. `tidemark context evaluate/history/
+explain` still drive the engine standalone, including `--as-of` for
+point-in-time reproduction. Section 2 (1H behavior) is still in draft
+and unimplemented.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
