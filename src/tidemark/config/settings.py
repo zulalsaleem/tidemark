@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # Market data (read-only; no exchange trading permissions)
     exchange_api_key: SecretStr | None = None
     exchange_base_url: str | None = None
+    exchange_id: str = "binanceusdm"
 
     # Storage
     database_url: str = "sqlite:///tidemark.db"
