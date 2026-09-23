@@ -63,10 +63,25 @@ def version() -> None:
     typer.echo(__version__)
 
 
-def _parse_csv(value: str | None) -> list[str] | None:
-    if value is None:
+def _parse_csv(values: list[str] | None) -> list[str] | None:
+    """Flatten repeated `--flag` occurrences and comma-separated values.
+
+    Accepts both `--symbols A --symbols B` and `--symbols A,B` (and a mix
+    of the two), so `--symbols`/`--timeframes` work whether the shell
+    delivers one token per occurrence or one token with embedded commas.
+
+    This matters on Windows: PowerShell parses an unquoted comma list as
+    an array-literal expression before the process ever starts, and a
+    token like `1d` matches its decimal-literal-with-suffix grammar
+    (`d` = System.Decimal), so it gets evaluated to the number 1 and
+    re-stringified as "1" — silently dropping the "d". Quoting
+    (`--timeframes "4h,1d,1w"`) avoids that, and so does the repeated-flag
+    form, since no single token then contains a comma for PowerShell's
+    parser to act on.
+    """
+    if not values:
         return None
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    items = [item.strip() for value in values for item in value.split(",") if item.strip()]
     return items or None
 
 
@@ -92,11 +107,24 @@ def _print_run_outcome(outcome: RunOutcome) -> None:
 
 @data_app.command("backfill")
 def data_backfill(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help=(
+            "Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS. "
+            'In PowerShell, quote a comma-separated value (e.g. --symbols "A,B") or '
+            "repeat --symbols instead of leaving it unquoted."
+        ),
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help=(
+            "Timeframes: repeat the flag or comma-separate; defaults to all stored "
+            "timeframes. In PowerShell, quote a comma-separated value (e.g. "
+            '--timeframes "4h,1d,1w") or repeat --timeframes instead of leaving it '
+            "unquoted — unquoted, PowerShell parses 1d as a number and drops the d."
+        ),
     ),
     days: int = typer.Option(
         None, "--days", help="Backfill depth in days; defaults to TIDEMARK_BACKFILL_DAYS."
@@ -117,11 +145,15 @@ def data_backfill(
 
 @data_app.command("update")
 def data_update(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Fetch closed candles from the last stored candle up to now."""
@@ -145,11 +177,15 @@ def data_update(
 
 @data_app.command("gaps")
 def data_gaps(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Report missing candles per symbol/timeframe. Never fabricates data."""
@@ -174,11 +210,15 @@ def data_gaps(
 
 @data_app.command("status")
 def data_status(
-    symbols: str = typer.Option(
-        None, "--symbols", help="Comma-separated symbols; defaults to TIDEMARK_SYMBOLS."
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
     ),
-    timeframes: str = typer.Option(
-        None, "--timeframes", help="Comma-separated timeframes; defaults to all stored timeframes."
+    timeframes: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--timeframes",
+        help="Timeframes: repeat the flag or comma-separate; defaults to all stored timeframes.",
     ),
 ) -> None:
     """Show latest candle time, row counts, and the last run's status."""

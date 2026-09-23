@@ -83,6 +83,15 @@ uv run tidemark data gaps
 
 ## Using Section 1
 
+> **PowerShell users:** quote comma-separated `--symbols`/`--timeframes`
+> values (`--timeframes "4h,1d,1w"`), or repeat the flag instead
+> (`--timeframes 4h --timeframes 1d --timeframes 1w`). Left unquoted,
+> PowerShell parses a bare comma list as an array-literal expression
+> before the process even starts, and a token like `1d` matches its
+> decimal-literal-with-suffix grammar (`d` = `System.Decimal`) — so it
+> silently becomes the number `1`, not the string `"1d"`. Bash is
+> unaffected.
+
 ```bash
 # Backfill closed 4H/1D/1W candles for a symbol (read-only, no API key needed
 # for public OHLCV on the default exchange).
