@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from pydantic import SecretStr
 
@@ -111,6 +112,50 @@ def _http_send(token: str, chat_id: str, text: str) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class TelegramSendError:
+    """Classifies why the most recent `send_text` attempt failed.
+
+    `kind="connection"` means the request never reached Telegram at all
+    (timeout, DNS failure, SSL handshake failure, connection refused,
+    ...) — `detail` is the raw error, and nothing about it says anything
+    about whether the credentials are valid. `kind="http_error"` means
+    Telegram's API answered with a non-2xx status — `status_code` and
+    `detail` (Telegram's own "description" field where available) then
+    say something real about *why* it was rejected, e.g. 401 for a bad
+    bot token, or 400 with "chat not found" for a bad chat ID.
+    """
+
+    kind: str  # "connection" or "http_error"
+    detail: str
+    status_code: int | None = None
+
+
+def _classify_error(exc: Exception) -> TelegramSendError:
+    if isinstance(exc, urllib.error.HTTPError):
+        return TelegramSendError(
+            kind="http_error", detail=_telegram_error_description(exc), status_code=exc.code
+        )
+    return TelegramSendError(kind="connection", detail=str(exc))
+
+
+def _telegram_error_description(exc: urllib.error.HTTPError) -> str:
+    """Best-effort extraction of Telegram's own error text from the
+    response body (`{"ok": false, "description": "..."}`). Falls back to
+    the HTTP reason phrase if the body isn't readable or isn't JSON —
+    this must never raise, it's only ever called while already handling
+    a failure.
+    """
+    try:
+        payload = json.loads(exc.read())
+        description = payload.get("description")
+        if description:
+            return str(description)
+    except Exception:
+        pass
+    return exc.reason or str(exc)
+
+
 class TelegramNotifier:
     """Sends read-only alerts to a configured Telegram chat.
 
@@ -137,6 +182,7 @@ class TelegramNotifier:
         self._base_backoff_seconds = base_backoff_seconds
         self._sleep_fn = sleep_fn
         self._send_fn = send_fn
+        self._last_error: TelegramSendError | None = None
 
     def __repr__(self) -> str:
         return f"TelegramNotifier(chat_id={self._chat_id!r})"
@@ -146,6 +192,14 @@ class TelegramNotifier:
         has_token = self._bot_token is not None and bool(self._bot_token.get_secret_value())
         return has_token and bool(self._chat_id)
 
+    @property
+    def last_error(self) -> TelegramSendError | None:
+        """Why the most recent `send_text` call failed, or `None` if it
+        succeeded, was never attempted (missing credentials), or hasn't
+        been called yet. Reset at the start of every `send_text` call.
+        """
+        return self._last_error
+
     def send_text(self, text: str) -> bool:
         """Send a raw message. Returns whether it was actually sent.
 
@@ -154,6 +208,7 @@ class TelegramNotifier:
         `max_retries` times with exponential backoff; on final failure,
         logs and returns False. Never raises.
         """
+        self._last_error = None
         if not self.is_configured:
             logger.warning("Telegram not configured (missing bot token or chat id) - skipping send")
             return False
@@ -163,8 +218,10 @@ class TelegramNotifier:
         while True:
             try:
                 self._send_fn(token, self._chat_id, text)
+                self._last_error = None
                 return True
             except Exception as exc:
+                self._last_error = _classify_error(exc)
                 attempt += 1
                 if attempt > self._max_retries:
                     logger.error(

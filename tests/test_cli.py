@@ -303,6 +303,10 @@ class _FakeNotifier:
 
     sent_messages: list[str] = []
     succeed: bool = True
+    # None here reads as "never attempted" (missing credentials) to
+    # notify_test's message branching - the connection-vs-http-error
+    # distinction itself is covered directly in tests/notify/test_telegram.py.
+    last_error = None
 
     def __init__(self, bot_token, chat_id) -> None:  # noqa: ARG002
         pass
@@ -443,3 +447,61 @@ def test_notify_test_reports_failure(
 
     assert result.exit_code != 0
     assert "NOT sent" in result.stdout
+
+
+def test_notify_test_reports_connection_failure_distinctly(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    """A connection-level failure never reached Telegram, so the message
+    must not imply anything about whether credentials are valid."""
+    from tidemark.notify.telegram import TelegramSendError
+
+    _use_temp_db(tmp_path, monkeypatch)
+    _fake_notifier.succeed = False
+    _fake_notifier.last_error = TelegramSendError(kind="connection", detail="timed out")
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code != 0
+    assert "unreachable" in result.stdout
+    assert "not verified" in result.stdout
+    assert "firewall" in result.stdout
+    assert "TIDEMARK_TELEGRAM_BOT_TOKEN" not in result.stdout
+
+
+def test_notify_test_reports_http_401_with_status_and_hint(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    from tidemark.notify.telegram import TelegramSendError
+
+    _use_temp_db(tmp_path, monkeypatch)
+    _fake_notifier.succeed = False
+    _fake_notifier.last_error = TelegramSendError(
+        kind="http_error", detail="Unauthorized", status_code=401
+    )
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code != 0
+    assert "HTTP 401" in result.stdout
+    assert "Unauthorized" in result.stdout
+    assert "TIDEMARK_TELEGRAM_BOT_TOKEN" in result.stdout
+
+
+def test_notify_test_reports_http_400_chat_not_found_with_hint(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    from tidemark.notify.telegram import TelegramSendError
+
+    _use_temp_db(tmp_path, monkeypatch)
+    _fake_notifier.succeed = False
+    _fake_notifier.last_error = TelegramSendError(
+        kind="http_error", detail="Bad Request: chat not found", status_code=400
+    )
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code != 0
+    assert "HTTP 400" in result.stdout
+    assert "chat not found" in result.stdout
+    assert "TIDEMARK_TELEGRAM_CHAT_ID" in result.stdout

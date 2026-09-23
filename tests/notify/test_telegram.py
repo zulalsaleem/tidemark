@@ -1,6 +1,9 @@
 """Telegram notifier: send-only, bounded retry, no real network anywhere."""
 
 import datetime as dt
+import io
+import json
+import urllib.error
 
 from tidemark.data.models import ContextRecord
 from tidemark.notify.telegram import DISCLAIMER, TelegramNotifier, build_message
@@ -191,6 +194,136 @@ def test_send_text_gives_up_after_max_retries_and_returns_false() -> None:
     )
 
     assert notifier.send_text("hello") is False
+
+
+# --- error classification: connection failure vs HTTP response -------------
+
+
+def _telegram_http_error(status_code: int, description: str) -> urllib.error.HTTPError:
+    body = json.dumps({"ok": False, "error_code": status_code, "description": description})
+    return urllib.error.HTTPError(
+        url="https://api.telegram.org/botX/sendMessage",
+        code=status_code,
+        msg="Bad Request" if status_code == 400 else "Unauthorized",
+        hdrs=None,
+        fp=io.BytesIO(body.encode()),
+    )
+
+
+def test_connection_failure_never_reaches_telegram_and_is_classified_as_connection() -> None:
+    """A fake transport that fails before any HTTP response exists
+    (timeout, DNS, SSL, refused - all surface as some non-HTTPError
+    exception from urllib): last_error must say the request never
+    reached Telegram, not anything about credentials."""
+
+    def times_out(token, chat_id, text):
+        raise TimeoutError("simulated connection timeout")
+
+    notifier = TelegramNotifier(
+        bot_token="tok",
+        chat_id="123",
+        max_retries=1,
+        send_fn=times_out,
+        sleep_fn=lambda seconds: None,
+    )
+
+    sent = notifier.send_text("hello")
+
+    assert sent is False
+    assert notifier.last_error is not None
+    assert notifier.last_error.kind == "connection"
+    assert notifier.last_error.status_code is None
+    assert "timeout" in notifier.last_error.detail.lower()
+
+
+def test_http_401_is_classified_as_http_error_with_status_and_description() -> None:
+    """A fake transport that raises a real HTTPError, as urllib would
+    once a response was actually received: last_error must carry the
+    status code and Telegram's own description, not a generic message."""
+
+    def unauthorized(token, chat_id, text):
+        raise _telegram_http_error(401, "Unauthorized")
+
+    notifier = TelegramNotifier(
+        bot_token="bad-token",
+        chat_id="123",
+        max_retries=1,
+        send_fn=unauthorized,
+        sleep_fn=lambda seconds: None,
+    )
+
+    sent = notifier.send_text("hello")
+
+    assert sent is False
+    assert notifier.last_error is not None
+    assert notifier.last_error.kind == "http_error"
+    assert notifier.last_error.status_code == 401
+    assert notifier.last_error.detail == "Unauthorized"
+
+
+def test_http_400_chat_not_found_is_classified_as_http_error() -> None:
+    def chat_not_found(token, chat_id, text):
+        raise _telegram_http_error(400, "Bad Request: chat not found")
+
+    notifier = TelegramNotifier(
+        bot_token="tok",
+        chat_id="bad-chat-id",
+        max_retries=1,
+        send_fn=chat_not_found,
+        sleep_fn=lambda seconds: None,
+    )
+
+    sent = notifier.send_text("hello")
+
+    assert sent is False
+    assert notifier.last_error is not None
+    assert notifier.last_error.kind == "http_error"
+    assert notifier.last_error.status_code == 400
+    assert "chat not found" in notifier.last_error.detail.lower()
+
+
+def test_last_error_is_none_before_any_send_and_after_a_success() -> None:
+    notifier = TelegramNotifier(
+        bot_token="tok", chat_id="123", send_fn=lambda token, chat_id, text: None
+    )
+
+    assert notifier.last_error is None
+
+    assert notifier.send_text("hello") is True
+    assert notifier.last_error is None
+
+
+def test_last_error_is_none_when_credentials_are_missing() -> None:
+    # Never attempted a request at all - not a connection or HTTP failure.
+    notifier = TelegramNotifier(bot_token=None, chat_id="123")
+
+    assert notifier.send_text("hello") is False
+    assert notifier.last_error is None
+
+
+def test_retry_behaviour_is_unchanged_for_http_errors() -> None:
+    """This change is message text only: an HTTPError must still be
+    retried exactly like any other exception, up to max_retries."""
+    attempts = {"n": 0}
+
+    def fails_twice_then_succeeds(token, chat_id, text):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _telegram_http_error(500, "Internal Server Error")
+
+    slept = []
+    notifier = TelegramNotifier(
+        bot_token="tok",
+        chat_id="123",
+        max_retries=5,
+        send_fn=fails_twice_then_succeeds,
+        sleep_fn=lambda seconds: slept.append(seconds),
+    )
+
+    assert notifier.send_text("hello") is True
+    assert attempts["n"] == 3
+    assert len(slept) == 2
+    assert notifier.last_error is None  # cleared on the eventual success
 
 
 def test_missing_bot_token_skips_send_without_crashing() -> None:

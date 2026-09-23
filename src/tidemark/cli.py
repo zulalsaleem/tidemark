@@ -544,11 +544,33 @@ def notify_test() -> None:
     sent = notifier.send_text(_TEST_MESSAGE)
     if sent:
         typer.echo("Test message sent.")
-    else:
+        return
+
+    error = notifier.last_error
+    if error is None:
+        # send_text never attempted a request at all: missing credentials.
         typer.echo(
             "Test message NOT sent - check TIDEMARK_TELEGRAM_BOT_TOKEN / TIDEMARK_TELEGRAM_CHAT_ID."
         )
-        raise typer.Exit(code=1)
+    elif error.kind == "connection":
+        # The request never reached Telegram, so this says nothing about
+        # whether the credentials are valid.
+        typer.echo(
+            f"Test message NOT sent - the Telegram API was unreachable ({error.detail}). "
+            "Credentials were not verified: the request never reached Telegram. This is "
+            "usually network filtering or a firewall blocking the connection, not a bad "
+            "bot token or chat ID."
+        )
+    else:
+        typer.echo(
+            f"Test message NOT sent - Telegram responded with HTTP {error.status_code}: "
+            f"{error.detail}"
+        )
+        if error.status_code == 401:
+            typer.echo("HTTP 401 usually means TIDEMARK_TELEGRAM_BOT_TOKEN is invalid.")
+        elif error.status_code == 400 and "chat not found" in error.detail.lower():
+            typer.echo("This usually means TIDEMARK_TELEGRAM_CHAT_ID is invalid.")
+    raise typer.Exit(code=1)
 
 
 def main() -> None:
