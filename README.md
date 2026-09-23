@@ -144,25 +144,52 @@ uv run tidemark journal alerts
 uv run tidemark notify test
 ```
 
+## Health check and heartbeat
+
+Telegram is silent unless state changes, so silence is ambiguous — it
+could mean nothing changed, or it could mean the system died. `health`
+makes silence trustworthy by inspecting what's actually in the database:
+is it reachable, is candle data fresh, did the last run succeed, is the
+journal still being written, are there gaps, and is Telegram even
+configured. See
+[docs/adr/0006-health-check-design.md](docs/adr/0006-health-check-design.md)
+for why the thresholds are what they are.
+
+```bash
+# Every check, human-readable. Exit code is 0/1/2 for OK/WARN/FAIL, so
+# systemd (or any monitor) can treat a degraded state as a failure.
+uv run tidemark health check
+
+# Same checks, machine-readable — for future monitoring.
+uv run tidemark health check --json
+
+# Run the checks and send one Telegram summary. The only `health`
+# command that sends anything; never writes to the journal, since a
+# heartbeat is a system-status message, not a research observation.
+uv run tidemark health heartbeat
+```
+
 ## Project status
 
-**Phase 1 + 2 + 3 — data layer, Section 1 HTF context engine, and the
-journal/alert pipeline.** The market-data pipeline is implemented: a
-ccxt-backed exchange client (public data only, no credentials, closed
-candles only), idempotent SQLite storage with per-row sanity checks,
-rejected-candle recording, gap detection, and run bookkeeping, and
-`tidemark data backfill/update/gaps/status` CLI commands. Section 1 of
-the rulebook (HTF context, locked at v1.1) is fully implemented on top
-of that: ATR(14), fractal swing detection, horizontal levels (swing
-clusters + previous day/week high/low), Fibonacci retracement legs, and
-the Section 1 state machine and 9-row decision matrix, all recalculated
-at every 4H close. `tidemark run` ties it together: evaluate -> append
-to the journal (the complete research record, one row per evaluation,
-including every WAIT) -> a pure change detector -> a filtered, read-only
-Telegram alert on change only. `tidemark context evaluate/history/
-explain` still drive the engine standalone, including `--as-of` for
-point-in-time reproduction. Section 2 (1H behavior) is still in draft
-and unimplemented.
+**Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
+journal/alert pipeline, and health/heartbeat.** The market-data pipeline
+is implemented: a ccxt-backed exchange client (public data only, no
+credentials, closed candles only), idempotent SQLite storage with
+per-row sanity checks, rejected-candle recording, gap detection, and run
+bookkeeping, and `tidemark data backfill/update/gaps/status` CLI
+commands. Section 1 of the rulebook (HTF context, locked at v1.1) is
+fully implemented on top of that: ATR(14), fractal swing detection,
+horizontal levels (swing clusters + previous day/week high/low),
+Fibonacci retracement legs, and the Section 1 state machine and 9-row
+decision matrix, all recalculated at every 4H close. `tidemark run` ties
+it together: evaluate -> append to the journal (the complete research
+record, one row per evaluation, including every WAIT) -> a pure change
+detector -> a filtered, read-only Telegram alert on change only.
+`tidemark health check/heartbeat` proves the unattended system is
+actually alive, independent of whether anything alert-worthy has
+happened. `tidemark context evaluate/history/explain` still drive the
+engine standalone, including `--as-of` for point-in-time reproduction.
+Section 2 (1H behavior) is still in draft and unimplemented.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
