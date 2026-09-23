@@ -1,92 +1,196 @@
-"""SQLite persistence: candle upserts, as-of filtering, idempotent context records."""
+"""Storage: idempotent upserts, sanity checks, gap detection, run bookkeeping."""
+
+from __future__ import annotations
 
 import datetime as dt
 
+import pytest
 from sqlalchemy import inspect
 
-from tidemark.data.models import Candle, ContextRecord
-from tidemark.data.store import TidemarkStore, create_store_engine, init_db
+from tidemark.data.exchange import RawCandle
+from tidemark.data.models import ContextRecord, RejectedCandle
+from tidemark.data.store import CandleUpsertResult, TidemarkStore, create_store_engine, init_db
 
-START = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+VENUE = "binanceusdm"
+SYMBOL = "BTC/USDT:USDT"
+TIMEFRAME = "4h"
 
 
-def _store() -> TidemarkStore:
+def _candle(open_time: dt.datetime, o=100.0, h=110.0, low=90.0, c=105.0, v=10.0) -> RawCandle:
+    return RawCandle(
+        open_time=open_time,
+        close_time=open_time + dt.timedelta(hours=4),
+        open=o,
+        high=h,
+        low=low,
+        close=c,
+        volume=v,
+    )
+
+
+@pytest.fixture
+def store() -> TidemarkStore:
     engine = create_store_engine("sqlite:///:memory:")
     init_db(engine)
     return TidemarkStore(engine)
-
-
-def _candle(i: int, close: float = 100.0) -> Candle:
-    close_time = START + dt.timedelta(hours=4 * i)
-    return Candle(
-        asset="BTCUSDT",
-        timeframe="4h",
-        open_time=close_time - dt.timedelta(hours=4),
-        close_time=close_time,
-        open=close,
-        high=close + 1,
-        low=close - 1,
-        close=close,
-        volume=10.0,
-    )
 
 
 def test_init_db_creates_expected_tables() -> None:
     engine = create_store_engine("sqlite:///:memory:")
     init_db(engine)
     tables = set(inspect(engine).get_table_names())
-    assert {"candles", "swings", "levels", "context_records", "journal_entries"} <= tables
+    assert {
+        "candles",
+        "rejected_candles",
+        "runs",
+        "run_symbol_stats",
+        "swings",
+        "levels",
+        "context_records",
+        "journal_entries",
+    } <= tables
 
 
-def test_save_and_get_candles_roundtrip_oldest_to_newest() -> None:
-    store = _store()
-    store.save_candles([_candle(0, 100.0), _candle(1, 101.0), _candle(2, 102.0)])
+def test_double_upsert_inserts_zero_duplicates(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    candles = [_candle(base + dt.timedelta(hours=4 * i)) for i in range(5)]
+    fetched_at = dt.datetime.now(dt.UTC)
 
-    df = store.get_candles("BTCUSDT", "4h")
+    first = store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, fetched_at)
+    assert first == CandleUpsertResult(fetched=5, inserted=5, duplicates_skipped=0, rejected=0)
 
-    assert list(df["close"]) == [100.0, 101.0, 102.0]
-    assert list(df["close_time"]) == [
-        START,
-        START + dt.timedelta(hours=4),
-        START + dt.timedelta(hours=8),
-    ]
+    second = store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, fetched_at)
+    assert second == CandleUpsertResult(fetched=5, inserted=0, duplicates_skipped=5, rejected=0)
 
-
-def test_save_candles_upserts_on_close_time_conflict() -> None:
-    store = _store()
-    store.save_candles([_candle(0, 100.0)])
-    store.save_candles([_candle(0, 999.0)])  # same asset/timeframe/close_time
-
-    df = store.get_candles("BTCUSDT", "4h")
-
-    assert len(df) == 1
-    assert df["close"].iloc[0] == 999.0
+    assert store.count_candles(VENUE, SYMBOL, TIMEFRAME) == 5
 
 
-def test_get_candles_as_of_excludes_later_candles() -> None:
-    store = _store()
-    store.save_candles([_candle(0), _candle(1), _candle(2)])
+def test_invalid_ohlc_rows_are_rejected_and_recorded(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    good = _candle(base)
+    bad_high = _candle(base + dt.timedelta(hours=4), o=100, h=95, low=90, c=105)
+    bad_low = _candle(base + dt.timedelta(hours=8), o=100, h=110, low=101, c=105)
+    negative_volume = _candle(base + dt.timedelta(hours=12), v=-1)
+    zero_price = _candle(base + dt.timedelta(hours=16), o=0)
 
-    df = store.get_candles("BTCUSDT", "4h", as_of=START + dt.timedelta(hours=4))
+    result = store.upsert_candles(
+        VENUE,
+        SYMBOL,
+        TIMEFRAME,
+        [good, bad_high, bad_low, negative_volume, zero_price],
+        dt.datetime.now(dt.UTC),
+    )
 
-    assert list(df["close_time"]) == [START, START + dt.timedelta(hours=4)]
+    assert result.inserted == 1
+    assert result.rejected == 4
+    assert store.count_candles(VENUE, SYMBOL, TIMEFRAME) == 1
+
+    with store._session_factory() as session:
+        rejected_rows = list(session.query(RejectedCandle))
+    assert len(rejected_rows) == 4
+    assert all(row.reason for row in rejected_rows)
 
 
-def test_get_candles_limit_keeps_most_recent() -> None:
-    store = _store()
-    store.save_candles([_candle(i) for i in range(5)])
+def test_gap_detection_finds_removed_candle(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    candles = [_candle(base + dt.timedelta(hours=4 * i)) for i in range(5)]
+    del candles[2]  # remove base+8h -> a deliberate gap
 
-    df = store.get_candles("BTCUSDT", "4h", limit=2)
+    store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, dt.datetime.now(dt.UTC))
 
-    assert list(df["close_time"]) == [
-        START + dt.timedelta(hours=12),
-        START + dt.timedelta(hours=16),
-    ]
+    gaps = store.find_gaps(VENUE, SYMBOL, TIMEFRAME)
+    assert gaps == [base + dt.timedelta(hours=8)]
 
 
-def _record(evaluated_at: dt.datetime, state: str = "BULLISH") -> ContextRecord:
+def test_gap_detection_reports_nothing_for_contiguous_candles(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    candles = [_candle(base + dt.timedelta(hours=4 * i)) for i in range(5)]
+    store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, dt.datetime.now(dt.UTC))
+
+    assert store.find_gaps(VENUE, SYMBOL, TIMEFRAME) == []
+
+
+def test_stored_timestamps_are_utc_aware(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, [_candle(base)], dt.datetime.now(dt.UTC))
+
+    [candle] = store.get_candles(VENUE, SYMBOL, TIMEFRAME)
+    assert candle.open_time.tzinfo is not None
+    assert candle.open_time.utcoffset() == dt.timedelta(0)
+    assert candle.close_time.tzinfo is not None
+    assert candle.fetched_at.tzinfo is not None
+    assert candle.open_time == base
+
+
+def test_start_run_inserts_running_row(store: TidemarkStore) -> None:
+    started = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+
+    store.start_run("run-1", "backfill", started)
+
+    run = store.latest_run()
+    assert run is not None
+    assert run.run_id == "run-1"
+    assert run.status == "RUNNING"
+    assert run.finished_at is None
+    assert run.started_at.tzinfo is not None
+
+    [running] = store.running_runs()
+    assert running.run_id == "run-1"
+
+
+def test_finish_run_rejects_invalid_status(store: TidemarkStore) -> None:
+    now = dt.datetime.now(dt.UTC)
+    store.start_run("run-bad", "backfill", now)
+    with pytest.raises(ValueError, match="invalid run status"):
+        store.finish_run(run_id="run-bad", finished_at=now, status="BOGUS", stats={})
+
+
+def test_finish_run_rejects_running_as_a_final_status(store: TidemarkStore) -> None:
+    now = dt.datetime.now(dt.UTC)
+    store.start_run("run-bad", "backfill", now)
+    with pytest.raises(ValueError, match="invalid run status"):
+        store.finish_run(run_id="run-bad", finished_at=now, status="RUNNING", stats={})
+
+
+def test_start_then_finish_run_and_latest_run(store: TidemarkStore) -> None:
+    started = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    finished = started + dt.timedelta(minutes=1)
+    stats = {
+        (SYMBOL, TIMEFRAME): CandleUpsertResult(
+            fetched=5, inserted=5, duplicates_skipped=0, rejected=0
+        ),
+    }
+
+    store.start_run("run-1", "backfill", started)
+    store.finish_run("run-1", finished, "COMPLETED", stats)
+
+    run = store.latest_run()
+    assert run is not None
+    assert run.run_id == "run-1"
+    assert run.status == "COMPLETED"
+    assert run.started_at.tzinfo is not None
+    assert run.finished_at is not None
+    assert run.finished_at.tzinfo is not None
+    assert store.running_runs() == []
+
+    [stat] = store.run_symbol_stats("run-1")
+    assert stat.symbol == SYMBOL
+    assert stat.inserted == 5
+
+
+def test_running_runs_excludes_finished_ones(store: TidemarkStore) -> None:
+    now = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.start_run("run-done", "backfill", now)
+    store.finish_run("run-done", now, "COMPLETED", {})
+    store.start_run("run-stuck", "update", now)
+
+    [running] = store.running_runs()
+    assert running.run_id == "run-stuck"
+
+
+def _context_record(evaluated_at: dt.datetime, state: str = "BULLISH") -> ContextRecord:
     return ContextRecord(
-        asset="BTCUSDT",
+        asset=SYMBOL,
         evaluated_at=evaluated_at,
         rule_version="section-01-v1.0",
         state=state,
@@ -99,27 +203,62 @@ def _record(evaluated_at: dt.datetime, state: str = "BULLISH") -> ContextRecord:
     )
 
 
-def test_save_context_record_is_idempotent() -> None:
-    store = _store()
-    store.save_context_record(_record(START))
-    store.save_context_record(_record(START, state="BEARISH"))
+def test_save_context_record_is_idempotent(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
 
-    history = store.context_history("BTCUSDT")
+    store.save_context_record(_context_record(evaluated_at))
+    store.save_context_record(_context_record(evaluated_at, state="BEARISH"))
 
+    history = store.context_history(SYMBOL)
     assert len(history) == 1
     assert history[0].state == "BEARISH"
 
 
-def test_latest_context_record_returns_most_recent() -> None:
-    store = _store()
-    store.save_context_record(_record(START))
-    store.save_context_record(_record(START + dt.timedelta(hours=4)))
+def test_save_context_record_keys_on_asset_evaluated_at_and_rule_version(
+    store: TidemarkStore,
+) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    v1 = _context_record(evaluated_at)
+    v2 = ContextRecord(
+        asset=SYMBOL,
+        evaluated_at=evaluated_at,
+        rule_version="section-01-v1.1",
+        state="NEUTRAL",
+        watch="WAIT",
+        grade=None,
+        reason_code="NEUTRAL_STRUCTURE",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
 
-    latest = store.latest_context_record("BTCUSDT")
+    store.save_context_record(v1)
+    store.save_context_record(v2)
 
-    assert latest.evaluated_at == START + dt.timedelta(hours=4)
+    # Different rule_version at the same evaluated_at is a distinct row,
+    # not an overwrite.
+    assert len(store.context_history(SYMBOL)) == 2
 
 
-def test_latest_context_record_none_when_missing() -> None:
-    store = _store()
-    assert store.latest_context_record("BTCUSDT") is None
+def test_latest_context_record_returns_most_recent(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(base))
+    store.save_context_record(_context_record(base + dt.timedelta(hours=4)))
+
+    latest = store.latest_context_record(SYMBOL)
+
+    assert latest is not None
+    assert latest.evaluated_at == base + dt.timedelta(hours=4)
+
+
+def test_latest_context_record_none_when_missing(store: TidemarkStore) -> None:
+    assert store.latest_context_record(SYMBOL) is None
+
+
+def test_context_record_evaluated_at_is_utc_aware(store: TidemarkStore) -> None:
+    evaluated_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.save_context_record(_context_record(evaluated_at))
+
+    [record] = store.context_history(SYMBOL)
+    assert record.evaluated_at.tzinfo is not None
+    assert record.evaluated_at == evaluated_at

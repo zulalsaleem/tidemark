@@ -1,4 +1,9 @@
-"""Exchange client is read-only: no order endpoints, no in-progress candles."""
+"""Exchange client: closed-candle filtering, retry, no credentials.
+
+No network access — every test uses a fake ccxt-like exchange stub.
+"""
+
+from __future__ import annotations
 
 import datetime as dt
 
@@ -7,74 +12,115 @@ import pytest
 
 from tidemark.data.exchange import ExchangeClient
 
-START_MS = int(dt.datetime(2026, 1, 1, tzinfo=dt.UTC).timestamp() * 1000)
-FOUR_HOURS_MS = 4 * 60 * 60 * 1000
+
+class FakeExchange:
+    """Minimal ccxt-like stub: only `fetch_ohlcv`, no network."""
+
+    apiKey = ""
+    secret = ""
+
+    def __init__(self, rows: list[list[float]] | None = None, fail_first_n: int = 0) -> None:
+        self._rows = sorted(rows or [], key=lambda r: r[0])
+        self._fail_first_n = fail_first_n
+        self.calls = 0
+
+    def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None):
+        self.calls += 1
+        if self.calls <= self._fail_first_n:
+            raise ccxt.NetworkError("simulated transient failure")
+        since = since or 0
+        rows = [r for r in self._rows if r[0] >= since]
+        return rows[:limit] if limit is not None else rows
 
 
-class _FakeExchange:
-    """Stand-in for a ccxt exchange: no network access, deterministic clock."""
-
-    def __init__(self, config: dict) -> None:
-        self.config = config
-        self.urls = {"api": "https://example.invalid"}
-        self._now_ms = START_MS + 3 * FOUR_HOURS_MS  # "now" sits mid-way through candle 3
-
-    def parse_timeframe(self, timeframe: str) -> int:
-        assert timeframe == "4h"
-        return 4 * 60 * 60
-
-    def milliseconds(self) -> int:
-        return self._now_ms
-
-    def fetch_ohlcv(self, asset, timeframe, limit, since):
-        rows = []
-        for i in range(5):
-            open_ms = START_MS + i * FOUR_HOURS_MS
-            rows.append([open_ms, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 10.0])
-        if since is not None:
-            rows = [r for r in rows if r[0] >= since]
-        return rows[:limit]
+class _FakeExchangeWithCreds(FakeExchange):
+    apiKey = "leaked-key"
 
 
-def test_fetch_closed_candles_excludes_in_progress_candle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ccxt, "binanceusdm", _FakeExchange, raising=False)
-    client = ExchangeClient()
-
-    candles = client.fetch_closed_candles("BTC/USDT:USDT", "4h", limit=10)
-
-    # "now" is mid-way through candle index 3 (open at +3*4h), so candle 3's
-    # close (+4*4h) is still in the future and must be excluded, along with
-    # candle 4 entirely. Only candles 0-2 have fully closed.
-    assert len(candles) == 3
-    assert [c.close for c in candles] == [100.5, 101.5, 102.5]
-    for candle in candles:
-        assert candle.close_time <= dt.datetime.fromtimestamp(
-            START_MS / 1000 + 12 * 3600, tz=dt.UTC
-        )
+def _row(open_time: dt.datetime, o=100.0, h=110.0, low=90.0, c=105.0, v=10.0) -> list:
+    return [int(open_time.timestamp() * 1000), o, h, low, c, v]
 
 
-def test_fetch_closed_candles_sets_asset_and_timeframe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(ccxt, "binanceusdm", _FakeExchange, raising=False)
-    client = ExchangeClient()
+def test_forming_candle_is_excluded() -> None:
+    open_time = dt.datetime(2026, 9, 22, 8, tzinfo=dt.UTC)  # 4h candle: 08:00-12:00
+    now = open_time + dt.timedelta(hours=2)  # mid-candle
+    fake = FakeExchange(rows=[_row(open_time)])
+    client = ExchangeClient(exchange=fake, now_fn=lambda: now)
 
-    candles = client.fetch_closed_candles("BTC/USDT:USDT", "4h", limit=10)
+    candles = client.fetch_closed_candles(
+        "BTC/USDT:USDT", "4h", since=open_time, until=now + dt.timedelta(hours=1)
+    )
 
-    assert all(c.asset == "BTC/USDT:USDT" for c in candles)
-    assert all(c.timeframe == "4h" for c in candles)
+    assert candles == []
 
 
-def test_fetch_closed_candles_passes_since_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ccxt, "binanceusdm", _FakeExchange, raising=False)
-    client = ExchangeClient()
+def test_candle_closing_exactly_at_now_is_included() -> None:
+    open_time = dt.datetime(2026, 9, 22, 8, tzinfo=dt.UTC)
+    now = open_time + dt.timedelta(hours=4)  # closes exactly now
+    fake = FakeExchange(rows=[_row(open_time)])
+    client = ExchangeClient(exchange=fake, now_fn=lambda: now)
 
-    since = dt.datetime.fromtimestamp((START_MS + FOUR_HOURS_MS) / 1000, tz=dt.UTC)
-    candles = client.fetch_closed_candles("BTC/USDT:USDT", "4h", limit=10, since=since)
+    candles = client.fetch_closed_candles(
+        "BTC/USDT:USDT", "4h", since=open_time, until=now + dt.timedelta(seconds=1)
+    )
 
-    assert [c.close for c in candles] == [101.5, 102.5]
+    assert len(candles) == 1
+    assert candles[0].open_time == open_time
+    assert candles[0].close_time == now
+
+
+def test_constructor_rejects_credentials_on_exchange_instance() -> None:
+    fake = _FakeExchangeWithCreds(rows=[])
+    with pytest.raises(AssertionError):
+        ExchangeClient(exchange=fake)
 
 
 def test_client_has_no_order_placement_methods() -> None:
     forbidden = {"place_order", "create_order", "cancel_order", "submit_order"}
     assert forbidden.isdisjoint(dir(ExchangeClient))
+
+
+def test_unsupported_timeframe_raises() -> None:
+    fake = FakeExchange(rows=[])
+    client = ExchangeClient(exchange=fake)
+    now = dt.datetime.now(dt.UTC)
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        client.fetch_closed_candles("BTC/USDT:USDT", "3m", since=now, until=now)
+
+
+def test_retries_transient_network_errors_then_succeeds() -> None:
+    open_time = dt.datetime(2026, 9, 22, 8, tzinfo=dt.UTC)
+    now = open_time + dt.timedelta(hours=8)
+    fake = FakeExchange(rows=[_row(open_time)], fail_first_n=2)
+    sleeps: list[float] = []
+    client = ExchangeClient(
+        exchange=fake,
+        now_fn=lambda: now,
+        max_retries=3,
+        base_backoff_seconds=0.01,
+        sleep_fn=sleeps.append,
+    )
+
+    candles = client.fetch_closed_candles("BTC/USDT:USDT", "4h", since=open_time, until=now)
+
+    assert len(candles) == 1
+    assert len(sleeps) == 2
+    assert sleeps == [0.01, 0.02]  # bounded exponential backoff
+
+
+def test_gives_up_after_max_retries_without_retrying_forever() -> None:
+    now = dt.datetime(2026, 9, 22, 12, tzinfo=dt.UTC)
+    since = now - dt.timedelta(hours=4)
+    fake = FakeExchange(rows=[], fail_first_n=100)
+    client = ExchangeClient(
+        exchange=fake,
+        now_fn=lambda: now,
+        max_retries=2,
+        base_backoff_seconds=0.01,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    with pytest.raises(ccxt.NetworkError):
+        client.fetch_closed_candles("BTC/USDT:USDT", "4h", since=since, until=now)
+
+    assert fake.calls == 3  # 1 initial attempt + 2 retries, then it gives up

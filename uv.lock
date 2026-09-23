@@ -1717,7 +1717,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ccxt", specifier = ">=4.3" },
+    { name = "ccxt", specifier = ">=4.5.82" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "sqlalchemy", specifier = ">=2.0" },
