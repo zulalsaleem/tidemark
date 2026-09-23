@@ -382,3 +382,116 @@ def test_repr_and_str_do_not_leak_token() -> None:
     notifier = TelegramNotifier(bot_token="super-secret-token", chat_id="123")
     assert "super-secret-token" not in repr(notifier)
     assert "super-secret-token" not in str(notifier)
+
+
+# --- heartbeat message (Phase 4B) -------------------------------------------
+
+
+def _health_report(status: str, **overrides):
+    from tidemark.health.checks import FAIL as H_FAIL
+    from tidemark.health.checks import OK as H_OK
+    from tidemark.health.checks import CheckResult, HealthReport
+
+    defaults = dict(
+        status=status,
+        generated_at=EVALUATED_AT,
+        rule_version="section-01-v1.1",
+        checks=[
+            CheckResult("database", H_OK, "8 tables present"),
+            CheckResult("telegram_config", H_OK, "credentials present"),
+        ]
+        if status == H_OK
+        else [
+            CheckResult("database", H_OK, "8 tables present"),
+            CheckResult("journal_activity", H_FAIL, "no journal entries recorded"),
+        ],
+        last_candle_symbol="BTC/USDT:USDT",
+        last_candle_timeframe="4h",
+        last_candle_close_time=EVALUATED_AT - dt.timedelta(hours=2),
+        last_evaluation_recorded_at=EVALUATED_AT - dt.timedelta(minutes=5),
+        last_evaluation_state="NEUTRAL",
+        last_evaluation_watch="WAIT",
+        last_run_status="COMPLETED",
+        total_gaps=0,
+        journal_count=47,
+    )
+    defaults.update(overrides)
+    return HealthReport(**defaults)
+
+
+def test_heartbeat_message_matches_required_shape_for_ok() -> None:
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    report = _health_report("OK")
+    message = build_heartbeat_message(report)
+
+    expected = (
+        "✅ Tidemark healthy\n"
+        "\n"
+        "Last 4H candle: 2026-09-23 02:00 UTC (2h ago)\n"
+        "Last evaluation: 2026-09-23 03:55 UTC — NEUTRAL / WAIT\n"
+        "Last run: COMPLETED\n"
+        "Gaps: none\n"
+        "Journal: 47 entries\n"
+        "\n"
+        "Rulebook: section-01-v1.1"
+    )
+    assert message == expected
+
+
+def test_heartbeat_message_warn_uses_warning_emoji_and_lists_failing_checks() -> None:
+    from tidemark.health.checks import WARN as H_WARN
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    report = _health_report(H_WARN)
+    message = build_heartbeat_message(report)
+
+    assert message.startswith("⚠️ Tidemark degraded")
+    assert "Failing checks:" in message
+    assert "journal_activity: no journal entries recorded" in message
+
+
+def test_heartbeat_message_fail_uses_cross_emoji() -> None:
+    from tidemark.health.checks import FAIL as H_FAIL
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    report = _health_report(H_FAIL)
+    message = build_heartbeat_message(report)
+
+    assert message.startswith("❌ Tidemark unhealthy")
+    assert "Failing checks:" in message
+
+
+def test_heartbeat_message_handles_missing_data_gracefully() -> None:
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    report = _health_report(
+        "OK",
+        last_candle_close_time=None,
+        last_evaluation_recorded_at=None,
+        last_run_status=None,
+    )
+    message = build_heartbeat_message(report)
+
+    assert "Last 4H candle: none recorded" in message
+    assert "Last evaluation: none recorded" in message
+    assert "Last run: none recorded" in message
+
+
+def test_heartbeat_message_contains_none_of_the_forbidden_words() -> None:
+    from tidemark.health.checks import WARN as H_WARN
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    for status in ("OK", H_WARN):
+        message = build_heartbeat_message(_health_report(status)).lower()
+        for word in _FORBIDDEN_WORDS:
+            assert word not in message, f"unexpected {word!r} in heartbeat message"
+
+
+def test_heartbeat_message_has_no_context_only_disclaimer() -> None:
+    # Unlike build_message, the heartbeat is a system-status message, not
+    # a trading alert - there's nothing here for the disclaimer to negate.
+    from tidemark.notify.telegram import build_heartbeat_message
+
+    message = build_heartbeat_message(_health_report("OK"))
+    assert DISCLAIMER not in message
