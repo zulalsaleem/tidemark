@@ -1,6 +1,6 @@
 """Section 1 — HTF context (4H).
 
-Implements `docs/rulebook/section-01-htf-context-v1.0.md`, which is
+Implements `docs/rulebook/section-01-htf-context-v1.1.md`, which is
 LOCKED. This module must implement exactly what that document specifies —
 nothing more, nothing tuned, nothing inferred. If a future rulebook change
 is needed, a new version file is added; this module then targets that new
@@ -49,6 +49,23 @@ MAJOR_RESISTANCE_FIB = "MAJOR_RESISTANCE_FIB"
 MAJOR_RESISTANCE = "MAJOR_RESISTANCE"
 FIB_ONLY = "FIB_ONLY"
 NOT_IN_ZONE = "NOT_IN_ZONE"
+
+# The decision matrix's own condition text per row (verbatim from
+# section-01-htf-context-v1.1.md's DECISION MATRIX), keyed by reason_code.
+# Used by notify/telegram.py: PART C requires the alert's reason line to be
+# the matrix row's reason, never free-form text, so this is quoted rather
+# than paraphrased.
+MATRIX_ROW_TEXT = {
+    NOT_ENOUGH_SWINGS: "INSUFFICIENT_STRUCTURE",
+    STRUCTURE_BROKEN: "STRUCTURE_BROKEN_*",
+    NEUTRAL_STRUCTURE: "NEUTRAL",
+    MAJOR_SUPPORT_FIB: "BULLISH + holds major support + Fib zone",
+    MAJOR_SUPPORT: "BULLISH + holds major support",
+    MAJOR_RESISTANCE_FIB: "BEARISH + holds major resistance + Fib",
+    MAJOR_RESISTANCE: "BEARISH + holds major resistance",
+    FIB_ONLY: "In Fib zone, no major level",
+    NOT_IN_ZONE: "Anything else",
+}
 
 _HORIZONTAL_LOOKBACK_CANDLES = 120
 
@@ -155,12 +172,16 @@ def _holds_zone(candle: pd.Series, level: Level, *, is_support: bool) -> bool:
     return touched and candle["close"] <= level.zone_high
 
 
-def _level_to_dict(level: Level, close: float) -> dict:
+def _level_to_dict(level: Level, close: float, *, held: bool) -> dict:
     # "role" (Section 1 v1.1, RULE 1.7a) is computed fresh here, from this
     # evaluation's close — the `Level` model has no static role field to
     # read instead (RULE 1.7a: role is never stored from formation).
     # `source` names the level's permanent origin (e.g.
-    # "swing_high_cluster"), which is unrelated to role.
+    # "swing_high_cluster"), which is unrelated to role. "held" is
+    # whether this specific level satisfied "holds major support"/
+    # "holds major resistance" for the candle being evaluated — surfaced
+    # so a notification can name the specific level, not just report the
+    # matrix's boolean outcome.
     return {
         "role": levels_module.level_role(level, close),
         "price": level.price,
@@ -168,6 +189,7 @@ def _level_to_dict(level: Level, close: float) -> dict:
         "zone_high": level.zone_high,
         "touches": level.touches,
         "is_major": level.is_major,
+        "held": held,
         "source": level.source,
         "formed_at": level.formed_at.isoformat(),
     }
@@ -260,18 +282,23 @@ def evaluate(
     # origin — a level born from a swing high can hold as SUPPORT if
     # price has since moved above it.
     close = latest_candle["close"]
-    holds_major_support = any(
-        level.is_major
+    holding_support_levels = [
+        level
+        for level in active_levels
+        if level.is_major
         and levels_module.level_role(level, close) == levels_module.SUPPORT
         and _holds_zone(latest_candle, level, is_support=True)
+    ]
+    holding_resistance_levels = [
+        level
         for level in active_levels
-    )
-    holds_major_resistance = any(
-        level.is_major
+        if level.is_major
         and levels_module.level_role(level, close) == levels_module.RESISTANCE
         and _holds_zone(latest_candle, level, is_support=False)
-        for level in active_levels
-    )
+    ]
+    holds_major_support = bool(holding_support_levels)
+    holds_major_resistance = bool(holding_resistance_levels)
+    held_level_ids = {id(level) for level in (*holding_support_levels, *holding_resistance_levels)}
 
     leg: fib_module.FibLeg | None = None
     price_in_fib_zone = False
@@ -312,7 +339,10 @@ def evaluate(
         watch=watch,
         grade=grade,
         reason_code=reason_code,
-        active_levels=[_level_to_dict(level, close) for level in active_levels],
+        active_levels=[
+            _level_to_dict(level, close, held=id(level) in held_level_ids)
+            for level in active_levels
+        ],
         fib=_fib_to_dict(leg, close),
         swings_used=swings_used,
     )
