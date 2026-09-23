@@ -196,7 +196,7 @@ def context_explain(symbol: str = typer.Option(..., "--symbol")) -> None:
         raise typer.Exit(code=1)
 
     grade = record.grade or "-"
-    typer.echo(f"{symbol} — Section 1 HTF Context ({record.rule_version})")
+    typer.echo(f"{symbol} - Section 1 HTF Context ({record.rule_version})")
     typer.echo(f"Evaluated at: {record.evaluated_at.isoformat()}")
     typer.echo("")
     typer.echo(f"State:  {record.state}")
