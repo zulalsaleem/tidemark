@@ -38,7 +38,6 @@ def test_two_swings_within_half_atr_form_a_level() -> None:
 
     assert len(levels) == 1
     level = levels[0]
-    assert level.kind == RESISTANCE
     assert level.source == SWING_HIGH_CLUSTER
     assert level.price == 101.5
     assert level.touches == 2
@@ -72,10 +71,7 @@ def test_highs_and_lows_cluster_separately() -> None:
 
     levels = cluster_swings_into_levels(swings, atr_value)
 
-    kinds = {level.kind for level in levels}
-    assert kinds == {RESISTANCE, SUPPORT}
     assert len(levels) == 2
-
     sources = {level.source for level in levels}
     assert sources == {SWING_HIGH_CLUSTER, SWING_LOW_CLUSTER}
 
@@ -111,19 +107,18 @@ def test_prev_week_levels_are_always_major() -> None:
     assert all(level.is_major for level in levels)
 
 
-def test_prev_period_levels_kinds_and_prices() -> None:
+def test_prev_period_levels_sources_and_prices() -> None:
     levels = prev_period_levels(_period_candles(), period="day", atr_value=10.0)
-    by_kind = {level.kind: level for level in levels}
-    assert by_kind[RESISTANCE].price == 110.0
-    assert by_kind[SUPPORT].price == 90.0
+    by_source = {level.source: level for level in levels}
+    assert by_source["prev_day_high"].price == 110.0
+    assert by_source["prev_day_low"].price == 90.0
 
 
 # --- level_role (Section 1 v1.1, RULE 1.7a) --------------------------------
 
 
-def _level_at(price: float, kind: str = RESISTANCE, source: str = SWING_HIGH_CLUSTER) -> Level:
+def _level_at(price: float, source: str = SWING_HIGH_CLUSTER) -> Level:
     return Level(
-        kind=kind,
         price=price,
         zone_low=price - 1,
         zone_high=price + 1,
@@ -149,12 +144,12 @@ def test_level_role_tie_break_is_support() -> None:
     assert level_role(level, close=100.0) == SUPPORT
 
 
-def test_level_role_ignores_static_kind_and_source() -> None:
-    # A level whose ORIGIN is a swing high (kind=RESISTANCE at formation)
-    # must still read as SUPPORT once price has moved above it — role is
-    # never derived from kind/source, only from (level.price, close).
-    swing_high_origin_level = _level_at(100.0, kind=RESISTANCE, source=SWING_HIGH_CLUSTER)
+def test_level_role_ignores_source() -> None:
+    # A level whose ORIGIN is a swing high must still read as SUPPORT
+    # once price has moved above it — role is never derived from
+    # source/origin, only from (level.price, close).
+    swing_high_origin_level = _level_at(100.0, source=SWING_HIGH_CLUSTER)
     assert level_role(swing_high_origin_level, close=150.0) == SUPPORT
 
-    swing_low_origin_level = _level_at(100.0, kind=SUPPORT, source=SWING_LOW_CLUSTER)
+    swing_low_origin_level = _level_at(100.0, source=SWING_LOW_CLUSTER)
     assert level_role(swing_low_origin_level, close=50.0) == RESISTANCE

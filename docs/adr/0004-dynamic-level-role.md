@@ -40,18 +40,24 @@ This explicitly separates two concepts v1.0 conflated:
 
 - **Origin** — a permanent fact about where a level came from
   (`swing_high_cluster`, `swing_low_cluster`, `prev_day_high`,
-  `prev_day_low`, `prev_week_high`, `prev_week_low`). Unchanged by this
-  rule; still set once at construction in `core/levels.py`.
+  `prev_day_low`, `prev_week_high`, `prev_week_low`), carried entirely
+  by `Level.source`. Unchanged by this rule; still set once at
+  construction in `core/levels.py`.
 - **Role** — support or resistance, evaluated fresh against the current
   close via the new `level_role()` function in `core/levels.py`, and
   used by `context/htf.py`'s "holds major support/resistance" checks
   and reported per-level in the output record instead of a static
   label.
 
-`Level.kind` (still populated as before, from origin) is no longer read
-anywhere in the decision-matrix logic or shown in the `active_levels[]`
-output, specifically to prevent it being mistaken for role now that the
-word "support"/"resistance" means something dynamic.
+The `Level` model's old `kind` column (a support/resistance value set
+once at construction) is removed entirely, not just left unread — RULE
+1.7a says role must never be stored from formation, and a column that
+still held a static support/resistance value would keep being exactly
+that, regardless of whether anything read it. `source` already carries
+the six origin values on its own; there is no separate origin field.
+Since nothing ever wrote to the `levels` table (levels are recomputed
+from candles at every evaluation, never persisted), dropping the column
+needed no migration — recreating the table picks up the new schema.
 
 This is a new rule_version, not a same-version clarification, because
 it changes engine output: the same stored candles can now produce a

@@ -34,8 +34,9 @@ def cluster_swings_into_levels(swings: list[Swing], atr_value: float) -> list[Le
 
     A level requires >= 2 confirmed swing points within `0.5 * atr_value`
     of each other (Section 1 PARAMETERS: swing cluster distance). Swing
-    highs and swing lows are clustered separately, so a level is always
-    unambiguously a resistance (from highs) or a support (from lows).
+    highs and swing lows are clustered separately, so a level's `source`
+    always unambiguously records which one it came from
+    (`swing_high_cluster` or `swing_low_cluster`).
 
     `swings` should already be restricted by the caller to confirmed
     swings within the rulebook's horizontal lookback (120 x 4H candles) —
@@ -49,18 +50,13 @@ def cluster_swings_into_levels(swings: list[Swing], atr_value: float) -> list[Le
     (major = touches >= 2 OR weekly high/low).
     """
     levels: list[Level] = []
-    for kind, level_kind, origin in (
-        (HIGH, RESISTANCE, SWING_HIGH_CLUSTER),
-        (LOW, SUPPORT, SWING_LOW_CLUSTER),
-    ):
-        members = sorted((s for s in swings if s.kind == kind), key=lambda s: s.price)
-        levels.extend(_cluster_same_kind(members, level_kind, origin, atr_value))
+    for swing_kind, origin in ((HIGH, SWING_HIGH_CLUSTER), (LOW, SWING_LOW_CLUSTER)):
+        members = sorted((s for s in swings if s.kind == swing_kind), key=lambda s: s.price)
+        levels.extend(_cluster_same_kind(members, origin, atr_value))
     return levels
 
 
-def _cluster_same_kind(
-    members: list[Swing], level_kind: str, origin: str, atr_value: float
-) -> list[Level]:
+def _cluster_same_kind(members: list[Swing], origin: str, atr_value: float) -> list[Level]:
     clusters: list[list[Swing]] = []
     current: list[Swing] = []
     threshold = _CLUSTER_DISTANCE_ATR * atr_value
@@ -81,7 +77,6 @@ def _cluster_same_kind(
         price = sum(s.price for s in cluster) / len(cluster)
         levels.append(
             Level(
-                kind=level_kind,
                 price=price,
                 zone_low=price - zone_tolerance,
                 zone_high=price + zone_tolerance,
@@ -124,7 +119,6 @@ def prev_period_levels(candles: pd.DataFrame, period: str, atr_value: float) -> 
 
     return [
         Level(
-            kind=RESISTANCE,
             price=high,
             zone_low=high - zone_tolerance,
             zone_high=high + zone_tolerance,
@@ -134,7 +128,6 @@ def prev_period_levels(candles: pd.DataFrame, period: str, atr_value: float) -> 
             formed_at=formed_at,
         ),
         Level(
-            kind=SUPPORT,
             price=low,
             zone_low=low - zone_tolerance,
             zone_high=low + zone_tolerance,
@@ -159,11 +152,10 @@ def level_role(level: Level, close: float) -> str:
         close < level.price -> RESISTANCE
         close == level.price -> SUPPORT (registered tie-break)
 
-    A level's `kind` (set at construction, from which swing type or
-    which half of an OHLC pair it came from) and `source` (its origin,
-    e.g. `swing_high_cluster`) are permanent facts about the level and
-    play no part in this — a level born from a swing high can read as
-    SUPPORT here if price has since moved above it.
+    A level's `source` (its origin, e.g. `swing_high_cluster`) is a
+    permanent fact about the level and plays no part in this — a level
+    born from a swing high can read as SUPPORT here if price has since
+    moved above it.
     """
     if close >= level.price:
         return SUPPORT

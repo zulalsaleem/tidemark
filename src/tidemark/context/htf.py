@@ -157,12 +157,10 @@ def _holds_zone(candle: pd.Series, level: Level, *, is_support: bool) -> bool:
 
 def _level_to_dict(level: Level, close: float) -> dict:
     # "role" (Section 1 v1.1, RULE 1.7a) is computed fresh here, from this
-    # evaluation's close — it is never read from `level.kind`, which is a
-    # permanent fact about the level's origin (which swing type or which
-    # half of an OHLC pair produced it), not its current role. `source`
-    # already names that origin precisely (e.g. "swing_high_cluster"), so
-    # `kind` is intentionally left out of this output to avoid it being
-    # mistaken for role.
+    # evaluation's close — the `Level` model has no static role field to
+    # read instead (RULE 1.7a: role is never stored from formation).
+    # `source` names the level's permanent origin (e.g.
+    # "swing_high_cluster"), which is unrelated to role.
     return {
         "role": levels_module.level_role(level, close),
         "price": level.price,
@@ -258,9 +256,9 @@ def evaluate(
         active_levels += levels_module.prev_period_levels(candles_1w, "week", atr_value)
 
     # Section 1 v1.1, RULE 1.7a: a level's role is evaluated fresh here
-    # against this candle's close, never read from a static kind/origin —
-    # a level born from a swing high can hold as SUPPORT if price has
-    # since moved above it.
+    # against this candle's close, never read from a level's (permanent)
+    # origin — a level born from a swing high can hold as SUPPORT if
+    # price has since moved above it.
     close = latest_candle["close"]
     holds_major_support = any(
         level.is_major
