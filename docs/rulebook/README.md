@@ -19,16 +19,19 @@ tunes them, or infers behavior they don't specify.
 - **Each version records its registration date and source** — when it was
   written down and where it came from (e.g. "own trading experience").
 - **A section's status matters.** `LOCKED` sections are implementable as
-  written. `DRAFT` / `EXTRACTION IN PROGRESS` sections are not yet ready
-  for implementation — states or parameters marked `PENDING` must not be
-  guessed at.
+  written and drive real signals. `DRAFT` / `EXTRACTION IN PROGRESS`
+  sections are not yet ready for implementation — states or parameters
+  marked `PENDING` must not be guessed at. `PROVISIONAL — OBSERVATION
+  ONLY` sections are implementable, but only as measurement: they may
+  read data and journal what they observe, and must never drive a
+  Telegram alert, a change-detector input, or any other trading output.
 
 ## Current sections
 
 | Section | File | Status |
 | --- | --- | --- |
 | 1 — HTF Context (4H) | [section-01-htf-context-v1.1.md](section-01-htf-context-v1.1.md) (current); [v1.0](section-01-htf-context-v1.0.md) (superseded, kept for history) | LOCKED |
-| 2 — 1H Behavior | [section-02-1h-behavior-DRAFT.md](section-02-1h-behavior-DRAFT.md) | EXTRACTION IN PROGRESS |
+| 2 — 1H Behaviour | [section-02-1h-behaviour-v0.1.md](section-02-1h-behaviour-v0.1.md) | PROVISIONAL — OBSERVATION ONLY |
 
 See [open-questions.md](open-questions.md) for behavior the current
 rulebook doesn't define, surfaced by running the engine — none of it is
