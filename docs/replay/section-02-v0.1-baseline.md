@@ -1,37 +1,26 @@
-# SUPERSEDED — Table 2 in this report is wrong. See section-02-v0.1-baseline.md.
+This is the corrected v0.1 baseline. It supersedes
+[section-02-v0.1-baseline-SUPERSEDED.md](section-02-v0.1-baseline-SUPERSEDED.md),
+which had two bugs in `replay/report.py`'s Table 2 (per-session) grouping
+and classification — see [ADR 0008](../adr/0008-replay-as-a-repo-command.md)
+for the full account. In short:
 
-This file is kept for history only. Do not use its numbers. It was
-generated before two bugs in `replay/report.py`'s Table 2 (per-session)
-grouping and classification were found and fixed — see
-[ADR 0008](../adr/0008-replay-as-a-repo-command.md) and
-[section-02-v0.1-baseline.md](section-02-v0.1-baseline.md) for the
-corrected report against the same pinned snapshot (row hash
-`018f246a810905f025022e1bc0b01c2a8f5777185d01fef3f6f9e79d7a04520c`,
-unchanged).
+- **Bug 1** (session grouping): a session's closing `HTF_CONTEXT_INVALIDATED`
+  row was being split off into its own phantom session instead of closing
+  the session it ended, because that row's own Section 1 fields reflect
+  the *new* post-change record, not the ending session's pin. Fixed in
+  `group_sessions`. Session count: 903 → 476.
+- **Bug 2** (structure-change direction): every session ending in
+  `HANDOFF_TO_15M` — the shared echo for both bullish and bearish
+  confirmations — was labelled `STRUCTURE_CHANGE_LONG` regardless of its
+  actual direction, because the classifier never read the row's own
+  `structure_change` field. Fixed in `_classify_session`. Direction split:
+  16 long / 0 short → 13 bullish / 3 bearish.
 
-**Bug 1** — `group_sessions` drew a session boundary at the
-`HTF_CONTEXT_INVALIDATED` row itself, because that row's own
-`section_1_state`/`watch`/`grade` fields reflect the *new* post-change
-Section 1 record, not the ending session's pin. Every session actually
-ended by an invalidation had its closing row sliced off into a separate
-phantom session, while the real session was classified from whatever its
-second-to-last row happened to be — almost always landing in
-`STILL_OPEN_AT_END_OF_DATA` below, even though data had not run out.
-Session count: 903 here, 476 corrected. All 366
-`STILL_OPEN_AT_END_OF_DATA` sessions below are this bug, not genuinely
-open sessions.
-
-**Bug 2** — `_classify_session` returned `STRUCTURE_CHANGE_LONG`
-unconditionally whenever a session's last row was `HANDOFF_TO_15M` (the
-direction-agnostic echo shared by both bullish and bearish confirmations)
-or `BULLISH_STRUCTURE_CHANGE`, without ever reading the row's own
-`structure_change` field. Every bearish structure change below is
-mislabeled `STRUCTURE_CHANGE_LONG`. Direction split: 16 long / 0 short
-here, 13 bullish / 3 bearish corrected (matching Table 3's row-level
-`BULLISH_STRUCTURE_CHANGE`/`BEARISH_STRUCTURE_CHANGE` counts).
-
-Table 1 (Section 1, per evaluation) and Table 3 (Section 2, per
-evaluation) below are unaffected by either bug and remain accurate.
+The **data snapshot below is unchanged** from the superseded report — same
+row hash (`018f246a810905f025022e1bc0b01c2a8f5777185d01fef3f6f9e79d7a04520c`),
+same candles. Only the Table 2 grouping/classification code changed;
+Table 1 and Table 3 were already correct and are numerically identical to
+the superseded report.
 
 ---
 
@@ -39,7 +28,7 @@ evaluation) below are unaffected by either bug and remain accurate.
 
 - command: `tidemark replay --rule-version section-02-v0.1`
 - rule_version: `section-02-v0.1`
-- generated_at: 2026-09-24T08:18:05.973108+00:00
+- generated_at: 2026-09-24T14:35:28.347166+00:00
 
 ## Data snapshot
 
@@ -273,7 +262,7 @@ A session is one contiguous run under a single pinned Section 1 (state, watch, g
 
 ### BTC/USDT:USDT
 
-Sessions: 197  |  with any interaction: 79  |  median length (1H candles): 4  |  max length: 20
+Sessions: 103  |  with any interaction: 79  |  median length (1H candles): 5  |  max length: 21
 
 | Terminal outcome | Count |
 | --- | ---: |
@@ -282,20 +271,32 @@ Sessions: 197  |  with any interaction: 79  |  median length (1H candles): 4  | 
 | LEVEL_FAILURE_SUPPORT | 16 |
 | LEVEL_FAILURE_RESISTANCE | 9 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 94 |
-| STILL_OPEN_AT_END_OF_DATA | 74 |
-| **sum** | **197** |
+| HTF_CONTEXT_INVALIDATED | 74 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **103** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 44 |
 | R2 | 9 |
 | R3 | 24 |
-| none | 120 |
+| none | 26 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (74 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 8 |
+| State/watch change | 66 |
+
+No-reaction sessions, split by interaction (26 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 2 |
+| Without interaction | 24 |
 
 ### ETH/USDT:USDT
 
-Sessions: 193  |  with any interaction: 77  |  median length (1H candles): 4  |  max length: 24
+Sessions: 102  |  with any interaction: 77  |  median length (1H candles): 5.0  |  max length: 25
 
 | Terminal outcome | Count |
 | --- | ---: |
@@ -304,104 +305,187 @@ Sessions: 193  |  with any interaction: 77  |  median length (1H candles): 4  | 
 | LEVEL_FAILURE_SUPPORT | 11 |
 | LEVEL_FAILURE_RESISTANCE | 8 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 91 |
-| STILL_OPEN_AT_END_OF_DATA | 78 |
-| **sum** | **193** |
+| HTF_CONTEXT_INVALIDATED | 78 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **102** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 40 |
 | R2 | 14 |
 | R3 | 17 |
-| none | 122 |
+| none | 31 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (78 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 9 |
+| State/watch change | 69 |
+
+No-reaction sessions, split by interaction (31 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 6 |
+| Without interaction | 25 |
 
 ### SOL/USDT:USDT
 
-Sessions: 168  |  with any interaction: 70  |  median length (1H candles): 4.0  |  max length: 16
+Sessions: 90  |  with any interaction: 70  |  median length (1H candles): 5.0  |  max length: 17
 
 | Terminal outcome | Count |
 | --- | ---: |
-| STRUCTURE_CHANGE_LONG | 2 |
-| STRUCTURE_CHANGE_SHORT | 0 |
+| STRUCTURE_CHANGE_LONG | 1 |
+| STRUCTURE_CHANGE_SHORT | 1 |
 | LEVEL_FAILURE_SUPPORT | 5 |
 | LEVEL_FAILURE_RESISTANCE | 10 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 78 |
-| STILL_OPEN_AT_END_OF_DATA | 73 |
-| **sum** | **168** |
+| HTF_CONTEXT_INVALIDATED | 73 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **90** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 35 |
 | R2 | 15 |
 | R3 | 19 |
-| none | 99 |
+| none | 21 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (73 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 9 |
+| State/watch change | 64 |
+
+No-reaction sessions, split by interaction (21 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 1 |
+| Without interaction | 20 |
 
 ### XRP/USDT:USDT
 
-Sessions: 160  |  with any interaction: 59  |  median length (1H candles): 4.0  |  max length: 20
+Sessions: 82  |  with any interaction: 59  |  median length (1H candles): 5.0  |  max length: 21
 
 | Terminal outcome | Count |
 | --- | ---: |
-| STRUCTURE_CHANGE_LONG | 3 |
-| STRUCTURE_CHANGE_SHORT | 0 |
+| STRUCTURE_CHANGE_LONG | 2 |
+| STRUCTURE_CHANGE_SHORT | 1 |
 | LEVEL_FAILURE_SUPPORT | 6 |
 | LEVEL_FAILURE_RESISTANCE | 7 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 78 |
-| STILL_OPEN_AT_END_OF_DATA | 66 |
-| **sum** | **160** |
+| HTF_CONTEXT_INVALIDATED | 66 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **82** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 23 |
 | R2 | 17 |
 | R3 | 15 |
-| none | 105 |
+| none | 27 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (66 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 3 |
+| State/watch change | 63 |
+
+No-reaction sessions, split by interaction (27 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 4 |
+| Without interaction | 23 |
 
 ### DOGE/USDT:USDT
 
-Sessions: 185  |  with any interaction: 72  |  median length (1H candles): 4  |  max length: 24
+Sessions: 99  |  with any interaction: 72  |  median length (1H candles): 5  |  max length: 25
 
 | Terminal outcome | Count |
 | --- | ---: |
-| STRUCTURE_CHANGE_LONG | 2 |
-| STRUCTURE_CHANGE_SHORT | 0 |
+| STRUCTURE_CHANGE_LONG | 1 |
+| STRUCTURE_CHANGE_SHORT | 1 |
 | LEVEL_FAILURE_SUPPORT | 12 |
 | LEVEL_FAILURE_RESISTANCE | 10 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 86 |
-| STILL_OPEN_AT_END_OF_DATA | 75 |
-| **sum** | **185** |
+| HTF_CONTEXT_INVALIDATED | 75 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **99** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 41 |
 | R2 | 7 |
 | R3 | 21 |
-| none | 116 |
+| none | 30 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (75 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 10 |
+| State/watch change | 65 |
+
+No-reaction sessions, split by interaction (30 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 3 |
+| Without interaction | 27 |
 
 ### ALL
 
-Sessions: 903  |  with any interaction: 357  |  median length (1H candles): 4  |  max length: 24
+Sessions: 476  |  with any interaction: 357  |  median length (1H candles): 5.0  |  max length: 25
 
 | Terminal outcome | Count |
 | --- | ---: |
-| STRUCTURE_CHANGE_LONG | 16 |
-| STRUCTURE_CHANGE_SHORT | 0 |
+| STRUCTURE_CHANGE_LONG | 13 |
+| STRUCTURE_CHANGE_SHORT | 3 |
 | LEVEL_FAILURE_SUPPORT | 50 |
 | LEVEL_FAILURE_RESISTANCE | 44 |
 | REACTION_EXPIRED | 0 |
-| HTF_CONTEXT_INVALIDATED | 427 |
-| STILL_OPEN_AT_END_OF_DATA | 366 |
-| **sum** | **903** |
+| HTF_CONTEXT_INVALIDATED | 366 |
+| STILL_OPEN_AT_END_OF_DATA | 0 |
+| **sum** | **476** |
 
 | Highest reaction tier reached | Sessions |
 | --- | ---: |
 | R1 | 183 |
 | R2 | 62 |
 | R3 | 96 |
-| none | 562 |
+| none | 135 |
+
+Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (366 sessions):
+| Reason | Count |
+| --- | ---: |
+| Grade-only change | 39 |
+| State/watch change | 327 |
+
+No-reaction sessions, split by interaction (135 sessions):
+| Interaction | Count |
+| --- | ---: |
+| With interaction | 16 |
+| Without interaction | 119 |
+
+### Structure-change sessions - detail
+
+Grade Section 1 held at session start, and the reaction tier that preceded the confirming close, for every structure-change session across all symbols.
+
+| Symbol | Session start | Trigger | Direction | Grade at start | Reaction tier |
+| --- | --- | --- | --- | --- | --- |
+| BTC/USDT:USDT | 2026-04-15T12:00:00+00:00 | 2026-04-15T20:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| BTC/USDT:USDT | 2026-06-12T08:00:00+00:00 | 2026-06-12T17:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| BTC/USDT:USDT | 2026-08-26T16:00:00+00:00 | 2026-08-26T23:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | A | R3 |
+| BTC/USDT:USDT | 2026-09-05T04:00:00+00:00 | 2026-09-05T16:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| DOGE/USDT:USDT | 2026-06-13T01:00:00+00:00 | 2026-06-13T08:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | A | R1 |
+| DOGE/USDT:USDT | 2026-07-17T20:00:00+00:00 | 2026-07-18T06:00:00+00:00 | BEARISH_STRUCTURE_CHANGE | B | R1 |
+| ETH/USDT:USDT | 2026-04-24T04:00:00+00:00 | 2026-04-24T12:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | A | R1 |
+| ETH/USDT:USDT | 2026-05-02T08:00:00+00:00 | 2026-05-02T14:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| ETH/USDT:USDT | 2026-05-10T08:00:00+00:00 | 2026-05-10T16:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| ETH/USDT:USDT | 2026-05-26T04:00:00+00:00 | 2026-05-26T11:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | A | R1 |
+| ETH/USDT:USDT | 2026-08-08T00:00:00+00:00 | 2026-08-08T11:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | A | R1 |
+| SOL/USDT:USDT | 2026-05-20T20:00:00+00:00 | 2026-05-21T01:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| SOL/USDT:USDT | 2026-07-13T08:00:00+00:00 | 2026-07-13T18:00:00+00:00 | BEARISH_STRUCTURE_CHANGE | B | R3 |
+| XRP/USDT:USDT | 2026-06-18T04:00:00+00:00 | 2026-06-18T14:00:00+00:00 | BEARISH_STRUCTURE_CHANGE | B | R3 |
+| XRP/USDT:USDT | 2026-07-26T12:00:00+00:00 | 2026-07-26T17:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R1 |
+| XRP/USDT:USDT | 2026-09-18T08:00:00+00:00 | 2026-09-18T14:00:00+00:00 | BULLISH_STRUCTURE_CHANGE | B | R2 |
 
 ## Table 3 — Section 2, per EVALUATION
 
