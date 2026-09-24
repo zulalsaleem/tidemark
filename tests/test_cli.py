@@ -9,7 +9,9 @@ from typer.testing import CliRunner
 from tidemark import __version__
 from tidemark import cli as cli_module
 from tidemark.cli import _parse_csv, app
+from tidemark.context import htf
 from tidemark.data.exchange import RawCandle
+from tidemark.data.models import JournalEntry
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
 from tidemark.notify.telegram import build_message
@@ -664,3 +666,172 @@ def test_health_heartbeat_sends_via_notifier_and_includes_rulebook(
     assert result.exit_code == 0
     assert "Tidemark healthy" in _fake_notifier.sent_messages[0]
     assert "Rulebook: section-01-v1.1" in _fake_notifier.sent_messages[0]
+
+
+# -- observe (Phase 5, Section 2) ---------------------------------------------
+
+
+def _seed_section1_watch(url: str, symbol: str, evaluated_at: dt.datetime) -> None:
+    """Write one Section 1 journal row directly (bypassing a full Section 1
+    evaluation) so Section 2 has an as-of LONG_WATCH record to activate
+    against, with a held support level Section 2 can pin.
+    """
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    level = {
+        "role": "support",
+        "price": 100.0,
+        "zone_low": 99.0,
+        "zone_high": 101.0,
+        "touches": 2,
+        "is_major": True,
+        "held": True,
+        "source": "swing_low_cluster",
+        "formed_at": evaluated_at.isoformat(),
+    }
+    entry = JournalEntry(
+        asset=symbol,
+        evaluated_at=evaluated_at,
+        recorded_at=evaluated_at,
+        rule_version=htf.RULE_VERSION,
+        state=htf.BULLISH,
+        watch=htf.LONG_WATCH,
+        grade="B",
+        reason_code="MAJOR_SUPPORT",
+        active_levels=[level],
+        fib={},
+        swings_used=[],
+        alert_sent=False,
+        alert_reason=None,
+    )
+    store.save_journal_entry(entry)
+
+
+def _raw_1h_candle(open_time: dt.datetime, close: float) -> RawCandle:
+    return RawCandle(
+        open_time=open_time,
+        close_time=open_time + dt.timedelta(hours=1),
+        open=close,
+        high=close + 0.6,
+        low=close - 0.4,
+        close=close,
+        volume=1.0,
+    )
+
+
+def _seed_1h_candles(url: str, symbol: str, n: int) -> None:
+    """Flat 1H candles that each interact with the seeded support zone
+    and close back away from their own low - an R1 reaction on every row.
+    """
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    candles = [_raw_1h_candle(START + dt.timedelta(hours=i), 100.5) for i in range(n)]
+    store.upsert_candles(VENUE, symbol, "1h", candles, dt.datetime.now(dt.UTC))
+
+
+def test_observe_run_journals_a_row_per_1h_candle(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+    assert "COMPLETED" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.observation_history(SYMBOL)) == 3
+
+
+def test_observe_run_twice_is_idempotent(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+
+    runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+    runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.observation_history(SYMBOL)) == 3
+
+
+def test_observe_list_and_stats_show_rows(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+    runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    list_result = runner.invoke(app, ["observe", "list", "--symbol", SYMBOL, "--days", "36500"])
+    stats_result = runner.invoke(app, ["observe", "stats", "--days", "36500"])
+
+    assert list_result.exit_code == 0
+    assert "REACTION_DETECTED" in list_result.stdout
+    assert stats_result.exit_code == 0
+    assert "Total observation rows: 3" in stats_result.stdout
+    assert "REACTION_DETECTED" in stats_result.stdout
+
+
+def test_observe_list_reports_none_when_empty(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["observe", "list", "--symbol", SYMBOL])
+
+    assert result.exit_code == 0
+    assert "No observation rows found." in result.stdout
+
+
+def test_observe_stats_reports_none_when_empty(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["observe", "stats"])
+
+    assert result.exit_code == 0
+    assert "No observation rows found." in result.stdout
+
+
+def test_observe_run_never_constructs_a_telegram_notifier(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hard constraint: no Telegram alerts from Section 2. Rather than
+    trust that `cli.observe_run` merely *doesn't call* a notifier, make
+    constructing one raise - proving the observe path never even touches
+    `TelegramNotifier`, unlike `run` (Section 1's pipeline).
+    """
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+
+    class _ExplodingNotifier:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("Section 2 must never construct a TelegramNotifier")
+
+    monkeypatch.setattr(cli_module, "TelegramNotifier", _ExplodingNotifier)
+
+    result = runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+
+
+_FORBIDDEN_SIGNAL_WORDS = ("entry", "stop", "sl", "tp", "target", "r:r", "buy", "sell")
+
+
+def test_observe_output_never_contains_trading_signal_language(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+    runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    list_result = runner.invoke(app, ["observe", "list", "--symbol", SYMBOL, "--days", "36500"])
+    stats_result = runner.invoke(app, ["observe", "stats", "--days", "36500"])
+
+    combined = (list_result.stdout + stats_result.stdout).lower()
+    for word in _FORBIDDEN_SIGNAL_WORDS:
+        assert word not in combined, f"found forbidden word {word!r} in observe output"
