@@ -482,7 +482,8 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
     with_interaction = 0
     lengths = []
     for session in sessions:
-        outcome_counts[_classify_session(session)] += 1
+        outcome = _classify_session(session)
+        outcome_counts[outcome] += 1
         interacted = any(row.interaction_detected for row in session)
         if interacted:
             with_interaction += 1
@@ -490,7 +491,12 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
         tier_counts["none" if tier is None else tier] += 1
         lengths.append(len(session))
 
-        if session[-1].state == mtf.HTF_CONTEXT_INVALIDATED:
+        # Gated on the session's classified outcome, not merely on its
+        # last row's raw state: an already-resolved session (structure
+        # change or failure) can also pick up a trailing invalidation row
+        # (see group_sessions/_classify_session), and that later
+        # invalidation isn't why the session's outcome was decided.
+        if outcome == mtf.HTF_CONTEXT_INVALIDATED:
             start, end = session[0], session[-1]
             grade_only = (
                 start.section_1_state == end.section_1_state
