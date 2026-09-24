@@ -65,6 +65,36 @@ def test_double_upsert_inserts_zero_duplicates(store: TidemarkStore) -> None:
     assert store.count_candles(VENUE, SYMBOL, TIMEFRAME) == 5
 
 
+def test_large_batch_upsert_inserts_all_candles_without_variable_limit_error(
+    store: TidemarkStore,
+) -> None:
+    """A single `upsert_candles` call with enough rows that one INSERT
+    statement would exceed SQLite's bound-parameter limit must still
+    insert every row - chunked transparently, not truncated or failed.
+    """
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    n = 1500  # well past one chunk at 11 columns/row (~90 rows/chunk at the 999 limit)
+    candles = [_candle(base + dt.timedelta(hours=4 * i)) for i in range(n)]
+
+    result = store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, dt.datetime.now(dt.UTC))
+
+    assert result == CandleUpsertResult(fetched=n, inserted=n, duplicates_skipped=0, rejected=0)
+    assert store.count_candles(VENUE, SYMBOL, TIMEFRAME) == n
+
+
+def test_large_batch_upsert_rerun_inserts_zero_duplicates(store: TidemarkStore) -> None:
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    n = 1500
+    candles = [_candle(base + dt.timedelta(hours=4 * i)) for i in range(n)]
+    fetched_at = dt.datetime.now(dt.UTC)
+
+    store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, fetched_at)
+    second = store.upsert_candles(VENUE, SYMBOL, TIMEFRAME, candles, fetched_at)
+
+    assert second == CandleUpsertResult(fetched=n, inserted=0, duplicates_skipped=n, rejected=0)
+    assert store.count_candles(VENUE, SYMBOL, TIMEFRAME) == n
+
+
 def test_invalid_ohlc_rows_are_rejected_and_recorded(store: TidemarkStore) -> None:
     base = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
     good = _candle(base)

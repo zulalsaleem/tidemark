@@ -33,6 +33,19 @@ from tidemark.data.timeframes import TIMEFRAME_DURATIONS
 RUNNING_STATUS = "RUNNING"
 VALID_RUN_STATUSES = {"COMPLETED", "PARTIAL", "FAILED"}
 
+# SQLite's pre-3.32 default `SQLITE_MAX_VARIABLE_NUMBER`. Newer builds allow
+# far more (32766+), but this stays safe on every build without having to
+# detect the SQLite version at runtime.
+_SQLITE_MAX_VARIABLES = 999
+
+
+def _chunk_size(columns_per_row: int) -> int:
+    """Rows per batch insert, kept under `_SQLITE_MAX_VARIABLES` regardless
+    of how many columns a row has - a hardcoded row count would silently
+    break again the day a table gains another column.
+    """
+    return max(1, _SQLITE_MAX_VARIABLES // columns_per_row)
+
 
 def create_store_engine(database_url: str) -> Engine:
     """Create a SQLAlchemy engine for the given database URL."""
@@ -172,12 +185,16 @@ class TidemarkStore:
 
             inserted = 0
             if valid_rows:
-                stmt = sqlite_insert(Candle).values(valid_rows)
-                stmt = stmt.on_conflict_do_nothing(
-                    index_elements=["venue", "symbol", "timeframe", "open_time"]
-                )
-                result = session.execute(stmt)
-                inserted = result.rowcount if result.rowcount and result.rowcount > 0 else 0
+                chunk_size = _chunk_size(len(valid_rows[0]))
+                for i in range(0, len(valid_rows), chunk_size):
+                    chunk = valid_rows[i : i + chunk_size]
+                    stmt = sqlite_insert(Candle).values(chunk)
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=["venue", "symbol", "timeframe", "open_time"]
+                    )
+                    result = session.execute(stmt)
+                    if result.rowcount and result.rowcount > 0:
+                        inserted += result.rowcount
 
             session.commit()
 
