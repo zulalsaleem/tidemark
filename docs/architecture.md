@@ -70,24 +70,54 @@
                  |  build_heartbeat_message,     |
                  |  `health heartbeat`           |
                  +----------------------------+
+
+                 +----------------------------+
+                 |  context/mtf.py             |
+                 |  Section 2 (1H, PROVISIONAL |
+                 |  - OBSERVATION ONLY v0.1)    |
+                 |  reads journal/records.py's  |
+                 |  output as-of each 1H close; |
+                 |  own side branch, not in the |
+                 |  evaluate/journal/alert flow |
+                 |  above - no path back into it|
+                 +--------------+-------------+
+                                |  ObservationResult (every 1H close under WATCH)
+                                v
+                 +----------------------------+
+                 |  journal/observe_pipeline.py|
+                 |  -> data/store.py            |
+                 |  observations table          |
+                 |  (append-only; no notifier   |
+                 |  parameter exists at all)    |
+                 +----------------------------+
 ```
 
 `journal/pipeline.py` orchestrates the last three stages for `tidemark
 run`, mirroring `data/ingest.py`'s per-symbol failure isolation and
-COMPLETED/PARTIAL/FAILED run status. `context/mtf.py` (Section 2, 1H
-behavior) is DRAFT and not wired into this pipeline. See
+COMPLETED/PARTIAL/FAILED run status. See
 [ADR 0005](adr/0005-journal-and-alert-separation.md) for why the journal
 and Telegram stages are never coupled, and
 [ADR 0006](adr/0006-health-check-design.md) for why `health/checks.py`
 is a separate read-only side branch rather than part of that pipeline.
+
+`context/mtf.py` (Section 2, 1H behavior) is a second, parallel side
+branch: it reads Section 1's journal as input (the latest row as of
+each 1H close) but has no path back into the evaluate/journal/change-
+detector/Telegram flow above. `journal/observe_pipeline.py` orchestrates
+`tidemark observe run` the same way `journal/pipeline.py` orchestrates
+`tidemark run`, with one deliberate difference: it takes no notifier
+parameter at all, so there is no code path by which it could reach
+Telegram. See
+[ADR 0007](adr/0007-section-2-observation-only.md) for why Section 2
+ships as measurement rather than signal.
 
 ## Module responsibilities
 
 | Module | Responsibility |
 | --- | --- |
 | `config/settings.py` | Load configuration from environment variables (via `.env` in development). No secrets in code; secret fields are `SecretStr` and never logged; no field may hold an exchange credential. |
-| `data/models.py` | SQLAlchemy ORM models: `Candle`, `RejectedCandle`, `Run`, `RunSymbolStat`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`. A `UTCDateTime` type keeps every stored timestamp UTC-aware despite SQLite having no native timezone type. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. |
-| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, idempotent context-record upserts (keyed on asset + evaluated_at + rule_version), and append-only journal writes (`UNIQUE(asset, evaluated_at, rule_version)` — a repeat is a no-op, never a second row or an update) plus the one narrow exception, `record_alert_outcome`. |
+| `data/models.py` | SQLAlchemy ORM models: `Candle`, `RejectedCandle`, `Run`, `RunSymbolStat`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`, `Observation`. A `UTCDateTime` type keeps every stored timestamp UTC-aware despite SQLite having no native timezone type. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. |
+| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, idempotent context-record upserts (keyed on asset + evaluated_at + rule_version), append-only journal writes (`UNIQUE(asset, evaluated_at, rule_version)` — a repeat is a no-op, never a second row or an update) plus the one narrow exception, `record_alert_outcome`, and append-only observation writes (`UNIQUE(asset, evaluated_at, rule_version)`, same no-op-on-repeat contract). |
 | `data/exchange.py` | ccxt-backed market-data client. Venue is configuration (default `binanceusdm`; also works with `bitget`, `mexc`, ... unchanged). Constructed with no credentials — `apiKey`/`secret` are asserted empty. Fetches closed candles only, with bounded-retry backoff on transient network errors. |
 | `data/timeframes.py` | The stored timeframe set (5m, 15m, 1h, 4h, 1d, 1w) and their durations — the single source of truth shared by the exchange client, store, and CLI. |
 | `data/ingest.py` | Orchestrates exchange fetch + store upsert + run recording for `backfill`/`update`. One symbol/timeframe failing never aborts the others; run status is COMPLETED/PARTIAL/FAILED. |
@@ -96,13 +126,14 @@ is a separate read-only side branch rather than part of that pipeline.
 | `core/levels.py` | Swing clustering into support/resistance levels/zones (0.5x ATR cluster distance, 120-candle lookback); previous day/week high & low. |
 | `core/fib.py` | Retracement leg detection (min 2x ATR), the 0.500-0.786 Fib zone, and invalidation on a 4H close beyond the leg start. |
 | `context/htf.py` | Section 1 — full state machine (bias, break, broken-state persistence) and the 9-row decision matrix against 4H closes; see [ADR 0003](adr/0003-rulebook-as-single-source-of-truth.md). Level role (support/resistance) is computed fresh each evaluation via `core.levels.level_role`, per v1.1's RULE 1.7a — see [ADR 0004](adr/0004-dynamic-level-role.md). |
-| `context/mtf.py` | Section 2 — 1H behavior. Currently DRAFT/PENDING; not yet active. |
+| `context/mtf.py` | Section 2 — 1H behavior (rulebook status `PROVISIONAL — OBSERVATION ONLY`, v0.1). A full deterministic replay over closed 1H candles, gated by the as-of Section 1 WATCH record: reaction tiers R1/R2/R3 (Stage A), higher-low/lower-high-then-close structure confirmation (Stage B), zone-close failure, 12-candle reaction expiry, and `HTF_CONTEXT_INVALIDATED` on any Section 1 state/watch/grade change. Reuses Section 1's zone bounds and holding definition rather than a second tolerance. Produces measurement rows only — see [ADR 0007](adr/0007-section-2-observation-only.md). |
 | `journal/records.py` | Builds the append-only journal row (`JournalEntry`) from an evaluated `ContextRecord`. One row per evaluation, including every WAIT — "no setups found" is a successful run, not a failure. |
 | `journal/changes.py` | Pure change detector: previous journal row + current evaluation -> an alert reason or `None`. No I/O. See [ADR 0005](adr/0005-journal-and-alert-separation.md) for why this stays decoupled from the journal write and from Telegram. |
 | `journal/pipeline.py` | Orchestrates `tidemark run`: evaluate -> journal -> change detector -> Telegram, per symbol, with per-symbol failure isolation and the run lifecycle (COMPLETED/PARTIAL/FAILED), mirroring `data/ingest.py`'s pattern. |
+| `journal/observe_pipeline.py` | Orchestrates `tidemark observe run`: evaluate Section 2 -> journal every returned row, per symbol, with the same per-symbol failure isolation and run lifecycle as `journal/pipeline.py`. Takes no notifier parameter at all — there is no code path by which this could reach Telegram. |
 | `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
 | `health/checks.py` | Pure health checks reading only `data/store.py`: database reachability/schema, candle freshness, last run per command, journal activity, gap counts, Telegram config presence. Never sends anything itself — see [ADR 0006](adr/0006-health-check-design.md). |
-| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive. |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `observe run`/`list`/`stats` drive Section 2 - measurement only, no alerts. |
 
 ## TODO
 

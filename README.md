@@ -51,8 +51,26 @@ notification layer on top of it. They are never coupled — a Telegram
 failure never prevents or rolls back a journal write, and the journal
 write always happens first. See
 [docs/adr/0005-journal-and-alert-separation.md](docs/adr/0005-journal-and-alert-separation.md).
-`context/mtf.py` (Section 2, 1H behavior) is still DRAFT and not wired
-into this pipeline.
+
+`context/mtf.py` (Section 2, 1H behavior) runs as a separate,
+parallel measurement pipeline, gated by Section 1's WATCH state:
+
+```
+context/htf.py journal (Section 1, read-only input)
+        |
+        v
+  context/mtf.py   Section 2 — 1H behavior, evaluated at every 1H close
+                    while the latest Section 1 record is a WATCH
+        |
+        v
+  journal/observe_pipeline.py -> observations table
+                        append-only: one row per 1H close under an
+                        active WATCH, including every no-reaction row
+```
+
+It never writes to the Section 1 journal, never calls
+`journal/changes.py`, and never calls `notify/telegram.py` — see
+[docs/adr/0007-section-2-observation-only.md](docs/adr/0007-section-2-observation-only.md).
 
 Persistence (SQLite via SQLAlchemy) sits alongside this pipeline in
 `data/store.py`, holding closed candles, rejected candles, run records,
@@ -169,6 +187,30 @@ uv run tidemark health check --json
 uv run tidemark health heartbeat
 ```
 
+## Using Section 2 observation
+
+Section 2 v0.1 is a **measurement layer, not a signal layer** — see
+[docs/rulebook/section-02-1h-behaviour-v0.1.md](docs/rulebook/section-02-1h-behaviour-v0.1.md)
+(status: `PROVISIONAL — OBSERVATION ONLY`). It never computes an entry,
+stop, target, or R:R, never sends a Telegram alert, and never feeds
+15M — `HANDOFF_TO_15M` is recorded as an observed state only.
+
+```bash
+# Backfill closed 1H candles too - Section 2 needs them alongside 4H/1D/1W.
+uv run tidemark data backfill --symbols BTC/USDT:USDT --timeframes 4h,1d,1w,1h --days 180
+
+# Evaluate Section 2 for each symbol and journal every 1H observation row
+# (only while that symbol is under an active Section 1 WATCH). No alerts.
+uv run tidemark observe run --symbols BTC/USDT:USDT
+
+# Past observations for a symbol, newest first.
+uv run tidemark observe list --symbol BTC/USDT:USDT
+
+# Counts by state, reason_code, and reaction tier - the review tool for
+# deciding whether v1.0 is ever warranted.
+uv run tidemark observe stats
+```
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -189,7 +231,17 @@ detector -> a filtered, read-only Telegram alert on change only.
 actually alive, independent of whether anything alert-worthy has
 happened. `tidemark context evaluate/history/explain` still drive the
 engine standalone, including `--as-of` for point-in-time reproduction.
-Section 2 (1H behavior) is still in draft and unimplemented.
+
+**Phase 5 — Section 2 (1H behavior), observation-only.** Implemented as
+a measurement layer (rulebook status `PROVISIONAL — OBSERVATION ONLY`,
+v0.1): reaction tiers (R1/R2/R3), higher-low/lower-high-then-close
+structure confirmation, zone-close failure, 12-candle reaction expiry,
+and `HTF_CONTEXT_INVALIDATED` on any Section 1 change, all replayed
+deterministically over closed 1H candles. `tidemark observe
+run/list/stats` journal and review it. It produces no trading output
+of any kind and is fully decoupled from the Section 1 journal, the
+change detector, and Telegram — see
+[docs/adr/0007-section-2-observation-only.md](docs/adr/0007-section-2-observation-only.md).
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
