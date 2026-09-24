@@ -155,6 +155,96 @@ def test_unrecognized_last_state_raises_rather_than_guessing() -> None:
         replay_report._classify_session(session)
 
 
+# -- group_sessions itself: a session ended by invalidation must close ------
+# -- the session it ends, not open a phantom one (Bug 1) --------------------
+
+
+def test_group_sessions_closes_on_invalidation_as_one_session_not_two() -> None:
+    # The invalidation row's own section_1_* fields deliberately differ
+    # from the preceding row's - exactly like the real thing (mtf.py's
+    # _invalidated_row populates them from the *new* post-change Section 1
+    # record) - to prove group_sessions no longer splits on that alone.
+    rows = [
+        _obs(_hours(0), mtf.NO_INTERACTION),
+        _obs(
+            _hours(1),
+            mtf.HTF_CONTEXT_INVALIDATED,
+            section_1_state=htf.NEUTRAL,
+            section_1_watch=htf.WAIT,
+            section_1_grade=None,
+        ),
+        # A fresh session starting right after must still start fresh, not
+        # get merged into the one that just closed.
+        _obs(
+            _hours(2),
+            mtf.NO_INTERACTION,
+            section_1_state=htf.BEARISH,
+            section_1_watch=htf.SHORT_WATCH,
+            section_1_grade="B",
+        ),
+    ]
+
+    sessions = replay_report.group_sessions(rows)
+
+    assert len(sessions) == 2
+    assert [r.state for r in sessions[0]] == [mtf.NO_INTERACTION, mtf.HTF_CONTEXT_INVALIDATED]
+    assert replay_report._classify_session(sessions[0]) == mtf.HTF_CONTEXT_INVALIDATED
+    assert len(sessions[1]) == 1
+
+
+def test_group_sessions_bearish_structure_change_classifies_as_bearish() -> None:
+    rows = [
+        _obs(
+            _hours(0),
+            mtf.REACTION_DETECTED,
+            reaction_tier=mtf.R1,
+            reaction_started_at=_hours(0),
+            section_1_watch=htf.SHORT_WATCH,
+        ),
+        _obs(
+            _hours(1),
+            mtf.BEARISH_STRUCTURE_CHANGE,
+            structure_change=mtf.BEARISH_STRUCTURE_CHANGE,
+            reaction_tier=mtf.R1,
+            reaction_started_at=_hours(0),
+            section_1_watch=htf.SHORT_WATCH,
+        ),
+        _obs(_hours(2), mtf.HANDOFF_TO_15M, section_1_watch=htf.SHORT_WATCH),
+        # Eventually invalidated too - the trailing invalidation row must
+        # not override the earlier bearish resolution.
+        _obs(
+            _hours(3),
+            mtf.HTF_CONTEXT_INVALIDATED,
+            section_1_state=htf.NEUTRAL,
+            section_1_watch=htf.WAIT,
+            section_1_grade=None,
+        ),
+    ]
+
+    sessions = replay_report.group_sessions(rows)
+
+    assert len(sessions) == 1
+    assert replay_report._classify_session(sessions[0]) == replay_report.STRUCTURE_CHANGE_SHORT
+
+
+def test_group_sessions_still_open_when_data_ends_without_invalidation() -> None:
+    rows = [
+        _obs(_hours(0), mtf.NO_INTERACTION),
+        _obs(_hours(1), mtf.REACTION_DETECTED, reaction_tier=mtf.R1, reaction_started_at=_hours(1)),
+        _obs(
+            _hours(2),
+            mtf.NO_STRUCTURAL_REFERENCE,
+            reaction_tier=mtf.R1,
+            reaction_started_at=_hours(1),
+        ),
+    ]
+
+    sessions = replay_report.group_sessions(rows)
+
+    assert len(sessions) == 1
+    assert replay_report._classify_session(sessions[0]) == replay_report.STILL_OPEN_AT_END_OF_DATA
+
+
 # -- a small real store fixture for the full-report tests below --------------
 
 _VALUES_4H = [
@@ -356,3 +446,17 @@ def test_table1_table2_table3_are_independent_units(tmp_path) -> None:
     # A session spans many 1H rows, so a session count can never exceed the
     # row count it was grouped from.
     assert table2_sessions <= table3_evaluations
+
+
+def test_full_replay_table2_outcomes_sum_to_session_count(tmp_path) -> None:
+    """The outcome-sum invariant, re-checked end to end (not just against
+    the hand-built fixture) through the corrected group_sessions/
+    _classify_session.
+    """
+    store = _seed_store(tmp_path)
+    report = replay_report.build_replay_report(
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", dt.datetime.now(dt.UTC)
+    )
+
+    for row in report.table2:
+        assert sum(row.outcome_counts.values()) == row.session_count

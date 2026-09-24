@@ -8,7 +8,28 @@ computed) into text.
 from __future__ import annotations
 
 from tidemark.context import htf, mtf
-from tidemark.replay.report import SESSION_OUTCOMES, ReplayReport, Table1Row, Table2Row, Table3Row
+from tidemark.replay.report import (
+    GRADE_ONLY_CHANGE,
+    INVALIDATION_REASONS,
+    NO_REACTION_INTERACTION_BUCKETS,
+    SESSION_OUTCOMES,
+    STATE_OR_WATCH_CHANGE,
+    WITH_INTERACTION,
+    WITHOUT_INTERACTION,
+    ReplayReport,
+    Table1Row,
+    Table2Row,
+    Table3Row,
+)
+
+_INVALIDATION_REASON_LABELS = {
+    GRADE_ONLY_CHANGE: "Grade-only change",
+    STATE_OR_WATCH_CHANGE: "State/watch change",
+}
+_NO_REACTION_INTERACTION_LABELS = {
+    WITH_INTERACTION: "With interaction",
+    WITHOUT_INTERACTION: "Without interaction",
+}
 
 _SECTION1_STATES = (
     htf.INSUFFICIENT_STRUCTURE,
@@ -139,6 +160,48 @@ def _render_table2_row(row: Table2Row) -> list[str]:
     lines += ["| Highest reaction tier reached | Sessions |", "| --- | ---: |"]
     for tier in (mtf.R1, mtf.R2, mtf.R3, "none"):
         lines.append(f"| {tier} | {row.highest_tier_counts.get(tier, 0)} |")
+
+    invalidated_total = sum(row.invalidation_reason_counts.values())
+    lines.append("")
+    lines.append(
+        f"Why sessions ending in {mtf.HTF_CONTEXT_INVALIDATED} actually ended "
+        f"({invalidated_total} sessions):"
+    )
+    lines += ["| Reason | Count |", "| --- | ---: |"]
+    for reason in INVALIDATION_REASONS:
+        label = _INVALIDATION_REASON_LABELS[reason]
+        lines.append(f"| {label} | {row.invalidation_reason_counts.get(reason, 0)} |")
+
+    no_reaction_total = sum(row.no_reaction_interaction_counts.values())
+    lines.append("")
+    lines.append(f"No-reaction sessions, split by interaction ({no_reaction_total} sessions):")
+    lines += ["| Interaction | Count |", "| --- | ---: |"]
+    for bucket in NO_REACTION_INTERACTION_BUCKETS:
+        label = _NO_REACTION_INTERACTION_LABELS[bucket]
+        lines.append(f"| {label} | {row.no_reaction_interaction_counts.get(bucket, 0)} |")
+
+    return lines
+
+
+def _render_structure_change_details(report: ReplayReport) -> list[str]:
+    details = report.table2[-1].structure_changes  # the "ALL" row
+    lines = [
+        "### Structure-change sessions - detail",
+        "",
+        "Grade Section 1 held at session start, and the reaction tier that "
+        "preceded the confirming close, for every structure-change session "
+        "across all symbols.",
+        "",
+        "| Symbol | Session start | Trigger | Direction | Grade at start | Reaction tier |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for d in sorted(details, key=lambda d: (d.symbol, d.session_start)):
+        lines.append(
+            f"| {d.symbol} | {d.session_start.isoformat()} | {d.trigger_at.isoformat()} "
+            f"| {d.direction} | {d.grade_at_start or '-'} | {d.reaction_tier or '-'} |"
+        )
+    if not details:
+        lines.append("| (none) | | | | | |")
     return lines
 
 
@@ -155,6 +218,7 @@ def render_table2(report: ReplayReport) -> str:
     for row in report.table2:
         lines += _render_table2_row(row)
         lines.append("")
+    lines += _render_structure_change_details(report)
     return "\n".join(lines).rstrip() + "\n"
 
 

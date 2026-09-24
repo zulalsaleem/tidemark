@@ -37,10 +37,6 @@ from tidemark.data.store import TidemarkStore
 # feeds Section 2. Fixed order so the snapshot hash is reproducible.
 TIMEFRAMES_USED: tuple[str, ...] = ("4h", "1d", "1w", "1h")
 
-_TERMINAL_LONG = (mtf.BULLISH_STRUCTURE_CHANGE, mtf.HANDOFF_TO_15M)
-_TERMINAL_SHORT = (mtf.BEARISH_STRUCTURE_CHANGE,)
-_TERMINAL_SUPPORT_FAIL = (mtf.SUPPORT_FAILURE, mtf.STAND_DOWN)
-_TERMINAL_RESISTANCE_FAIL = (mtf.RESISTANCE_FAILURE,)
 _STILL_ACTIVE_STATES = (
     mtf.NO_INTERACTION,
     mtf.REACTION_DETECTED,
@@ -67,6 +63,20 @@ SESSION_OUTCOMES: tuple[str, ...] = (
 )
 
 _TIER_RANK = {mtf.R1: 1, mtf.R2: 2, mtf.R3: 3}
+
+# Why a session that ended on HTF_CONTEXT_INVALIDATED actually ended: only
+# the grade changed (state and watch unchanged), or state and/or watch
+# changed too.
+GRADE_ONLY_CHANGE = "GRADE_ONLY_CHANGE"
+STATE_OR_WATCH_CHANGE = "STATE_OR_WATCH_CHANGE"
+INVALIDATION_REASONS: tuple[str, ...] = (GRADE_ONLY_CHANGE, STATE_OR_WATCH_CHANGE)
+
+# For a session with no reaction tier ever detected: did it interact with
+# the level at all (CONTINUATION_CANDIDATE_NOT_EVALUATED at some point) or
+# never touch the zone (NO_INTERACTION throughout).
+WITH_INTERACTION = "WITH_INTERACTION"
+WITHOUT_INTERACTION = "WITHOUT_INTERACTION"
+NO_REACTION_INTERACTION_BUCKETS: tuple[str, ...] = (WITH_INTERACTION, WITHOUT_INTERACTION)
 
 
 # -- data snapshot (PART B) ---------------------------------------------------
@@ -256,19 +266,29 @@ def replay_section2(
 
 def group_sessions(rows: list[mtf.ObservationResult]) -> list[list[mtf.ObservationResult]]:
     """Group Section 2 output rows (already in evaluated_at order) into
-    sessions: a new session starts on the first row, whenever the pinned
-    (section_1_state, section_1_watch, section_1_grade) tuple changes, or
-    whenever there's a time gap since the previous row (Section 1 left
-    WATCH and later re-entered it - no rows are emitted while it's away).
+    sessions: a new session starts on the first row, whenever there's a
+    time gap since the previous row (Section 1 left WATCH and later
+    re-entered it - no rows are emitted while it's away), or right after a
+    row whose own state is HTF_CONTEXT_INVALIDATED - that row is the
+    CLOSING row of the session it ends, not the opening row of a new one.
+
+    This does NOT compare each row's own (section_1_state, section_1_watch,
+    section_1_grade) fields against the previous row's, because the
+    invalidation row's own fields reflect the *new*, post-change Section 1
+    record - `mtf.py`'s `_invalidated_row` builds it from `as_of` (the
+    record that triggered the change), not from `session.pin` (what the
+    ending session was pinned to). Comparing fields would put the
+    invalidation row on the wrong side of the boundary it's supposed to
+    mark. (A prior version of this function did exactly that - it's the
+    subject of ADR 0008's Table 2 correction.)
     """
     sessions: list[list[mtf.ObservationResult]] = []
     current: list[mtf.ObservationResult] = []
     prev: mtf.ObservationResult | None = None
     for row in rows:
-        pin = (row.section_1_state, row.section_1_watch, row.section_1_grade)
         is_new = (
             prev is None
-            or pin != (prev.section_1_state, prev.section_1_watch, prev.section_1_grade)
+            or prev.state == mtf.HTF_CONTEXT_INVALIDATED
             or row.evaluated_at - prev.evaluated_at != dt.timedelta(hours=1)
         )
         if is_new and current:
@@ -283,32 +303,45 @@ def group_sessions(rows: list[mtf.ObservationResult]) -> list[list[mtf.Observati
 
 def _classify_session(session: list[mtf.ObservationResult]) -> str:
     """Every session ends in exactly one outcome - see `SESSION_OUTCOMES`.
+
+    Resolution (a structure change or a level failure) is looked for
+    anywhere in the session, never inferred from the last row alone: since
+    `group_sessions` now attaches a session's closing HTF_CONTEXT_INVALIDATED
+    row to the session it ends, an already-resolved session (structure
+    change or failure fired earlier) can still end with that trailing
+    invalidation row as its last row - and that later invalidation must
+    not override the session's true, earlier resolution. Each direction is
+    read from the triggering row's own `structure_change`/`failure` field,
+    never guessed from which terminal *state* happens to be last (that was
+    Bug 2 - the earlier version returned STRUCTURE_CHANGE_LONG whenever
+    the last row was HANDOFF_TO_15M, which is the same direction-agnostic
+    echo state for both bullish and bearish confirmations).
+
     Raises rather than guessing if a future state isn't yet mapped here,
     which is what keeps "outcome counts sum to the session total" true by
     construction instead of by accident.
     """
-    last = session[-1]
-    if last.state in _TERMINAL_LONG:
-        return STRUCTURE_CHANGE_LONG
-    if last.state in _TERMINAL_SHORT:
-        return STRUCTURE_CHANGE_SHORT
-    if last.state in _TERMINAL_SUPPORT_FAIL:
-        # STAND_DOWN is direction-agnostic on its own; the triggering row's
-        # own `failure` field (still present in the row list) says which.
-        direction = next(r.failure for r in session if r.failure is not None)
-        if direction == mtf.SUPPORT_FAILURE:
+    for r in session:
+        if r.structure_change == mtf.BULLISH_STRUCTURE_CHANGE:
+            return STRUCTURE_CHANGE_LONG
+        if r.structure_change == mtf.BEARISH_STRUCTURE_CHANGE:
+            return STRUCTURE_CHANGE_SHORT
+    for r in session:
+        if r.failure == mtf.SUPPORT_FAILURE:
             return LEVEL_FAILURE_SUPPORT
-        return LEVEL_FAILURE_RESISTANCE
-    if last.state in _TERMINAL_RESISTANCE_FAIL:
-        return LEVEL_FAILURE_RESISTANCE
+        if r.failure == mtf.RESISTANCE_FAILURE:
+            return LEVEL_FAILURE_RESISTANCE
+
+    last = session[-1]
     if last.state == mtf.HTF_CONTEXT_INVALIDATED:
         return mtf.HTF_CONTEXT_INVALIDATED
     if last.state == mtf.REACTION_EXPIRED:
         return mtf.REACTION_EXPIRED
     if last.state in _STILL_ACTIVE_STATES:
-        # The only way `mtf.evaluate`'s loop stops emitting rows for a
-        # still-active session is running out of candles - there is no
-        # other way to end on one of these non-terminal states.
+        # An unresolved session can only end here (rather than on
+        # HTF_CONTEXT_INVALIDATED) by running out of candles - there is no
+        # other way `mtf.evaluate`'s loop stops emitting rows for a
+        # still-active session.
         return STILL_OPEN_AT_END_OF_DATA
     raise ValueError(f"unclassified Section 2 session-ending state: {last.state!r}")
 
@@ -338,6 +371,21 @@ class Table1Row:
 
 
 @dataclass(frozen=True)
+class StructureChangeDetail:
+    """One STRUCTURE_CHANGE_LONG/_SHORT session: the grade Section 1 held
+    when the session started, and the reaction tier that preceded the
+    confirming close.
+    """
+
+    symbol: str
+    session_start: dt.datetime
+    trigger_at: dt.datetime
+    direction: str  # mtf.BULLISH_STRUCTURE_CHANGE or mtf.BEARISH_STRUCTURE_CHANGE
+    grade_at_start: str | None
+    reaction_tier: str | None
+
+
+@dataclass(frozen=True)
 class Table2Row:
     """Section 2, per session."""
 
@@ -348,6 +396,9 @@ class Table2Row:
     highest_tier_counts: dict[str, int]
     median_session_length: float | None
     max_session_length: int | None
+    invalidation_reason_counts: dict[str, int]
+    no_reaction_interaction_counts: dict[str, int]
+    structure_changes: list[StructureChangeDetail]
 
 
 @dataclass(frozen=True)
@@ -423,15 +474,48 @@ def _build_table1(records_by_symbol: dict[str, list[ContextRecord]]) -> list[Tab
 def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) -> Table2Row:
     outcome_counts: dict[str, int] = dict.fromkeys(SESSION_OUTCOMES, 0)
     tier_counts: dict[str, int] = {mtf.R1: 0, mtf.R2: 0, mtf.R3: 0, "none": 0}
+    invalidation_reason_counts: dict[str, int] = dict.fromkeys(INVALIDATION_REASONS, 0)
+    no_reaction_interaction_counts: dict[str, int] = dict.fromkeys(
+        NO_REACTION_INTERACTION_BUCKETS, 0
+    )
+    structure_changes: list[StructureChangeDetail] = []
     with_interaction = 0
     lengths = []
     for session in sessions:
         outcome_counts[_classify_session(session)] += 1
-        if any(row.interaction_detected for row in session):
+        interacted = any(row.interaction_detected for row in session)
+        if interacted:
             with_interaction += 1
         tier = _highest_tier(session)
         tier_counts["none" if tier is None else tier] += 1
         lengths.append(len(session))
+
+        if session[-1].state == mtf.HTF_CONTEXT_INVALIDATED:
+            start, end = session[0], session[-1]
+            grade_only = (
+                start.section_1_state == end.section_1_state
+                and start.section_1_watch == end.section_1_watch
+            )
+            reason = GRADE_ONLY_CHANGE if grade_only else STATE_OR_WATCH_CHANGE
+            invalidation_reason_counts[reason] += 1
+
+        if tier is None:
+            bucket = WITH_INTERACTION if interacted else WITHOUT_INTERACTION
+            no_reaction_interaction_counts[bucket] += 1
+
+        for row in session:
+            if row.structure_change is not None:
+                structure_changes.append(
+                    StructureChangeDetail(
+                        symbol=session[0].asset,
+                        session_start=session[0].evaluated_at,
+                        trigger_at=row.evaluated_at,
+                        direction=row.structure_change,
+                        grade_at_start=session[0].section_1_grade,
+                        reaction_tier=row.reaction_tier,
+                    )
+                )
+                break
 
     return Table2Row(
         symbol=symbol,
@@ -441,6 +525,9 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
         highest_tier_counts=tier_counts,
         median_session_length=statistics.median(lengths) if lengths else None,
         max_session_length=max(lengths) if lengths else None,
+        invalidation_reason_counts=invalidation_reason_counts,
+        no_reaction_interaction_counts=no_reaction_interaction_counts,
+        structure_changes=structure_changes,
     )
 
 

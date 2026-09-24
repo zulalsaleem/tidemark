@@ -8,9 +8,48 @@ import datetime as dt
 
 from tidemark.context import mtf
 from tidemark.replay import render
-from tidemark.replay.report import DataSnapshot, ReplayReport, Table1Row, Table2Row, Table3Row
+from tidemark.replay.report import (
+    GRADE_ONLY_CHANGE,
+    STATE_OR_WATCH_CHANGE,
+    WITH_INTERACTION,
+    WITHOUT_INTERACTION,
+    DataSnapshot,
+    ReplayReport,
+    StructureChangeDetail,
+    Table1Row,
+    Table2Row,
+    Table3Row,
+)
 
 BASE = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+
+def _table2_row(**overrides) -> Table2Row:
+    defaults = dict(
+        symbol="BTC/USDT:USDT",
+        session_count=0,
+        sessions_with_interaction=0,
+        outcome_counts=dict.fromkeys(
+            (
+                "STRUCTURE_CHANGE_LONG",
+                "STRUCTURE_CHANGE_SHORT",
+                "LEVEL_FAILURE_SUPPORT",
+                "LEVEL_FAILURE_RESISTANCE",
+                mtf.REACTION_EXPIRED,
+                mtf.HTF_CONTEXT_INVALIDATED,
+                "STILL_OPEN_AT_END_OF_DATA",
+            ),
+            0,
+        ),
+        highest_tier_counts={mtf.R1: 0, mtf.R2: 0, mtf.R3: 0, "none": 0},
+        median_session_length=None,
+        max_session_length=None,
+        invalidation_reason_counts={GRADE_ONLY_CHANGE: 0, STATE_OR_WATCH_CHANGE: 0},
+        no_reaction_interaction_counts={WITH_INTERACTION: 0, WITHOUT_INTERACTION: 0},
+        structure_changes=[],
+    )
+    defaults.update(overrides)
+    return Table2Row(**defaults)
 
 
 def _empty_snapshot() -> DataSnapshot:
@@ -47,8 +86,7 @@ def _report(table2_row: Table2Row) -> ReplayReport:
 
 
 def test_render_table2_sum_row_matches_session_count() -> None:
-    row = Table2Row(
-        symbol="BTC/USDT:USDT",
+    row = _table2_row(
         session_count=9,
         sessions_with_interaction=4,
         outcome_counts={
@@ -63,35 +101,42 @@ def test_render_table2_sum_row_matches_session_count() -> None:
         highest_tier_counts={mtf.R1: 2, mtf.R2: 1, mtf.R3: 1, "none": 5},
         median_session_length=3.0,
         max_session_length=12,
+        invalidation_reason_counts={GRADE_ONLY_CHANGE: 1, STATE_OR_WATCH_CHANGE: 1},
+        no_reaction_interaction_counts={WITH_INTERACTION: 2, WITHOUT_INTERACTION: 3},
     )
 
     text = render.render_table2(_report(row))
 
     assert "| **sum** | **9** |" in text
     assert "Sessions: 9" in text
+    assert "Why sessions ending in HTF_CONTEXT_INVALIDATED actually ended (2 sessions):" in text
+    assert "No-reaction sessions, split by interaction (5 sessions):" in text
+
+
+def test_render_table2_lists_structure_change_details() -> None:
+    detail = StructureChangeDetail(
+        symbol="BTC/USDT:USDT",
+        session_start=BASE,
+        trigger_at=BASE + dt.timedelta(hours=8),
+        direction=mtf.BEARISH_STRUCTURE_CHANGE,
+        grade_at_start="B",
+        reaction_tier=mtf.R3,
+    )
+    row = _table2_row(
+        session_count=1,
+        outcome_counts={"STRUCTURE_CHANGE_SHORT": 1},
+        structure_changes=[detail],
+    )
+
+    text = render.render_table2(_report(row))
+
+    assert "### Structure-change sessions - detail" in text
+    assert "BEARISH_STRUCTURE_CHANGE" in text
+    assert "| B | R3 |" in text
 
 
 def test_render_report_includes_all_three_table_headers() -> None:
-    row = Table2Row(
-        symbol="BTC/USDT:USDT",
-        session_count=0,
-        sessions_with_interaction=0,
-        outcome_counts=dict.fromkeys(
-            (
-                "STRUCTURE_CHANGE_LONG",
-                "STRUCTURE_CHANGE_SHORT",
-                "LEVEL_FAILURE_SUPPORT",
-                "LEVEL_FAILURE_RESISTANCE",
-                mtf.REACTION_EXPIRED,
-                mtf.HTF_CONTEXT_INVALIDATED,
-                "STILL_OPEN_AT_END_OF_DATA",
-            ),
-            0,
-        ),
-        highest_tier_counts={mtf.R1: 0, mtf.R2: 0, mtf.R3: 0, "none": 0},
-        median_session_length=None,
-        max_session_length=None,
-    )
+    row = _table2_row()
 
     text = render.render_report(_report(row))
 
