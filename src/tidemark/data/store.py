@@ -23,6 +23,7 @@ from tidemark.data.models import (
     Candle,
     ContextRecord,
     JournalEntry,
+    Observation,
     RejectedCandle,
     Run,
     RunSymbolStat,
@@ -56,6 +57,20 @@ class CandleUpsertResult:
     inserted: int
     duplicates_skipped: int
     rejected: int
+
+
+@dataclass(frozen=True)
+class ObservationWriteResult:
+    """Outcome of writing one Section 2 observation row.
+
+    Append-only, mirroring `JournalWriteResult`: `inserted=False` means
+    this (asset, evaluated_at, rule_version) was already observed — a
+    no-op, and `observation` is the existing row untouched, not a second
+    row and not an update.
+    """
+
+    observation: Observation
+    inserted: bool
 
 
 @dataclass(frozen=True)
@@ -504,3 +519,70 @@ class TidemarkStore:
         with self._session_factory() as session:
             stmt = select(func.count()).select_from(JournalEntry)
             return session.scalar(stmt) or 0
+
+    # -- observations (Section 2, Phase 5) -------------------------------------
+
+    def save_observation(self, observation: Observation) -> ObservationWriteResult:
+        """Append one Section 2 observation row. Append-only, mirroring
+        `save_journal_entry`: an existing (asset, evaluated_at,
+        rule_version) row is never overwritten — re-evaluating the same
+        1H close is a no-op that returns the existing row.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(Observation).where(
+                    Observation.asset == observation.asset,
+                    Observation.evaluated_at == observation.evaluated_at,
+                    Observation.rule_version == observation.rule_version,
+                )
+            ).one_or_none()
+            if existing is not None:
+                return ObservationWriteResult(observation=existing, inserted=False)
+
+            new_observation = Observation(
+                asset=observation.asset,
+                evaluated_at=observation.evaluated_at,
+                rule_version=observation.rule_version,
+                section_1_state=observation.section_1_state,
+                section_1_watch=observation.section_1_watch,
+                section_1_grade=observation.section_1_grade,
+                section_1_level_price=observation.section_1_level_price,
+                interaction_detected=observation.interaction_detected,
+                reaction_tier=observation.reaction_tier,
+                reaction_condition_matched=observation.reaction_condition_matched,
+                reaction_started_at=observation.reaction_started_at,
+                structure_reference_price=observation.structure_reference_price,
+                structure_reference_confirmed_at=observation.structure_reference_confirmed_at,
+                structure_change=observation.structure_change,
+                failure=observation.failure,
+                expiry=observation.expiry,
+                state=observation.state,
+                reason_code=observation.reason_code,
+                swings_used=observation.swings_used,
+            )
+            session.add(new_observation)
+            session.commit()
+            session.refresh(new_observation)
+            return ObservationWriteResult(observation=new_observation, inserted=True)
+
+    def observation_history(
+        self, asset: str, since: dt.datetime | None = None
+    ) -> list[Observation]:
+        """Fetch observation rows for an asset, newest first."""
+        with self._session_factory() as session:
+            stmt = select(Observation).where(Observation.asset == asset)
+            if since is not None:
+                stmt = stmt.where(Observation.evaluated_at >= since)
+            stmt = stmt.order_by(Observation.evaluated_at.desc())
+            return list(session.scalars(stmt))
+
+    def all_observations(self, since: dt.datetime | None = None) -> list[Observation]:
+        """Fetch observation rows across every asset, newest first — the
+        query `observe stats` aggregates over.
+        """
+        with self._session_factory() as session:
+            stmt = select(Observation)
+            if since is not None:
+                stmt = stmt.where(Observation.evaluated_at >= since)
+            stmt = stmt.order_by(Observation.evaluated_at.desc())
+            return list(session.scalars(stmt))
