@@ -835,3 +835,73 @@ def test_observe_output_never_contains_trading_signal_language(
     combined = (list_result.stdout + stats_result.stdout).lower()
     for word in _FORBIDDEN_SIGNAL_WORDS:
         assert word not in combined, f"found forbidden word {word!r} in observe output"
+
+
+# -- replay (Phase 5B) ---------------------------------------------------------
+
+
+def test_replay_rejects_an_unimplemented_rule_version(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["replay", "--rule-version", "section-02-v0.2"])
+
+    assert result.exit_code == 1
+    assert "section-02-v0.2" in result.stdout
+    assert "section-02-v0.1" in result.stdout
+
+
+def test_replay_writes_nothing_and_prints_all_three_tables(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=30)
+    _seed_1h_candles(url, SYMBOL, n=50)
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    before = (
+        store.count_journal_entries(),
+        len(store.context_history(SYMBOL)),
+        len(store.observation_history(SYMBOL)),
+    )
+
+    result = runner.invoke(
+        app, ["replay", "--rule-version", "section-02-v0.1", "--symbols", SYMBOL]
+    )
+
+    after = (
+        store.count_journal_entries(),
+        len(store.context_history(SYMBOL)),
+        len(store.observation_history(SYMBOL)),
+    )
+
+    assert result.exit_code == 0
+    assert before == after == (0, 0, 0)
+    assert "## Data snapshot" in result.stdout
+    assert "## Table 1" in result.stdout
+    assert "## Table 2" in result.stdout
+    assert "## Table 3" in result.stdout
+    assert "**sum**" in result.stdout
+
+
+def test_replay_reports_deterministically_across_two_invocations(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=20)
+    _seed_1h_candles(url, SYMBOL, n=40)
+
+    first = runner.invoke(app, ["replay", "--rule-version", "section-02-v0.1", "--symbols", SYMBOL])
+    second = runner.invoke(
+        app, ["replay", "--rule-version", "section-02-v0.1", "--symbols", SYMBOL]
+    )
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    # generated_at is the one deliberately time-varying line; everything else
+    # - including the snapshot hash and every table - must match exactly.
+    first_lines = [line for line in first.stdout.splitlines() if "generated_at" not in line]
+    second_lines = [line for line in second.stdout.splitlines() if "generated_at" not in line]
+    assert first_lines == second_lines
