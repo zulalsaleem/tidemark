@@ -15,7 +15,7 @@ import typer
 
 from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
-from tidemark.context import htf
+from tidemark.context import htf, mtf
 from tidemark.core.atr import atr as compute_atr
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, run_backfill, run_update
@@ -26,6 +26,8 @@ from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
+from tidemark.replay.render import render_report
+from tidemark.replay.report import build_replay_report
 
 app = typer.Typer(
     name="tidemark",
@@ -132,6 +134,62 @@ def _print_pipeline_outcome(outcome: PipelineRunOutcome) -> None:
 def version() -> None:
     """Print the installed Tidemark version."""
     typer.echo(__version__)
+
+
+@app.command()
+def replay(
+    rule_version: str = typer.Option(
+        ...,
+        "--rule-version",
+        help=(
+            "The Section 2 rule version to replay against. Only "
+            f"{mtf.RULE_VERSION!r} is implemented."
+        ),
+    ),
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
+    ),
+    days: int = typer.Option(
+        None,
+        "--days",
+        help="Limit the replay to the last N days of stored candles; defaults to all of it.",
+    ),
+) -> None:
+    """Read-only, point-in-time replay of Section 1 and Section 2.
+
+    Writes nothing to the context, journal, or observation tables - report
+    only. See docs/adr/0008-replay-as-a-repo-command.md and
+    docs/replay/section-02-v0.1-baseline.md.
+    """
+    if rule_version != mtf.RULE_VERSION:
+        typer.echo(
+            f"Unknown --rule-version {rule_version!r}. Only {mtf.RULE_VERSION!r} is "
+            "implemented - there is no v0.2 to replay against yet."
+        )
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    store = _store(settings)
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+
+    command = f"tidemark replay --rule-version {rule_version}"
+    if symbols:
+        command += " --symbols " + ",".join(symbol_list)
+    if days is not None:
+        command += f" --days {days}"
+
+    report = build_replay_report(
+        store,
+        settings.venue,
+        symbol_list,
+        rule_version,
+        command,
+        dt.datetime.now(dt.UTC),
+        days=days,
+    )
+    typer.echo(render_report(report))
 
 
 def _parse_csv(values: list[str] | None) -> list[str] | None:
