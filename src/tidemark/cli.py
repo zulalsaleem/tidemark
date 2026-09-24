@@ -23,6 +23,7 @@ from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
+from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 
@@ -55,6 +56,16 @@ journal_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(journal_app, name="journal")
+
+observe_app = typer.Typer(
+    name="observe",
+    help=(
+        "Section 2 (1H) observation-only layer: run, list, stats. "
+        "Measurement, not signal - see docs/rulebook/section-02-1h-behaviour-v0.1.md."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(observe_app, name="observe")
 
 notify_app = typer.Typer(
     name="notify",
@@ -536,6 +547,97 @@ def journal_alerts(days: int = typer.Option(30, "--days")) -> None:
             f"{entry.evaluated_at.isoformat()}  {entry.asset:<16}  {entry.state:22}  "
             f"{entry.watch:11}  grade={grade}  alert_reason={entry.alert_reason}"
         )
+
+
+@observe_app.command("run")
+def observe_run(
+    symbols: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbols",
+        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
+    ),
+) -> None:
+    """Evaluate Section 2 (1H) and journal every observation row.
+
+    Measurement only: no entries, stops, targets, R:R, 15M handoff, or
+    Telegram alert is ever produced here.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+
+    outcome = run_observe_pipeline(store, settings.venue, symbol_list)
+    _print_observe_outcome(outcome)
+
+
+def _print_observe_outcome(outcome: ObservePipelineRunOutcome) -> None:
+    typer.echo(f"observe {outcome.run_id}: {outcome.status}")
+    for o in outcome.outcomes:
+        if o.error is not None:
+            typer.echo(f"  {o.symbol:<16} FAILED: {o.error}")
+        else:
+            typer.echo(f"  {o.symbol:<16} evaluated={o.evaluated} inserted={o.inserted}")
+
+
+@observe_app.command("list")
+def observe_list(
+    symbol: str = typer.Option(..., "--symbol"),
+    days: int = typer.Option(30, "--days"),
+) -> None:
+    """List Section 2 observation rows for a symbol, newest first."""
+    settings = get_settings()
+    store = _store(settings)
+    since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    observations = store.observation_history(symbol, since=since)
+
+    if not observations:
+        typer.echo("No observation rows found.")
+        return
+
+    for obs in observations:
+        tier = obs.reaction_tier or "-"
+        typer.echo(
+            f"{obs.evaluated_at.isoformat()}  {obs.state:32}  "
+            f"watch={obs.section_1_watch:11}  tier={tier:<2}  reason={obs.reason_code}"
+        )
+
+
+def _count_by(observations: list, key) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for obs in observations:
+        k = key(obs)
+        counts[k] = counts.get(k, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
+@observe_app.command("stats")
+def observe_stats(days: int = typer.Option(30, "--days")) -> None:
+    """Section 2 counts by state, reason_code, and reaction tier - the review tool."""
+    settings = get_settings()
+    store = _store(settings)
+    since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    observations = store.all_observations(since=since)
+
+    if not observations:
+        typer.echo("No observation rows found.")
+        return
+
+    typer.echo(f"Total observation rows: {len(observations)}")
+
+    typer.echo("")
+    typer.echo("By state:")
+    for state, count in _count_by(observations, lambda o: o.state):
+        typer.echo(f"  {state:<36} {count}")
+
+    typer.echo("")
+    typer.echo("By reason_code:")
+    for reason, count in _count_by(observations, lambda o: o.reason_code):
+        typer.echo(f"  {reason:<36} {count}")
+
+    typer.echo("")
+    typer.echo("By reaction tier:")
+    for tier, count in _count_by(observations, lambda o: o.reaction_tier or "(none)"):
+        typer.echo(f"  {tier:<10} {count}")
 
 
 _TEST_MESSAGE = (
