@@ -134,6 +134,43 @@ def test_session_outcome_counts_sum_to_session_count() -> None:
     assert row.outcome_counts[replay_report.STILL_OPEN_AT_END_OF_DATA] == 1
 
 
+def test_invalidation_reason_only_counts_sessions_whose_outcome_is_invalidated() -> None:
+    resolved_then_invalidated = [
+        _obs(
+            _hours(0), mtf.BULLISH_STRUCTURE_CHANGE, structure_change=mtf.BULLISH_STRUCTURE_CHANGE
+        ),
+        _obs(_hours(1), mtf.HANDOFF_TO_15M),
+        # Eventually invalidated too - must NOT count towards
+        # invalidation_reason_counts, since this session's outcome is the
+        # structure change, not the invalidation.
+        _obs(
+            _hours(2),
+            mtf.HTF_CONTEXT_INVALIDATED,
+            section_1_state=htf.NEUTRAL,
+            section_1_watch=htf.WAIT,
+            section_1_grade=None,
+        ),
+    ]
+    genuinely_invalidated = [
+        _obs(_hours(3), mtf.NO_INTERACTION),
+        _obs(
+            _hours(4),
+            mtf.HTF_CONTEXT_INVALIDATED,
+            section_1_state=htf.NEUTRAL,
+            section_1_watch=htf.WAIT,
+            section_1_grade=None,
+        ),
+    ]
+
+    row = replay_report._build_table2_row(
+        SYMBOL, [resolved_then_invalidated, genuinely_invalidated]
+    )
+
+    assert row.outcome_counts[replay_report.STRUCTURE_CHANGE_LONG] == 1
+    assert row.outcome_counts[mtf.HTF_CONTEXT_INVALIDATED] == 1
+    assert sum(row.invalidation_reason_counts.values()) == 1
+
+
 def test_session_still_active_at_end_of_data_is_still_open() -> None:
     session = [
         _obs(_hours(0), mtf.NO_INTERACTION),
