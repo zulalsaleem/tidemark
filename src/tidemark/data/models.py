@@ -245,3 +245,55 @@ class JournalEntry(Base):
     swings_used: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     alert_sent: Mapped[bool] = mapped_column(nullable=False, default=False)
     alert_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class Observation(Base):
+    """An append-only Section 2 (1H) observation row — see
+    `docs/rulebook/section-02-1h-behaviour-v0.1.md`, PROVISIONAL /
+    OBSERVATION ONLY, and `context/mtf.py`.
+
+    One row per closed 1H candle per asset while under an active Section
+    1 WATCH, including every no-reaction evaluation — the negative cases
+    are the measurement. Distinct from `journal_entries` (the Section 1
+    research record): this is a separate table for a separate, purely
+    observational purpose, never read by the change detector or
+    notifier.
+    """
+
+    __tablename__ = "observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "asset", "evaluated_at", "rule_version", name="uq_observations_asset_evaluated_at_rule"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    evaluated_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
+    rule_version: Mapped[str] = mapped_column(String, nullable=False)
+
+    section_1_state: Mapped[str] = mapped_column(String, nullable=False)
+    section_1_watch: Mapped[str] = mapped_column(String, nullable=False)
+    section_1_grade: Mapped[str | None] = mapped_column(String, nullable=True)
+    section_1_level_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    interaction_detected: Mapped[bool] = mapped_column(nullable=False, default=False)
+    reaction_tier: Mapped[str | None] = mapped_column(String, nullable=True)
+    reaction_condition_matched: Mapped[str | None] = mapped_column(String, nullable=True)
+    reaction_started_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+    structure_reference_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    structure_reference_confirmed_at: Mapped[dt.datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+
+    structure_change: Mapped[str | None] = mapped_column(String, nullable=True)
+    failure: Mapped[str | None] = mapped_column(String, nullable=True)
+    expiry: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String, nullable=False)
+
+    # swings_used[]{kind, price, formed_at, confirmed_at} - mirrors the
+    # Section 1 OUTPUT RECORD's swings_used shape.
+    swings_used: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
