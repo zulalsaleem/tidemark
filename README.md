@@ -211,6 +211,31 @@ uv run tidemark observe list --symbol BTC/USDT:USDT
 uv run tidemark observe stats
 ```
 
+## Replaying Section 1 and Section 2
+
+`tidemark replay` is a read-only, point-in-time replay over already-stored
+candles — it never writes to the context, journal, or observation tables.
+It reports Section 1 per evaluation, Section 2 per session, and Section 2
+per evaluation as three separate tables that are never summed together
+(mixing those units the wrong way is exactly what produced an earlier,
+invalid ad-hoc comparison — see
+[docs/adr/0008-replay-as-a-repo-command.md](docs/adr/0008-replay-as-a-repo-command.md)).
+It also records a hash over the candle rows it used, so a later replay
+against different history says so plainly instead of being silently
+compared.
+
+```bash
+# Report against every symbol's full stored history.
+uv run tidemark replay --rule-version section-02-v0.1
+
+# Limit to specific symbols and/or the last N days.
+uv run tidemark replay --rule-version section-02-v0.1 --symbols BTC/USDT:USDT --days 90
+```
+
+The frozen v0.1 baseline this produced is committed at
+[docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md)
+— what a future v0.2 replay is compared against.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -242,6 +267,14 @@ run/list/stats` journal and review it. It produces no trading output
 of any kind and is fully decoupled from the Section 1 journal, the
 change detector, and Telegram — see
 [docs/adr/0007-section-2-observation-only.md](docs/adr/0007-section-2-observation-only.md).
+
+**Phase 5B — the replay command and the frozen v0.1 baseline.**
+`tidemark replay` re-evaluates Section 1 and Section 2 point-in-time
+over stored candles with no writes, reporting per-evaluation and
+per-session counts as separate, never-merged tables — see
+[docs/adr/0008-replay-as-a-repo-command.md](docs/adr/0008-replay-as-a-repo-command.md)
+and the committed
+[docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md).
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
