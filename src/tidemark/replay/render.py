@@ -180,6 +180,20 @@ def _render_table2_row(row: Table2Row) -> list[str]:
         label = _NO_REACTION_INTERACTION_LABELS[bucket]
         lines.append(f"| {label} | {row.no_reaction_interaction_counts.get(bucket, 0)} |")
 
+    lines.append("")
+    lines += ["| Grade at start | Sessions |", "| --- | ---: |"]
+    for grade in ("A", "B"):
+        lines.append(f"| {grade} | {row.grade_at_start_counts.get(grade, 0)} |")
+    lines.append("")
+    lines += [
+        "| Terminal outcome | Grade A at start | Grade B at start |",
+        "| --- | ---: | ---: |",
+    ]
+    for outcome in SESSION_OUTCOMES:
+        by_a = row.outcome_by_grade_at_start.get("A", {})
+        by_b = row.outcome_by_grade_at_start.get("B", {})
+        lines.append(f"| {outcome} | {by_a.get(outcome, 0)} | {by_b.get(outcome, 0)} |")
+
     return lines
 
 
@@ -209,10 +223,13 @@ def render_table2(report: ReplayReport) -> str:
     lines = [
         "## Table 2 — Section 2, per SESSION",
         "",
-        "A session is one contiguous run under a single pinned Section 1 "
-        "(state, watch, grade). Every session ends in exactly one terminal "
-        "outcome; each symbol's outcome counts sum to that symbol's session "
-        "count (see the **sum** row). `ALL` is every symbol combined.",
+        "A session's own definition depends on `rule_version` - see "
+        "`docs/rulebook/section-02-1h-behaviour-v0.1.md`/`-v0.2.md`. Every "
+        "session ends in exactly one terminal outcome; each symbol's "
+        "outcome counts sum to that symbol's session count (see the "
+        "**sum** row). Grade is recorded per session (`grade_at_start`) "
+        "rather than gating it from v0.2 on. `ALL` is every symbol "
+        "combined.",
         "",
     ]
     for row in report.table2:

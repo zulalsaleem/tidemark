@@ -24,7 +24,7 @@ import bisect
 import datetime as dt
 import hashlib
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -251,6 +251,7 @@ def replay_section2(
     candles_by_timeframe: dict[str, list[Candle]],
     symbol: str,
     section_1_history: list[ContextRecord],
+    rule_version: str,
 ) -> list[mtf.ObservationResult]:
     """Replay Section 2 once over the full available 1H history. `mtf.
     evaluate` is itself a from-the-start, no-look-ahead replay (see its own
@@ -261,12 +262,23 @@ def replay_section2(
     if len(candles_1h) == 0:
         return []
     frame_1h = _candles_to_frame(candles_1h)
-    return mtf.evaluate(symbol, section_1_history, frame_1h)
+    return mtf.evaluate(symbol, section_1_history, frame_1h, rule_version=rule_version)
 
 
-def group_sessions(rows: list[mtf.ObservationResult]) -> list[list[mtf.ObservationResult]]:
+def group_sessions(
+    rows: list[mtf.ObservationResult], rule_version: str
+) -> list[list[mtf.ObservationResult]]:
     """Group Section 2 output rows (already in evaluated_at order) into
-    sessions: a new session starts on the first row, whenever there's a
+    sessions, per `rule_version`'s own session-termination rule (`mtf.
+    _session_ended`) - see `_group_sessions_v1`/`_group_sessions_v2`.
+    """
+    if rule_version == mtf.RULE_VERSION_V1:
+        return _group_sessions_v1(rows)
+    return _group_sessions_v2(rows)
+
+
+def _group_sessions_v1(rows: list[mtf.ObservationResult]) -> list[list[mtf.ObservationResult]]:
+    """v0.1: a new session starts on the first row, whenever there's a
     time gap since the previous row (Section 1 left WATCH and later
     re-entered it - no rows are emitted while it's away), or right after a
     row whose own state is HTF_CONTEXT_INVALIDATED - that row is the
@@ -289,6 +301,47 @@ def group_sessions(rows: list[mtf.ObservationResult]) -> list[list[mtf.Observati
         is_new = (
             prev is None
             or prev.state == mtf.HTF_CONTEXT_INVALIDATED
+            or row.evaluated_at - prev.evaluated_at != dt.timedelta(hours=1)
+        )
+        if is_new and current:
+            sessions.append(current)
+            current = []
+        current.append(row)
+        prev = row
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def _group_sessions_v2(rows: list[mtf.ObservationResult]) -> list[list[mtf.ObservationResult]]:
+    """v0.2: grade no longer bounds a session (section-02-v0.2-
+    justification.md, Part 2), so the (state, watch, grade) pin can no
+    longer be used to recover session boundaries from the flat row list -
+    `_group_sessions_v1`'s own fix (comparing pin fields put the closing
+    invalidation row on the wrong side of its own boundary) would need a
+    v2-shaped equivalent regardless.
+
+    `row.session_started_at` - stamped by `mtf.evaluate` from each
+    session's own first row - is that equivalent, and a more direct one:
+    every row of one session shares the same value, including its own
+    closing HTF_CONTEXT_INVALIDATED row (`_invalidated_row` stamps it from
+    the *ending* session, not the new one), so that row correctly stays
+    attached to the session it closes rather than starting a new group -
+    the same correctness property `_group_sessions_v1` gets from checking
+    `prev.state == HTF_CONTEXT_INVALIDATED`, encoded as data instead of
+    inferred from a state check. A new session (even one that happens to
+    reuse the same watch direction and level) always gets a later,
+    distinct `session_started_at`. The time-gap check is kept as the same
+    belt-and-braces fallback v0.1 uses for a WATCH that dropped away and
+    later returned.
+    """
+    sessions: list[list[mtf.ObservationResult]] = []
+    current: list[mtf.ObservationResult] = []
+    prev: mtf.ObservationResult | None = None
+    for row in rows:
+        is_new = (
+            prev is None
+            or row.session_started_at != prev.session_started_at
             or row.evaluated_at - prev.evaluated_at != dt.timedelta(hours=1)
         )
         if is_new and current:
@@ -399,6 +452,11 @@ class Table2Row:
     invalidation_reason_counts: dict[str, int]
     no_reaction_interaction_counts: dict[str, int]
     structure_changes: list[StructureChangeDetail]
+    # Grade is data, not a session-ending switch, from v0.2 on (section-02-
+    # v0.2-justification.md, Part 3) - these answer "do A-grade sessions
+    # resolve differently from B-grade sessions?" from real data.
+    grade_at_start_counts: dict[str, int] = field(default_factory=dict)
+    outcome_by_grade_at_start: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -479,6 +537,8 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
         NO_REACTION_INTERACTION_BUCKETS, 0
     )
     structure_changes: list[StructureChangeDetail] = []
+    grade_at_start_counts: dict[str, int] = {}
+    outcome_by_grade_at_start: dict[str, dict[str, int]] = {}
     with_interaction = 0
     lengths = []
     for session in sessions:
@@ -523,6 +583,14 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
                 )
                 break
 
+        grade = session[0].grade_at_start
+        if grade is not None:
+            grade_at_start_counts[grade] = grade_at_start_counts.get(grade, 0) + 1
+            by_grade = outcome_by_grade_at_start.setdefault(
+                grade, dict.fromkeys(SESSION_OUTCOMES, 0)
+            )
+            by_grade[outcome] += 1
+
     return Table2Row(
         symbol=symbol,
         session_count=len(sessions),
@@ -534,6 +602,8 @@ def _build_table2_row(symbol: str, sessions: list[list[mtf.ObservationResult]]) 
         invalidation_reason_counts=invalidation_reason_counts,
         no_reaction_interaction_counts=no_reaction_interaction_counts,
         structure_changes=structure_changes,
+        grade_at_start_counts=grade_at_start_counts,
+        outcome_by_grade_at_start=outcome_by_grade_at_start,
     )
 
 
@@ -579,9 +649,9 @@ def build_replay_report(
     for symbol in symbols:
         records = replay_section1(candles[symbol], symbol)
         records_by_symbol[symbol] = records
-        obs = replay_section2(candles[symbol], symbol, records)
+        obs = replay_section2(candles[symbol], symbol, records, rule_version)
         obs_by_symbol[symbol] = obs
-        sessions_by_symbol[symbol] = group_sessions(obs)
+        sessions_by_symbol[symbol] = group_sessions(obs, rule_version)
 
     return ReplayReport(
         rule_version=rule_version,

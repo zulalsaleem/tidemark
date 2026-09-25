@@ -31,7 +31,7 @@ tunes them, or infers behavior they don't specify.
 | Section | File | Status |
 | --- | --- | --- |
 | 1 — HTF Context (4H) | [section-01-htf-context-v1.1.md](section-01-htf-context-v1.1.md) (current); [v1.0](section-01-htf-context-v1.0.md) (superseded, kept for history) | LOCKED |
-| 2 — 1H Behaviour | [section-02-1h-behaviour-v0.1.md](section-02-1h-behaviour-v0.1.md) | PROVISIONAL — OBSERVATION ONLY |
+| 2 — 1H Behaviour | [section-02-1h-behaviour-v0.2.md](section-02-1h-behaviour-v0.2.md) (current); [v0.1](section-02-1h-behaviour-v0.1.md) (superseded, kept for history) | PROVISIONAL — OBSERVATION ONLY |
 
 See [open-questions.md](open-questions.md) for behavior the current
 rulebook doesn't define, surfaced by running the engine — none of it is

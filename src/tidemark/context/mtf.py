@@ -1,10 +1,15 @@
 """Section 2 — 1H behaviour (PROVISIONAL — OBSERVATION ONLY).
 
-Implements `docs/rulebook/section-02-1h-behaviour-v0.1.md`. This module
-is a MEASUREMENT layer, not a signal layer: it observes what 1H price
-does at a 4H WATCH area and returns rows to journal. It never computes
-an entry, stop, target, or R:R, never recommends a handoff, and is never
-called anywhere near `notify/telegram.py`.
+Implements both `docs/rulebook/section-02-1h-behaviour-v0.1.md` and
+`section-02-1h-behaviour-v0.2.md`, selected per call via `evaluate()`'s
+`rule_version` argument (`RULE_VERSION_V1`/`RULE_VERSION_V2`). The two
+versions differ in exactly one respect - what ends a session, in
+`_session_ended` - and are otherwise identical: reaction tiers, structure
+confirmation, zone failure, and the 12-candle expiry are shared code.
+This module is a MEASUREMENT layer, not a signal layer: it observes what
+1H price does at a 4H WATCH area and returns rows to journal. It never
+computes an entry, stop, target, or R:R, never recommends a handoff, and
+is never called anywhere near `notify/telegram.py`.
 
 `evaluate()` is a full, deterministic replay over the given 1H candles
 and Section 1 journal history — not incrementally persisted state — so
@@ -16,7 +21,7 @@ relies on).
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -26,7 +31,9 @@ from tidemark.core.atr import atr as compute_atr
 from tidemark.core.swings import HIGH, LOW, confirmed_swings_as_of, find_swings
 from tidemark.data.models import JournalEntry, Swing
 
-RULE_VERSION = "section-02-v0.1"
+RULE_VERSION_V1 = "section-02-v0.1"
+RULE_VERSION_V2 = "section-02-v0.2"
+SUPPORTED_RULE_VERSIONS = (RULE_VERSION_V1, RULE_VERSION_V2)
 
 # Reaction tiers (Stage A).
 R1 = "R1"
@@ -75,6 +82,9 @@ class ObservationResult:
     section_1_watch: str
     section_1_grade: str | None
     section_1_level_price: float | None
+    session_started_at: dt.datetime
+    grade_at_start: str | None
+    grade_history: list[dict]
     interaction_detected: bool
     reaction_tier: str | None
     reaction_condition_matched: str | None
@@ -100,6 +110,10 @@ class _Session:
     watch: str
     pin: tuple[str, str, str | None]
     level: dict
+    started_at: dt.datetime
+    grade_at_start: str | None
+    current_grade: str | None
+    grade_history: list[dict] = field(default_factory=list)
     terminal: str | None = None
     interaction_occurred: bool = False
     reaction_tier: str | None = None
@@ -114,6 +128,7 @@ def evaluate(
     asset: str,
     section_1_history: list[JournalEntry],
     candles_1h: pd.DataFrame,
+    rule_version: str = RULE_VERSION_V1,
 ) -> list[ObservationResult]:
     """Replay Section 2 over closed 1H candles, gated by Section 1 WATCH.
 
@@ -122,6 +137,17 @@ def evaluate(
     candles, ordered oldest to newest, already truncated to whatever "as
     of" point is being evaluated.
 
+    `rule_version` selects which session-termination rule governs this
+    replay - `RULE_VERSION_V1` (docs/rulebook/section-02-1h-behaviour-
+    v0.1.md: a session ends the moment the pinned (state, watch, grade)
+    tuple stops matching) or `RULE_VERSION_V2` (section-02-1h-behaviour-
+    v0.2.md: a session ends only on a WATCH direction change, a WATCH
+    disappearing, or the held level's price leaving the *original*
+    level's zone - a grade change alone no longer ends it). Everything
+    else - reaction tiers, structure confirmation, expiry - is identical
+    between the two; only `_session_ended` and the grade bookkeeping
+    below differ.
+
     Returns one row per 1H candle where a Section 2 observation applies -
     i.e. only while the as-of Section 1 record for that candle is
     LONG_WATCH or SHORT_WATCH (PART F: "one row per 1H close per asset
@@ -129,6 +155,9 @@ def evaluate(
     or whose as-of record is WAIT, produces no row at all - that is what
     NO_HTF_CONTEXT means; it is never itself a journaled state.
     """
+    if rule_version not in SUPPORTED_RULE_VERSIONS:
+        raise ValueError(f"unsupported Section 2 rule_version: {rule_version!r}")
+
     if len(candles_1h) == 0:
         return []
 
@@ -149,7 +178,6 @@ def evaluate(
         if h_idx < 0:
             continue
         as_of = history[h_idx]
-        tuple_now = (as_of.state, as_of.watch, as_of.grade)
 
         if session is None:
             if as_of.watch not in _WATCH_ROLE:
@@ -161,17 +189,63 @@ def evaluate(
                 # happen, but Section 2 never manufactures a level to
                 # watch, so it simply waits rather than guessing one.
                 continue
-            session = _Session(watch=as_of.watch, pin=tuple_now, level=level)
-        elif tuple_now != session.pin:
-            results.append(_invalidated_row(asset, t, as_of, session))
-            session = None
-            continue
+            session = _Session(
+                watch=as_of.watch,
+                pin=(as_of.state, as_of.watch, as_of.grade),
+                level=level,
+                started_at=t,
+                grade_at_start=as_of.grade,
+                current_grade=as_of.grade,
+            )
+        else:
+            if as_of.grade != session.current_grade:
+                session.grade_history = [
+                    *session.grade_history,
+                    {"evaluated_at": t.isoformat(), "grade": as_of.grade},
+                ]
+                session.current_grade = as_of.grade
+            if _session_ended(rule_version, session, as_of):
+                results.append(_invalidated_row(asset, t, as_of, session, rule_version))
+                session = None
+                continue
 
         prior = candles_1h.iloc[i - 1] if i > 0 else None
         atr_value = atr_series.iloc[i]
-        results.append(_evaluate_candle(asset, t, as_of, session, candle, prior, swings, atr_value))
+        results.append(
+            _evaluate_candle(
+                asset, t, as_of, session, candle, prior, swings, atr_value, rule_version
+            )
+        )
 
     return results
+
+
+def _session_ended(rule_version: str, session: _Session, as_of: JournalEntry) -> bool:
+    """Whether `as_of` ends the current session under `rule_version`.
+
+    v0.1: the pinned (state, watch, grade) tuple must still match exactly
+    (rulebook v0.1, HTF_CONTEXT_INVALIDATED).
+
+    v0.2: grade is no longer part of this test (section-02-v0.2-
+    justification.md, Part 2). A session ends only when the WATCH
+    direction changes or disappears (`as_of.watch != session.watch`
+    covers both - `session.watch` is never WAIT), or when the currently
+    held major level of that role no longer falls inside the *original*
+    pinned level's zone. `session.level` itself is never reassigned - it
+    stays pinned to whatever was held at session start for the life of
+    the session, exactly as v0.1 already did; only this containment
+    check reads the newest as-of active_levels.
+    """
+    if rule_version == RULE_VERSION_V1:
+        return (as_of.state, as_of.watch, as_of.grade) != session.pin
+
+    if as_of.watch != session.watch:
+        return True
+    current_level = _pick_level(as_of.active_levels, _WATCH_ROLE[session.watch])
+    if current_level is None:
+        return True
+    zone_low, zone_high = session.level["zone_low"], session.level["zone_high"]
+    return not (zone_low <= current_level["price"] <= zone_high)
 
 
 def _pick_level(active_levels: list[dict], role: str) -> dict | None:
@@ -185,15 +259,20 @@ def _pick_level(active_levels: list[dict], role: str) -> dict | None:
     return max(candidates, key=lambda lvl: lvl["touches"])
 
 
-def _base_fields(asset: str, t: dt.datetime, as_of: JournalEntry, session: _Session) -> dict:
+def _base_fields(
+    asset: str, t: dt.datetime, as_of: JournalEntry, session: _Session, rule_version: str
+) -> dict:
     return {
         "asset": asset,
         "evaluated_at": t,
-        "rule_version": RULE_VERSION,
+        "rule_version": rule_version,
         "section_1_state": as_of.state,
         "section_1_watch": as_of.watch,
         "section_1_grade": as_of.grade,
         "section_1_level_price": session.level["price"],
+        "session_started_at": session.started_at,
+        "grade_at_start": session.grade_at_start,
+        "grade_history": list(session.grade_history),
     }
 
 
@@ -216,9 +295,23 @@ def _empty_row(base: dict, *, state: str) -> ObservationResult:
 
 
 def _invalidated_row(
-    asset: str, t: dt.datetime, as_of: JournalEntry, session: _Session
+    asset: str, t: dt.datetime, as_of: JournalEntry, session: _Session, rule_version: str
 ) -> ObservationResult:
-    return _empty_row(_base_fields(asset, t, as_of, session), state=HTF_CONTEXT_INVALIDATED)
+    """The row that closes out `session`. Stamped with `session.started_at`
+    (via `_base_fields`, unchanged) - this row belongs to the session it
+    ends, not to a new one: `report.group_sessions`'s v0.2 path groups rows
+    by `session_started_at` equality specifically so this closing row
+    stays attached to its session, mirroring what v0.1's fixed grouping
+    achieves by checking `prev.state == HTF_CONTEXT_INVALIDATED` (see
+    `report._group_sessions_v1`/`_group_sessions_v2` and ADR 0008's Table 2
+    correction). `_classify_session` then scans every row in the group for
+    `structure_change`/`failure` rather than trusting the last row alone,
+    so this row correctly closing out a resolved session doesn't hide that
+    resolution.
+    """
+    return _empty_row(
+        _base_fields(asset, t, as_of, session, rule_version), state=HTF_CONTEXT_INVALIDATED
+    )
 
 
 def _overlaps_zone(candle: pd.Series, level: dict) -> bool:
@@ -306,8 +399,9 @@ def _evaluate_candle(
     prior: pd.Series | None,
     swings: list[Swing],
     atr_value: float | None,
+    rule_version: str,
 ) -> ObservationResult:
-    base = _base_fields(asset, t, as_of, session)
+    base = _base_fields(asset, t, as_of, session, rule_version)
 
     if session.terminal is not None:
         return _empty_row(base, state=session.terminal)

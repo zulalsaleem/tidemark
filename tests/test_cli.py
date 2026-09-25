@@ -845,11 +845,42 @@ def test_replay_rejects_an_unimplemented_rule_version(
 ) -> None:
     _use_temp_db(tmp_path, monkeypatch)
 
-    result = runner.invoke(app, ["replay", "--rule-version", "section-02-v0.2"])
+    result = runner.invoke(app, ["replay", "--rule-version", "section-02-v0.3"])
 
     assert result.exit_code == 1
-    assert "section-02-v0.2" in result.stdout
+    assert "section-02-v0.3" in result.stdout
     assert "section-02-v0.1" in result.stdout
+    assert "section-02-v0.2" in result.stdout
+
+
+def test_replay_accepts_v0_2_rule_version(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=30)
+    _seed_1h_candles(url, SYMBOL, n=50)
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    before = (
+        store.count_journal_entries(),
+        len(store.context_history(SYMBOL)),
+        len(store.observation_history(SYMBOL)),
+    )
+
+    result = runner.invoke(
+        app, ["replay", "--rule-version", "section-02-v0.2", "--symbols", SYMBOL]
+    )
+
+    after = (
+        store.count_journal_entries(),
+        len(store.context_history(SYMBOL)),
+        len(store.observation_history(SYMBOL)),
+    )
+
+    assert result.exit_code == 0
+    assert before == after == (0, 0, 0)
+    assert "## Table 2" in result.stdout
+    assert "Grade at start" in result.stdout
+    assert "**sum**" in result.stdout
 
 
 def test_replay_writes_nothing_and_prints_all_three_tables(

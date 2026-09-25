@@ -277,6 +277,18 @@ class Observation(Base):
     section_1_grade: Mapped[str | None] = mapped_column(String, nullable=True)
     section_1_level_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Session bookkeeping (section-02-v0.2): `session_started_at` identifies
+    # which contiguous Section 2 session this row belongs to (the
+    # evaluated_at of that session's first row) - needed because v0.2's
+    # session boundary is no longer fully recoverable from
+    # (section_1_state, section_1_watch, section_1_grade) alone, since grade
+    # no longer ends a session. `grade_at_start`/`grade_history` make grade a
+    # queryable observation rather than a session-ending switch - see
+    # docs/rulebook/section-02-v0.2-justification.md, Part 3.
+    session_started_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    grade_at_start: Mapped[str | None] = mapped_column(String, nullable=True)
+    grade_history: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
     interaction_detected: Mapped[bool] = mapped_column(nullable=False, default=False)
     reaction_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     reaction_condition_matched: Mapped[str | None] = mapped_column(String, nullable=True)

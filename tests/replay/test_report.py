@@ -30,11 +30,14 @@ def _obs(evaluated_at: dt.datetime, state: str, **overrides) -> mtf.ObservationR
     defaults = dict(
         asset=SYMBOL,
         evaluated_at=evaluated_at,
-        rule_version=mtf.RULE_VERSION,
+        rule_version=mtf.RULE_VERSION_V1,
         section_1_state=htf.BULLISH,
         section_1_watch=htf.LONG_WATCH,
         section_1_grade="B",
         section_1_level_price=100.0,
+        session_started_at=evaluated_at,
+        grade_at_start="B",
+        grade_history=[],
         interaction_detected=False,
         reaction_tier=None,
         reaction_condition_matched=None,
@@ -221,7 +224,7 @@ def test_group_sessions_closes_on_invalidation_as_one_session_not_two() -> None:
         ),
     ]
 
-    sessions = replay_report.group_sessions(rows)
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V1)
 
     assert len(sessions) == 2
     assert [r.state for r in sessions[0]] == [mtf.NO_INTERACTION, mtf.HTF_CONTEXT_INVALIDATED]
@@ -258,7 +261,7 @@ def test_group_sessions_bearish_structure_change_classifies_as_bearish() -> None
         ),
     ]
 
-    sessions = replay_report.group_sessions(rows)
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V1)
 
     assert len(sessions) == 1
     assert replay_report._classify_session(sessions[0]) == replay_report.STRUCTURE_CHANGE_SHORT
@@ -276,10 +279,129 @@ def test_group_sessions_still_open_when_data_ends_without_invalidation() -> None
         ),
     ]
 
-    sessions = replay_report.group_sessions(rows)
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V1)
 
     assert len(sessions) == 1
     assert replay_report._classify_session(sessions[0]) == replay_report.STILL_OPEN_AT_END_OF_DATA
+
+
+def test_group_sessions_v2_also_closes_on_invalidation_as_one_session_not_two() -> None:
+    # Same shape as the v0.1 Bug 1 regression test above, run through the
+    # v0.2 (session_started_at-based) grouping path instead, since mtf.py's
+    # _invalidated_row stamps session_started_at from the *ending* session
+    # for both rule versions - the same correctness property, encoded
+    # differently per version (see report._group_sessions_v2's docstring).
+    started = _hours(0)
+    rows = [
+        _obs(_hours(0), mtf.NO_INTERACTION, session_started_at=started),
+        _obs(_hours(1), mtf.HTF_CONTEXT_INVALIDATED, session_started_at=started),
+        _obs(_hours(2), mtf.NO_INTERACTION, session_started_at=_hours(2)),
+    ]
+
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V2)
+
+    assert len(sessions) == 2
+    assert [r.state for r in sessions[0]] == [mtf.NO_INTERACTION, mtf.HTF_CONTEXT_INVALIDATED]
+    assert replay_report._classify_session(sessions[0]) == mtf.HTF_CONTEXT_INVALIDATED
+    assert len(sessions[1]) == 1
+
+
+# -- Table 2: grade_at_start is data, broken down per section-02-v0.2-------
+
+
+def test_table2_grade_at_start_breakdown() -> None:
+    sessions = [
+        [_obs(_hours(0), mtf.HTF_CONTEXT_INVALIDATED, grade_at_start="A")],
+        [_obs(_hours(1), mtf.HTF_CONTEXT_INVALIDATED, grade_at_start="B")],
+        [
+            _obs(
+                _hours(2),
+                mtf.BULLISH_STRUCTURE_CHANGE,
+                structure_change=mtf.BULLISH_STRUCTURE_CHANGE,
+                grade_at_start="B",
+            )
+        ],
+    ]
+
+    row = replay_report._build_table2_row(SYMBOL, sessions)
+
+    assert row.grade_at_start_counts == {"A": 1, "B": 2}
+    assert row.outcome_by_grade_at_start["A"][mtf.HTF_CONTEXT_INVALIDATED] == 1
+    assert row.outcome_by_grade_at_start["A"][replay_report.STRUCTURE_CHANGE_LONG] == 0
+    assert row.outcome_by_grade_at_start["B"][mtf.HTF_CONTEXT_INVALIDATED] == 1
+    assert row.outcome_by_grade_at_start["B"][replay_report.STRUCTURE_CHANGE_LONG] == 1
+
+
+# -- group_sessions: v0.1 splits on grade, v0.2 does not ---------------------
+
+
+def test_group_sessions_v1_splits_on_grade_change() -> None:
+    # A grade-only change ends a v0.1 session (mtf.py's own
+    # `_session_ended`), which always surfaces as an explicit
+    # HTF_CONTEXT_INVALIDATED row - `_group_sessions_v1` splits on that
+    # row, never on comparing (state, watch, grade) fields directly (that
+    # comparison was Bug 1: the invalidation row's own fields already
+    # reflect the *new* grade, so two rows differing only in grade with no
+    # invalidation row between them - the shape this test used before the
+    # fix - is not a shape `mtf.evaluate` ever actually produces).
+    rows = [
+        _obs(_hours(0), mtf.NO_INTERACTION, grade_at_start="B", section_1_grade="B"),
+        _obs(
+            _hours(1),
+            mtf.HTF_CONTEXT_INVALIDATED,
+            grade_at_start="B",
+            section_1_grade="A",
+        ),
+        _obs(_hours(2), mtf.NO_INTERACTION, grade_at_start="A", section_1_grade="A"),
+    ]
+
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V1)
+
+    assert len(sessions) == 2
+    assert [r.state for r in sessions[0]] == [mtf.NO_INTERACTION, mtf.HTF_CONTEXT_INVALIDATED]
+    assert [r.state for r in sessions[1]] == [mtf.NO_INTERACTION]
+
+
+def test_group_sessions_v2_does_not_split_on_grade_change() -> None:
+    started = _hours(0)
+    rows = [
+        _obs(
+            _hours(0),
+            mtf.NO_INTERACTION,
+            grade_at_start="B",
+            section_1_grade="B",
+            session_started_at=started,
+        ),
+        _obs(
+            _hours(1),
+            mtf.NO_INTERACTION,
+            grade_at_start="B",
+            section_1_grade="A",
+            session_started_at=started,
+        ),
+    ]
+
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V2)
+
+    assert len(sessions) == 1
+    assert len(sessions[0]) == 2
+
+
+def test_group_sessions_v2_splits_on_a_new_session_started_at() -> None:
+    # Rows stay exactly 1H apart throughout, so the time-gap fallback never
+    # fires on its own - only `session_started_at` changing at hour 2
+    # causes the split, isolating that specific trigger.
+    rows = [
+        _obs(_hours(0), mtf.NO_INTERACTION, session_started_at=_hours(0)),
+        _obs(_hours(1), mtf.HTF_CONTEXT_INVALIDATED, session_started_at=_hours(0)),
+        _obs(_hours(2), mtf.NO_INTERACTION, session_started_at=_hours(2)),
+    ]
+
+    sessions = replay_report.group_sessions(rows, mtf.RULE_VERSION_V2)
+
+    assert len(sessions) == 2
+    assert len(sessions[0]) == 2
+    assert len(sessions[1]) == 1
 
 
 # -- a small real store fixture for the full-report tests below --------------
@@ -360,10 +482,10 @@ def test_replay_report_is_deterministic_across_two_runs(tmp_path) -> None:
     generated_at = dt.datetime(2026, 6, 1, tzinfo=dt.UTC)
 
     first = replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", generated_at
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", generated_at
     )
     second = replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", generated_at
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", generated_at
     )
 
     assert first == second
@@ -380,7 +502,7 @@ def test_build_replay_report_never_writes_to_the_store(tmp_path, monkeypatch) ->
     monkeypatch.setattr(TidemarkStore, "save_observation", _boom)
 
     replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", dt.datetime.now(dt.UTC)
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", dt.datetime.now(dt.UTC)
     )
 
 
@@ -393,7 +515,7 @@ def test_replay_writes_nothing_row_counts_unchanged(tmp_path) -> None:
     )
 
     replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", dt.datetime.now(dt.UTC)
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", dt.datetime.now(dt.UTC)
     )
 
     after = (
@@ -470,7 +592,7 @@ def test_report_data_model_never_combines_table_totals() -> None:
 def test_table1_table2_table3_are_independent_units(tmp_path) -> None:
     store = _seed_store(tmp_path)
     report = replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", dt.datetime.now(dt.UTC)
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", dt.datetime.now(dt.UTC)
     )
 
     table1_evaluations = report.table1[-1].total_evaluations  # Section 1, 4H unit
@@ -492,7 +614,7 @@ def test_full_replay_table2_outcomes_sum_to_session_count(tmp_path) -> None:
     """
     store = _seed_store(tmp_path)
     report = replay_report.build_replay_report(
-        store, VENUE, [SYMBOL], mtf.RULE_VERSION, "test command", dt.datetime.now(dt.UTC)
+        store, VENUE, [SYMBOL], mtf.RULE_VERSION_V1, "test command", dt.datetime.now(dt.UTC)
     )
 
     for row in report.table2:

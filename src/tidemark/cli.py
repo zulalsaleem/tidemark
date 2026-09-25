@@ -142,8 +142,8 @@ def replay(
         ...,
         "--rule-version",
         help=(
-            "The Section 2 rule version to replay against. Only "
-            f"{mtf.RULE_VERSION!r} is implemented."
+            "The Section 2 rule version to replay against: "
+            f"{', '.join(repr(v) for v in mtf.SUPPORTED_RULE_VERSIONS)}."
         ),
     ),
     symbols: list[str] = typer.Option(  # noqa: B008
@@ -163,11 +163,9 @@ def replay(
     only. See docs/adr/0008-replay-as-a-repo-command.md and
     docs/replay/section-02-v0.1-baseline.md.
     """
-    if rule_version != mtf.RULE_VERSION:
-        typer.echo(
-            f"Unknown --rule-version {rule_version!r}. Only {mtf.RULE_VERSION!r} is "
-            "implemented - there is no v0.2 to replay against yet."
-        )
+    if rule_version not in mtf.SUPPORTED_RULE_VERSIONS:
+        supported = ", ".join(repr(v) for v in mtf.SUPPORTED_RULE_VERSIONS)
+        typer.echo(f"Unknown --rule-version {rule_version!r}. Supported versions: {supported}.")
         raise typer.Exit(code=1)
 
     settings = get_settings()

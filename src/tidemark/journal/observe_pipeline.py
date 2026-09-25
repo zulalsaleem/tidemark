@@ -95,7 +95,12 @@ def _observe_symbol(store: TidemarkStore, venue: str, symbol: str) -> SymbolObse
             return SymbolObserveOutcome(symbol, 0, 0, "no 1H candles")
 
         section_1_history = store.journal_history(symbol)
-        results = mtf.evaluate(symbol, section_1_history, candles_1h)
+        # Live observation stays on v0.1 until the rulebook author approves
+        # v0.2 for production use - see docs/rulebook/section-02-v0.2-
+        # justification.md. `tidemark replay` is where v0.2 is exercised.
+        results = mtf.evaluate(
+            symbol, section_1_history, candles_1h, rule_version=mtf.RULE_VERSION_V1
+        )
 
         inserted = 0
         for result in results:
@@ -107,6 +112,9 @@ def _observe_symbol(store: TidemarkStore, venue: str, symbol: str) -> SymbolObse
                 section_1_watch=result.section_1_watch,
                 section_1_grade=result.section_1_grade,
                 section_1_level_price=result.section_1_level_price,
+                session_started_at=result.session_started_at,
+                grade_at_start=result.grade_at_start,
+                grade_history=result.grade_history,
                 interaction_detected=result.interaction_detected,
                 reaction_tier=result.reaction_tier,
                 reaction_condition_matched=result.reaction_condition_matched,
