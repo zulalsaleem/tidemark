@@ -9,6 +9,10 @@ docs/adr/0002-canonical-market-data-venue.md.
 Venue is configuration, not code: any ccxt exchange id that exposes
 `fetch_ohlcv` for unified perpetual symbols (e.g. "binanceusdm", "bitget",
 "mexc") works without changes here.
+
+`list_perpetual_symbols` (Phase 6, Merge 2A) is a second, separate
+read-only call — ccxt's unified `load_markets`, for venue symbol
+discovery — added alongside candle fetching without changing it.
 """
 
 from __future__ import annotations
@@ -41,6 +45,18 @@ class RawCandle:
     low: float
     close: float
     volume: float
+
+
+@dataclass(frozen=True)
+class MarketListing:
+    """One symbol's entry in the venue's current market catalog, as
+    filtered by `ExchangeClient.list_perpetual_symbols` (Phase 6, Merge
+    2A, PART A: venue discovery).
+    """
+
+    symbol: str
+    quote_currency: str
+    contract_type: str
 
 
 def build_exchange(venue: str) -> Any:
@@ -136,6 +152,40 @@ class ExchangeClient:
             since_ms = next_since_ms
 
         return candles
+
+    def list_perpetual_symbols(self, quote_currency: str = "USDT") -> list[MarketListing]:
+        """List active perpetual ("swap") contracts quoted in `quote_currency`.
+
+        A separate, additive call from `fetch_closed_candles` (Phase 6,
+        Merge 2A, PART A) — uses ccxt's unified `load_markets`, never a
+        venue-specific raw endpoint, so this stays exactly as
+        venue-agnostic as candle fetching already is (ADR 0002). Never
+        touches the candle-fetch path above.
+
+        Filters to ccxt's unified `type == "swap"` (a perpetual contract,
+        as opposed to a dated `"future"`), `quote == quote_currency`, and
+        `active` per the venue's own flag — an inactive/delisted listing
+        is simply excluded here, not returned with a flag. The caller
+        (`data/discover.py`) is what turns "no longer in this list" into
+        an `ABSENT_FROM_VENUE` registry status.
+        """
+        markets = self._exchange.load_markets()
+        listings: list[MarketListing] = []
+        for market in markets.values():
+            if market.get("type") != "swap":
+                continue
+            if market.get("quote") != quote_currency:
+                continue
+            if not market.get("active"):
+                continue
+            listings.append(
+                MarketListing(
+                    symbol=market["symbol"],
+                    quote_currency=market["quote"],
+                    contract_type="perpetual",
+                )
+            )
+        return listings
 
     def _fetch_with_retry(self, symbol: str, timeframe: str, since_ms: int) -> list:
         attempt = 0
