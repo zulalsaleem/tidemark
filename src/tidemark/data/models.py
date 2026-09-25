@@ -258,9 +258,18 @@ class MarketRegistry(Base):
     ACTIVE, STALE, or ABSENT_FROM_VENUE.
 
     `section1_first_usable_at` and `section1_eligibility_checked_at` are
-    nullable here and filled in by Merge 2 (UNIV-01: eligibility is "has
+    nullable here and filled in by Merge 2B (UNIV-01: eligibility is "has
     Section 1 demonstrably exited INSUFFICIENT_STRUCTURE at least once,"
-    never a calendar-history requirement) - Merge 1 only adds the columns.
+    never a calendar-history requirement) - Merge 1 only added the columns.
+
+    `first_candle_seen_at`/`last_candle_seen_at` are nullable, amended
+    from Merge 1's original NOT NULL definition: Merge 2A splits venue
+    discovery (PART A, which creates a registry row from the listing
+    alone) from candle backfill (PART B, which is what actually populates
+    these two fields) into two separate steps, so a freshly-discovered
+    symbol legitimately has no candle coverage yet. This changes no data
+    - nothing had ever written to this table before Merge 2A, so there is
+    nothing to migrate; see docs/adr/0009-universe-selection-architecture.md.
     """
 
     __tablename__ = "market_registry"
@@ -271,8 +280,8 @@ class MarketRegistry(Base):
     symbol: Mapped[str] = mapped_column(String, nullable=False, index=True)
     contract_type: Mapped[str] = mapped_column(String, nullable=False)
     quote_currency: Mapped[str] = mapped_column(String, nullable=False)
-    first_candle_seen_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
-    last_candle_seen_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    first_candle_seen_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    last_candle_seen_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
     first_seen_in_venue_list_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     last_seen_in_venue_list_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)

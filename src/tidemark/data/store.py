@@ -693,6 +693,107 @@ class TidemarkStore:
             )
             return session.scalars(stmt).first()
 
+    def record_market_listing(
+        self,
+        venue: str,
+        symbol: str,
+        contract_type: str,
+        quote_currency: str,
+        seen_at: dt.datetime,
+    ) -> MarketRegistry:
+        """Upsert one symbol's presence in the venue's current listing
+        (Phase 6, Merge 2A, PART A: discovery).
+
+        Touches only listing-related fields: `first_seen_in_venue_list_at`
+        is set once, on first discovery, and never moved afterward;
+        `last_seen_in_venue_list_at` is bumped to `seen_at` every call;
+        `contract_type`/`quote_currency` are refreshed in case the venue's
+        own classification changes; `status` is set to ACTIVE (a symbol
+        being upserted here was, by construction, just seen in the
+        current listing). Candle-coverage fields
+        (`first_candle_seen_at`/`last_candle_seen_at`, owned by
+        `record_candle_coverage`) are left untouched on an existing row,
+        and start `None` on a new one — unlike `upsert_market_registry_row`,
+        which overwrites every field, this never clobbers what the other
+        half of discovery/backfill wrote.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(MarketRegistry).where(
+                    MarketRegistry.venue == venue, MarketRegistry.symbol == symbol
+                )
+            ).one_or_none()
+            if existing is not None:
+                existing.contract_type = contract_type
+                existing.quote_currency = quote_currency
+                existing.last_seen_in_venue_list_at = seen_at
+                existing.status = "ACTIVE"
+                session.commit()
+                session.refresh(existing)
+                return existing
+
+            new_row = MarketRegistry(
+                venue=venue,
+                symbol=symbol,
+                contract_type=contract_type,
+                quote_currency=quote_currency,
+                first_candle_seen_at=None,
+                last_candle_seen_at=None,
+                first_seen_in_venue_list_at=seen_at,
+                last_seen_in_venue_list_at=seen_at,
+                status="ACTIVE",
+                section1_first_usable_at=None,
+                section1_eligibility_checked_at=None,
+            )
+            session.add(new_row)
+            session.commit()
+            session.refresh(new_row)
+            return new_row
+
+    def mark_absent_from_venue(self, venue: str, symbols_seen: set[str]) -> int:
+        """Mark every `venue` registry row not in `symbols_seen` (this
+        discovery run's live listing) as ABSENT_FROM_VENUE, unless it
+        already is. Never deletes a row — the registry is the historical
+        record of what the venue has ever contained (ADR 0009). Returns
+        the count of rows newly marked.
+        """
+        with self._session_factory() as session:
+            stmt = select(MarketRegistry).where(
+                MarketRegistry.venue == venue, MarketRegistry.status != "ABSENT_FROM_VENUE"
+            )
+            rows = list(session.scalars(stmt))
+            changed = 0
+            for row in rows:
+                if row.symbol not in symbols_seen:
+                    row.status = "ABSENT_FROM_VENUE"
+                    changed += 1
+            session.commit()
+            return changed
+
+    def record_candle_coverage(
+        self, venue: str, symbol: str, first_seen: dt.datetime, last_seen: dt.datetime
+    ) -> MarketRegistry | None:
+        """Update only `first_candle_seen_at`/`last_candle_seen_at` on an
+        existing registry row (Phase 6, Merge 2A, PART B: backfill), from
+        what actually landed in `candles`. Returns `None` if no registry
+        row exists yet for `(venue, symbol)` — backfill only ever targets
+        symbols discovery has already registered, so this should not
+        normally happen; this method never creates a row implicitly.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(MarketRegistry).where(
+                    MarketRegistry.venue == venue, MarketRegistry.symbol == symbol
+                )
+            ).one_or_none()
+            if existing is None:
+                return None
+            existing.first_candle_seen_at = first_seen
+            existing.last_candle_seen_at = last_seen
+            session.commit()
+            session.refresh(existing)
+            return existing
+
     # -- universe snapshots (Phase 6, Merge 1) -------------------------------
 
     def save_universe_snapshot(
