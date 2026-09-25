@@ -23,6 +23,16 @@ backfill "as of the past"), and nothing is ever written back to the
 registry cache, since a value computed from data truncated at an earlier
 T must never be treated as the general, full-history truth for a later
 FORWARD run to trust.
+
+UNIV-08 (domain eligibility): before any of the above, every ranked
+symbol's asset class is checked against its *persisted* `market_registry`
+classification (never a live `load_markets()` call — the same
+UNIVERSE_AS_OF_INVARIANT guard, applied to asset class instead of candle
+data). Only `CRYPTO`-classified symbols can ever reach the volume/rank/
+eligibility checks below; `NON_CRYPTO`/`NON_ELIGIBLE_INDEX`/`UNKNOWN`
+symbols are excluded immediately, regardless of rank or metric value.
+This does not change the ranking methodology, N, or K — see
+docs/adr/0009's UNIV-08 addendum.
 """
 
 from __future__ import annotations
@@ -32,6 +42,14 @@ import hashlib
 import uuid
 from dataclasses import dataclass
 
+from tidemark.data.asset_class import (
+    CRYPTO,
+    NON_CRYPTO,
+    NON_CRYPTO_UNDERLYING,
+    NON_ELIGIBLE_INDEX,
+    UNKNOWN,
+    UNKNOWN_UNDERLYING_TYPE,
+)
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import run_backfill
 from tidemark.data.models import Candle, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
@@ -48,7 +66,14 @@ from tidemark.data.universe_metric import (
     median_daily_derived_quote_volume_30d,
 )
 
-METHODOLOGY_VERSION = "universe-v1"
+# Bumped from "universe-v1" for UNIV-08 (asset-class domain constraint):
+# the ranking/eligibility methodology itself is unchanged (same metric,
+# same N=30/K=50, same rank-first order), but which symbols can ever
+# become eligible changed, so snapshots before and after this line must
+# be distinguishable - the pre-UNIV-08 snapshot keeps "universe-v1"
+# forever (append-only, never rewritten) and is engineering data only,
+# same treatment as UNIV-06's BACKFILLED provenance marking.
+METHODOLOGY_VERSION = "universe-v2"
 
 K = 50  # architectural: headroom over N, never swept - see ADR 0009 UNIV-03
 N = 30
@@ -133,6 +158,11 @@ def _backfill_missing_4h(
     (PART B step 3) - "if not already stored" is read literally: a symbol
     that already has any 4H history is left exactly as it is, not
     incrementally updated here.
+
+    `assessment_set` is already scoped to CRYPTO-classified symbols only
+    (UNIV-08 — see `generate_universe_snapshot`), so nothing here needs to
+    re-check asset class: a symbol reaching this function is, by
+    construction, one this snapshot could actually select.
     """
     missing = [
         rs.symbol
@@ -141,6 +171,23 @@ def _backfill_missing_4h(
     ]
     if missing:
         run_backfill(store, exchange, venue, missing, ["4h"], days, now=now)
+
+
+_DOMAIN_EXCLUSION_REASON = {
+    NON_ELIGIBLE_INDEX: NON_ELIGIBLE_INDEX,
+    NON_CRYPTO: NON_CRYPTO_UNDERLYING,
+    UNKNOWN: UNKNOWN_UNDERLYING_TYPE,
+}
+
+
+def _domain_exclusion_reason(asset_class: str) -> str:
+    """The exclusion_reason for a non-CRYPTO persisted `asset_class`
+    (UNIV-08) — a registry-level fact, not re-derived from
+    `underlyingType` here (that derivation happens once, at discovery
+    time, in `data/asset_class.py`; this only maps the already-decided
+    class to its row-level reason).
+    """
+    return _DOMAIN_EXCLUSION_REASON[asset_class]
 
 
 def _candle_hash_row(venue: str, symbol: str, timeframe: str, candle: Candle) -> str:
@@ -195,6 +242,8 @@ def generate_universe_snapshot(
         if row.status == "ACTIVE" and row.first_seen_in_venue_list_at <= snapshot_at
     ]
 
+    registry_by_symbol = {row.symbol: row for row in registry_rows}
+
     # -- PART B step 1: rank every ACTIVE symbol by the metric ----------------
     daily_by_symbol = _load_metrics(store, venue, registry_rows, snapshot_at)
     metrics = {
@@ -204,7 +253,23 @@ def generate_universe_snapshot(
     ranked = rank_symbols(metrics)
 
     # -- PART B step 2: top K as the assessment set ---------------------------
-    assessment_set = ranked[:K]
+    # UNIV-08: the assessment set is the top K by rank *among CRYPTO-
+    # classified symbols*, not top K of the raw mixed ranking - K's own
+    # purpose (ADR 0009: "headroom over N so ineligible symbols can be
+    # skipped without running out of candidates") is defeated if a
+    # symbol that can never be eligible on domain grounds alone still
+    # occupies one of the K slots. This does not touch `rank_symbols`'s
+    # sort order, N, or K itself - `ranked` (and each row's own `rank`)
+    # still reflects every ACTIVE symbol's true overall volume rank,
+    # crypto or not, for a complete audit trail; only which symbols get
+    # backfilled and Section-1-assessed is scoped to crypto candidates.
+    crypto_ranked = [
+        rs
+        for rs in ranked
+        if (registry := registry_by_symbol.get(rs.symbol)) is not None
+        and registry.asset_class == CRYPTO
+    ]
+    assessment_set = crypto_ranked[:K]
     assessment_symbols = {rs.symbol for rs in assessment_set if rs.metric_value is not None}
 
     # -- PART B step 3: backfill 4H for the assessment set (FORWARD only) -----
@@ -216,22 +281,46 @@ def generate_universe_snapshot(
     rows: list[UniverseSnapshotRow] = []
     exclusion_counts: dict[str, int] = {}
 
-    registry_by_symbol = {row.symbol: row for row in registry_rows}
-
     for symbol, candles in daily_by_symbol.items():
         for c in candles:
             hash_rows.append(_candle_hash_row(venue, symbol, "1d", c))
 
     for rank, rs in enumerate(ranked, start=1):
-        cached_first_usable_at = None
-        if is_forward:
-            registry_row = registry_by_symbol.get(rs.symbol)
-            if registry_row is not None:
-                cached_first_usable_at = registry_row.section1_first_usable_at
+        registry_row = registry_by_symbol.get(rs.symbol)
 
-        if rs.metric_value is None:
+        # UNIV-08: classification is read from the PERSISTED registry
+        # value only, never a live load_markets() call - a symbol whose
+        # classification was never captured (no registry row, or a
+        # pre-UNIV-08 row not yet re-discovered) is UNKNOWN, not guessed.
+        # This check runs before every other exclusion reason: domain
+        # membership is a more fundamental gate than data availability, so
+        # a non-crypto symbol is excluded on that ground regardless of
+        # whether it also happens to have insufficient volume history.
+        underlying_type = registry_row.underlying_type if registry_row is not None else None
+        asset_class = registry_row.asset_class if registry_row is not None else None
+        classification_source = (
+            registry_row.classification_source if registry_row is not None else None
+        )
+        classification_as_of = (
+            registry_row.classification_as_of if registry_row is not None else None
+        )
+        classification_methodology_version = (
+            registry_row.classification_methodology_version if registry_row is not None else None
+        )
+        if asset_class is None:
+            asset_class = UNKNOWN
+
+        cached_first_usable_at = None
+        if is_forward and registry_row is not None:
+            cached_first_usable_at = registry_row.section1_first_usable_at
+
+        if asset_class != CRYPTO:
             eligible: bool | None = False
-            reason: str | None = INSUFFICIENT_VOLUME_HISTORY
+            reason: str | None = _domain_exclusion_reason(asset_class)
+            first_usable_at = None
+        elif rs.metric_value is None:
+            eligible = False
+            reason = INSUFFICIENT_VOLUME_HISTORY
             first_usable_at = None
         elif rs.symbol not in assessment_symbols:
             eligible = None
@@ -277,6 +366,11 @@ def generate_universe_snapshot(
                 eligible=eligible,
                 selected=False,
                 exclusion_reason=reason,
+                underlying_type=underlying_type,
+                asset_class=asset_class,
+                classification_source=classification_source,
+                classification_as_of=classification_as_of,
+                classification_methodology_version=classification_methodology_version,
             )
         )
 

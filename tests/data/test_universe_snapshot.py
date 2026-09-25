@@ -9,6 +9,11 @@ import datetime as dt
 
 import pytest
 
+from tidemark.data.asset_class import (
+    CLASSIFICATION_METHODOLOGY_VERSION,
+    CLASSIFICATION_SOURCE,
+    CRYPTO,
+)
 from tidemark.data.exchange import ExchangeClient, RawCandle
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.universe_eligibility import (
@@ -84,7 +89,20 @@ def _four_h_raw(open_time: dt.datetime, value: float) -> RawCandle:
 
 
 def _seed_registry(store: TidemarkStore, symbol: str, seen_at: dt.datetime) -> None:
+    """Seed a registry listing classified CRYPTO - the default for every
+    test in this file that isn't itself about asset-class classification
+    (see tests/data/test_asset_class.py and the UNIV-08 tests below for
+    those)."""
     store.record_market_listing(VENUE, symbol, "perpetual", "USDT", seen_at)
+    store.record_classification(
+        VENUE,
+        symbol,
+        "COIN",
+        CRYPTO,
+        CLASSIFICATION_SOURCE,
+        seen_at,
+        CLASSIFICATION_METHODOLOGY_VERSION,
+    )
 
 
 def _seed_daily(
@@ -497,6 +515,9 @@ def test_as_of_invariant_across_several_timestamps(candle_index: int) -> None:
                     "eligible": r.eligible,
                     "selected": r.selected,
                     "exclusion_reason": r.exclusion_reason,
+                    # UNIV-08: classification is part of the as-of invariant too.
+                    "underlying_type": r.underlying_type,
+                    "asset_class": r.asset_class,
                 }
                 for r in rows
             ),
@@ -533,3 +554,245 @@ def test_as_of_invariant_registry_membership_excludes_symbols_listed_after_t() -
 
     symbols = {r.symbol for r in result.rows}
     assert symbols == {"OLD/USDT:USDT"}
+
+
+# -- UNIV-08: asset-class domain constraint ------------------------------------
+
+
+def _seed_classified(
+    store: TidemarkStore, symbol: str, seen_at: dt.datetime, underlying_type: str, asset_class: str
+) -> None:
+    store.record_market_listing(VENUE, symbol, "perpetual", "USDT", seen_at)
+    store.record_classification(
+        VENUE,
+        symbol,
+        underlying_type,
+        asset_class,
+        CLASSIFICATION_SOURCE,
+        seen_at,
+        CLASSIFICATION_METHODOLOGY_VERSION,
+    )
+
+
+def test_non_crypto_symbol_excluded_regardless_of_volume_or_rank(store: TidemarkStore) -> None:
+    """A non-crypto symbol excluded on domain grounds even though it has
+    plenty of volume history and would otherwise have ranked at #1."""
+    from tidemark.data.asset_class import NON_CRYPTO, NON_CRYPTO_UNDERLYING
+
+    _seed_classified(store, "MSTR/USDT:USDT", BASE - dt.timedelta(days=100), "EQUITY", NON_CRYPTO)
+    _seed_daily(store, "MSTR/USDT:USDT", n=40, until=BASE, volume=999_999.0)  # highest volume
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    [row] = result.rows
+    assert row.rank == 1  # still ranked by volume - ranking methodology unchanged
+    assert row.metric_value is not None  # metric still computed and shown
+    assert row.eligible is False
+    assert row.selected is False
+    assert row.exclusion_reason == NON_CRYPTO_UNDERLYING
+    assert row.asset_class == NON_CRYPTO
+
+
+def test_index_symbol_excluded_as_non_eligible_index(store: TidemarkStore) -> None:
+    from tidemark.data.asset_class import NON_ELIGIBLE_INDEX
+
+    _seed_classified(
+        store, "BTCDOM/USDT:USDT", BASE - dt.timedelta(days=100), "INDEX", NON_ELIGIBLE_INDEX
+    )
+    _seed_daily(store, "BTCDOM/USDT:USDT", n=40, until=BASE, volume=1000.0)
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    [row] = result.rows
+    assert row.exclusion_reason == NON_ELIGIBLE_INDEX
+    assert row.asset_class == NON_ELIGIBLE_INDEX
+
+
+def test_unclassified_symbol_excluded_as_unknown(store: TidemarkStore) -> None:
+    """A registry row with no classification at all (pre-UNIV-08, never
+    re-discovered) must be excluded as UNKNOWN, never guessed CRYPTO."""
+    from tidemark.data.asset_class import UNKNOWN, UNKNOWN_UNDERLYING_TYPE
+
+    store.record_market_listing(
+        VENUE, "OLD/USDT:USDT", "perpetual", "USDT", BASE - dt.timedelta(days=100)
+    )
+    _seed_daily(store, "OLD/USDT:USDT", n=40, until=BASE, volume=1000.0)
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    [row] = result.rows
+    assert row.exclusion_reason == UNKNOWN_UNDERLYING_TYPE
+    assert row.asset_class == UNKNOWN
+
+
+def test_crypto_symbol_is_unaffected_by_the_domain_check(store: TidemarkStore) -> None:
+    symbol = "GOOD/USDT:USDT"
+    _seed_registry(store, symbol, BASE - dt.timedelta(days=100))
+    _seed_daily(store, symbol, n=40, until=BASE, volume=1000.0)
+    start = BASE - dt.timedelta(hours=4 * len(_EXIT_VALUES))
+    _seed_4h(store, symbol, _EXIT_VALUES, start)
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    [row] = result.rows
+    assert row.asset_class == CRYPTO
+    assert row.eligible is True
+    assert row.selected is True
+
+
+def test_fresh_snapshot_contains_only_coin_instruments(store: TidemarkStore) -> None:
+    from tidemark.data.asset_class import NON_CRYPTO
+
+    start = BASE - dt.timedelta(hours=4 * len(_EXIT_VALUES))
+    for i in range(3):
+        symbol = f"CRYPTO{i}/USDT:USDT"
+        _seed_registry(store, symbol, BASE - dt.timedelta(days=100))
+        _seed_daily(store, symbol, n=40, until=BASE, volume=float(1000 + i))
+        _seed_4h(store, symbol, _EXIT_VALUES, start)
+    for i in range(3):
+        symbol = f"EQUITY{i}/USDT:USDT"
+        _seed_classified(store, symbol, BASE - dt.timedelta(days=100), "EQUITY", NON_CRYPTO)
+        _seed_daily(store, symbol, n=40, until=BASE, volume=float(2000 + i))
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    selected_symbols = {r.symbol for r in result.rows if r.selected}
+    assert selected_symbols == {"CRYPTO0/USDT:USDT", "CRYPTO1/USDT:USDT", "CRYPTO2/USDT:USDT"}
+    assert all(r.asset_class == CRYPTO for r in result.rows if r.selected)
+
+
+def test_snapshot_reads_persisted_classification_not_live_metadata(store: TidemarkStore) -> None:
+    """Snapshot generation never calls load_markets() itself - it can
+    only see what discovery already persisted. Proven here structurally:
+    generate_universe_snapshot is given no exchange for a BACKFILLED run
+    (exchange=None) and still classifies correctly, which is only
+    possible if it read the registry, not a live call."""
+    _seed_classified(store, "MSTR/USDT:USDT", BASE - dt.timedelta(days=100), "EQUITY", "NON_CRYPTO")
+    _seed_daily(store, "MSTR/USDT:USDT", n=40, until=BASE, volume=1000.0)
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)  # exchange=None
+
+    [row] = result.rows
+    assert row.asset_class == "NON_CRYPTO"
+
+
+def test_a_reclassification_after_t_does_not_alter_a_backfilled_snapshot_at_t(
+    store: TidemarkStore,
+) -> None:
+    """UNIVERSE_AS_OF_INVARIANT applied to asset class: a classification
+    change discovery makes AFTER T must not retroactively alter what a
+    BACKFILLED snapshot at T reports - proven here because
+    record_classification's set-once semantics mean the registry can
+    only ever hold the FIRST classification captured, so this is really
+    asserting the snapshot uses that persisted value, not a live one.
+    """
+    symbol = "BTC/USDT:USDT"
+    seen_at = BASE - dt.timedelta(days=100)
+    _seed_classified(store, symbol, seen_at, "COIN", CRYPTO)
+    _seed_daily(store, symbol, n=40, until=BASE, volume=1000.0)
+    start = BASE - dt.timedelta(hours=4 * len(_EXIT_VALUES))
+    _seed_4h(store, symbol, _EXIT_VALUES, start)
+
+    t = BASE - dt.timedelta(days=1)
+    result = generate_universe_snapshot(store, None, VENUE, as_of=t)
+
+    [row] = result.rows
+    assert row.asset_class == CRYPTO
+
+
+def test_pre_univ08_snapshot_is_unchanged_by_generating_a_fresh_one(store: TidemarkStore) -> None:
+    """Snapshots are append-only. A snapshot generated before UNIV-08
+    existed (methodology_version='universe-v1', no classification fields
+    on its rows - exactly what the real, already-shipped snapshot looks
+    like) must never be rewritten, mutated, or deleted by a later,
+    UNIV-08-aware snapshot generation.
+    """
+    from tidemark.data.models import UniverseSnapshot, UniverseSnapshotRow
+
+    old_snapshot_at = BASE - dt.timedelta(days=1)
+    old_header = UniverseSnapshot(
+        snapshot_id="pre-univ08",
+        snapshot_at=old_snapshot_at,
+        methodology_version="universe-v1",
+        venue=VENUE,
+        metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+        metric_window_days=30,
+        k=K,
+        n_selected=1,
+        provenance="FORWARD",
+        candle_hash="deadbeef",
+        counts_by_exclusion_reason={},
+    )
+    old_row = UniverseSnapshotRow(
+        snapshot_id="pre-univ08",
+        symbol="MSTR/USDT:USDT",
+        rank=1,
+        metric_value=1_000_000.0,
+        eligible=True,
+        selected=True,
+        exclusion_reason=None,
+        # no classification fields - exactly the pre-UNIV-08 shape
+    )
+    store.save_universe_snapshot(old_header, [old_row])
+
+    # Generate a fresh, UNIV-08-aware snapshot at a different timestamp.
+    symbol = "GOOD/USDT:USDT"
+    _seed_registry(store, symbol, BASE - dt.timedelta(days=100))
+    _seed_daily(store, symbol, n=40, until=BASE, volume=1000.0)
+    start = BASE - dt.timedelta(hours=4 * len(_EXIT_VALUES))
+    _seed_4h(store, symbol, _EXIT_VALUES, start)
+    generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    # The old snapshot is byte-for-byte exactly as it was written.
+    old_after = store.universe_snapshot_by_id("pre-univ08")
+    assert old_after is not None
+    assert old_after.methodology_version == "universe-v1"
+    assert old_after.snapshot_at == old_snapshot_at
+    assert old_after.n_selected == 1
+
+    [old_row_after] = store.universe_snapshot_rows("pre-univ08")
+    assert old_row_after.symbol == "MSTR/USDT:USDT"
+    assert old_row_after.selected is True
+    assert old_row_after.asset_class is None  # never backfilled onto an old row
+    assert old_row_after.underlying_type is None
+
+    # Two distinct snapshots now coexist, both untouched by each other.
+    assert len(store.universe_snapshots(VENUE)) == 2
+
+
+def test_non_crypto_symbols_never_consume_an_assessment_slot_from_crypto_candidates(
+    store: TidemarkStore,
+) -> None:
+    """UNIV-08: the assessment set is the top K *crypto* candidates by
+    rank, not top K of the raw mixed ranking - ADR 0009's own reason for
+    K's existence ("headroom over N so ineligible symbols can be skipped
+    without running out of candidates") is defeated if a symbol that can
+    never be eligible on domain grounds occupies one of the K slots. Here,
+    K non-crypto symbols outrank every crypto one by volume; without the
+    fix, every crypto candidate would be pushed past the assessment
+    cutoff and get NOT_ASSESSED instead of a real eligibility check.
+    """
+    from tidemark.data.asset_class import NON_CRYPTO
+
+    start = BASE - dt.timedelta(hours=4 * len(_EXIT_VALUES))
+
+    # K non-crypto symbols, all out-ranking every crypto symbol by volume.
+    for i in range(K):
+        symbol = f"EQUITY{i:03d}/USDT:USDT"
+        _seed_classified(store, symbol, BASE - dt.timedelta(days=100), "EQUITY", NON_CRYPTO)
+        _seed_daily(store, symbol, n=40, until=BASE, volume=float(100_000 + i))
+
+    # One crypto candidate, ranked below all K non-crypto symbols by volume,
+    # but still perfectly eligible.
+    symbol = "GOOD/USDT:USDT"
+    _seed_registry(store, symbol, BASE - dt.timedelta(days=100))
+    _seed_daily(store, symbol, n=40, until=BASE, volume=1.0)  # lowest volume
+    _seed_4h(store, symbol, _EXIT_VALUES, start)
+
+    result = generate_universe_snapshot(store, None, VENUE, as_of=BASE)
+
+    row = next(r for r in result.rows if r.symbol == symbol)
+    assert row.rank == K + 1  # true overall rank: last, behind all K non-crypto
+    assert row.eligible is True  # still actually assessed and found eligible
+    assert row.selected is True
+    assert row.exclusion_reason is None
