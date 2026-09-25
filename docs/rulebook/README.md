@@ -33,6 +33,17 @@ tunes them, or infers behavior they don't specify.
 | 1 — HTF Context (4H) | [section-01-htf-context-v1.1.md](section-01-htf-context-v1.1.md) (current); [v1.0](section-01-htf-context-v1.0.md) (superseded, kept for history) | LOCKED |
 | 2 — 1H Behaviour | [section-02-1h-behaviour-v0.2.md](section-02-1h-behaviour-v0.2.md) (current); [v0.1](section-02-1h-behaviour-v0.1.md) (superseded, kept for history) | PROVISIONAL — OBSERVATION ONLY |
 
+## Live observation version
+
+`tidemark observe run` (the live Section 2 pipeline) switched from
+`section-02-v0.1` to `section-02-v0.2` (grade-only session termination —
+see [section-02-v0.2-justification.md](section-02-v0.2-justification.md))
+on 2026-09-25. `tidemark replay` continues to support both versions via
+`--rule-version`, for comparison against the pinned baseline. Observation
+rows already collected under v0.1 keep `rule_version` `"section-02-v0.1"`
+and are never rewritten — the two versions coexist in the `observations`
+table, distinguished by that field.
+
 See [open-questions.md](open-questions.md) for behavior the current
 rulebook doesn't define, surfaced by running the engine — none of it is
 decided, and code does not guess at an answer while an entry is open.

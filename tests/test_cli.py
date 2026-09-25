@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from tidemark import __version__
 from tidemark import cli as cli_module
 from tidemark.cli import _parse_csv, app
-from tidemark.context import htf
+from tidemark.context import htf, mtf
 from tidemark.data.exchange import RawCandle
 from tidemark.data.models import JournalEntry
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
@@ -746,6 +746,26 @@ def test_observe_run_journals_a_row_per_1h_candle(
     engine = create_store_engine(url)
     store = TidemarkStore(engine)
     assert len(store.observation_history(SYMBOL)) == 3
+
+
+def test_observe_run_journals_under_v0_2(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Live observation runs on v0.2 (grade-only session termination) as of
+    # 2026-09-25 - see docs/rulebook/section-02-v0.2-justification.md and
+    # docs/rulebook/README.md. Rows collected before that date keep
+    # rule_version "section-02-v0.1" and are never rewritten.
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["observe", "run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    observations = store.observation_history(SYMBOL)
+    assert len(observations) == 3
+    assert all(o.rule_version == mtf.RULE_VERSION_V2 for o in observations)
+    assert mtf.RULE_VERSION_V2 == "section-02-v0.2"
 
 
 def test_observe_run_twice_is_idempotent(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
