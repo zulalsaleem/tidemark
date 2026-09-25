@@ -247,9 +247,9 @@ see [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-se
 symbol recorded, not only the winners), and the existing journal/
 observation tables (what Tidemark actually evaluated).
 
-Merge 2A (this one) discovers the venue's symbol catalog and backfills
-daily candles for it — still no selection, eligibility, or metric
-computation:
+Merge 2A discovered the venue's symbol catalog and backfilled daily
+candles for it. Merge 2B (this one) computes the metric, assesses
+eligibility, and generates the snapshot itself:
 
 ```bash
 # Refresh market_registry from the venue's live listing: active
@@ -263,6 +263,17 @@ uv run tidemark universe discover
 # symbols and take a while.
 uv run tidemark universe backfill --days 120
 
+# Generate a snapshot: rank every ACTIVE symbol by
+# MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D, backfill 4H candles for the top
+# K=50 if not already stored, assess Section 1 eligibility (the LOCKED
+# v1.1 engine, unmodified) for those 50, and select the top N=30
+# eligible by rank.
+uv run tidemark universe snapshot
+
+# The same, reconstructed as of a past timestamp instead of live - never
+# touches the network, never updates market_registry's eligibility cache.
+uv run tidemark universe snapshot --as-of 2026-09-01T00:00:00+00:00
+
 # Market-registry rows: status, candle coverage, and stored row counts.
 uv run tidemark universe registry
 
@@ -270,21 +281,26 @@ uv run tidemark universe registry
 uv run tidemark universe snapshots
 
 # One snapshot's full ranking - selected symbols first, excluded symbols
-# shown too with their exclusion_reason.
+# shown too with their exclusion_reason. A rank below K=50 shows
+# eligible as "-" (NULL): NOT_ASSESSED, never a reported failure.
 uv run tidemark universe show --snapshot-id <id>
+
+# Coverage report: symbols on venue, eligible, assessed, selected, data
+# available, and counts by exclusion reason.
+uv run tidemark universe coverage
 ```
 
 Discovery uses ccxt's unified `load_markets` — a second, separate,
 venue-agnostic read-only call alongside candle fetching (never a
-venue-specific raw endpoint); backfill reuses the existing `data backfill`
-ingest path unmodified, restricted to `1d`. All read-only commands report
-an empty database gracefully ("No ... found yet.") rather than erroring.
+venue-specific raw endpoint); both backfill commands reuse the existing
+`data backfill` ingest path unmodified. All read-only commands report an
+empty database gracefully ("No ... found yet.") rather than erroring.
 **`TIDEMARK_SYMBOLS` / `settings.symbol_list()` remains the only symbol
 source every pipeline reads** — `tidemark run`, `tidemark observe run`,
-and `tidemark health check` are unaffected by this merge, even though
-`market_registry` may now hold hundreds of symbols. Merge 2B (eligibility
-+ the derived volume metric) and Merge 3 (snapshot generation and, as its
-own separate decision, wiring selection into the pipelines) follow later.
+and `tidemark health check` are unaffected by any of this, even after a
+real snapshot has been generated. Merge 3 (the daily refresh schedule
+and, as its own separate decision, wiring selection into the pipelines)
+follows later.
 
 ## Project status
 
@@ -350,6 +366,36 @@ from Merge 1, before anything had ever written to the table) so a
 freshly-discovered symbol is a valid row before its first backfill.
 Still no eligibility, metric, or ranking logic, and every pipeline's
 symbol source remains exactly `TIDEMARK_SYMBOLS`.
+
+**Phase 6, Merge 2B — the volume metric, eligibility, and snapshot
+generation.** `tidemark universe snapshot` computes
+`MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D` for every ACTIVE registry symbol
+(`data/universe_metric.py`), ranks them (deterministic, symbol-name
+tie-break), backfills 4H candles for the top K=50 if not already stored,
+and assesses Section 1 eligibility for those 50 by replaying the LOCKED
+v1.1 engine unmodified (`data/universe_eligibility.py`, via
+`replay.report.replay_section1`) — never a calendar-history requirement,
+per UNIV-01. The top N=30 eligible by rank are selected; every ranked
+symbol gets a row regardless. Rows below K are `NOT_ASSESSED` with
+`eligible = NULL`, deliberately distinct from an assessed-and-failed
+`eligible = False` (`UniverseSnapshotRow.eligible` and
+`UniverseSnapshot.k` were amended/added the same way Merge 2A amended
+`market_registry` — nothing had written to these tables in production
+yet). Omitting `--as-of` runs live (FORWARD): it may backfill 4H data and
+caches a found `section1_first_usable_at` onto `market_registry` so a
+later run never re-replays a symbol's whole history. Giving `--as-of`
+reconstructs a past snapshot (BACKFILLED): it never touches the network
+and never writes that cache, verified by `UNIVERSE_AS_OF_INVARIANT`
+tests across several timestamps
+(`tests/data/test_universe_snapshot.py`). `tidemark universe coverage`
+reports symbols on venue, eligible, assessed, selected, data available,
+and counts by exclusion reason. Every pipeline's symbol source remains
+exactly `TIDEMARK_SYMBOLS` — verified by both a store-level and a
+CLI-level regression test, even after a real snapshot has been
+generated. See
+[docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md)'s
+Merge 2B addendum for the full design, including the rank-first order
+and the listing-status-as-of limitation.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.

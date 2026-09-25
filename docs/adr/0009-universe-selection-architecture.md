@@ -284,3 +284,94 @@ ranking are still entirely Merge 2B's, per UNIV-01 and UNIV-02/07 above.
   wiring a snapshot's selection into what the pipelines actually
   evaluate) are each their own change, checked against
   UNIVERSE_AS_OF_INVARIANT before being considered done.
+
+## Addendum: Merge 2B — the metric, rank-first eligibility, and snapshot generation
+
+Merge 2B is what actually computes a snapshot's contents; Merges 1 and
+2A only ever built the schema and the data underneath it. Its central
+design decision, PART B's rank-first order, is fixed and must not be
+reordered:
+
+1. Rank every ACTIVE registry symbol by `MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D`,
+   descending.
+2. Take the top **K = 50** as the assessment set.
+3. Backfill 4H candles for those 50 only, if none are stored yet.
+4. Assess Section 1 eligibility for those 50 — and only those 50.
+5. Select the top **N = 30** eligible, in the rank order already
+   established.
+
+**K = 50 is ARCHITECTURAL**, exactly like N = 30 already was: headroom
+over N so that ineligible symbols inside the assessment set can be
+skipped without running out of candidates before reaching 30 selected.
+It is fixed on operational grounds (bounding how many symbols ever need
+a 4H backfill or a Section 1 replay per snapshot run) and is never swept
+for performance, the same commitment UNIV-03 already made for N.
+
+**A row ranked below K is `NOT_ASSESSED`, and `NOT_ASSESSED` is not
+`eligible = false`.** `UniverseSnapshotRow.eligible` is `NULL` for such a
+row, not `False` — PART C's own wording is "the snapshot says 'we did
+not check', not 'it failed'," and collapsing the two into one boolean
+would have silently erased that distinction every time a symbol simply
+wasn't rich enough by volume to be looked at. This required amending
+`UniverseSnapshotRow.eligible` from Merge 1's `NOT NULL` to nullable —
+safe because nothing had ever written a row to this table before Merge
+2B (Merge 1 shipped schema and read-only plumbing only; Merge 2A never
+touched `universe_snapshot`/`universe_snapshot_row` at all). A
+`UniverseSnapshot.k` column was added the same way, recording the
+assessment-set size a given snapshot actually used.
+
+**Eligibility runs the locked Section 1 v1.1 engine unmodified.**
+`data/universe_eligibility.py`'s `assess_section1_eligibility` calls
+`replay.report.replay_section1` — itself a thin, point-in-time wrapper
+around `context.htf.evaluate`, already used by `tidemark replay` — and
+adds no rule, parameter, or threshold of its own. A symbol is eligible
+once that replay shows Section 1 exiting `INSUFFICIENT_STRUCTURE` at
+least once; `section1_first_usable_at` is that first exit's
+`evaluated_at`. Before running the replay at all, three cheaper,
+data-quality gates run first, in this fixed order, so a genuine
+`NEVER_EXITED_INSUFFICIENT_STRUCTURE` finding is never confused with a
+data problem: fewer than 14 4H candles (`MIN_4H_CANDLES_FOR_ATR` — the
+one mechanical, rulebook-derivable floor the Phase 6 preflight actually
+found, unlike the unbounded 2-highs-and-2-lows requirement) gives
+`INSUFFICIENT_4H_HISTORY`; any rejected 4H candle on record gives
+`INVALID_OHLCV`; a gap in the 4H sequence gives `DATA_GAPS`.
+
+**FORWARD vs BACKFILLED and the registry cache.** Omitting `--as-of`
+generates a live snapshot at `now`: step 3 may reach the exchange (reused
+`data/ingest.py` path, unmodified — see the Merge 2A addendum above), and
+a symbol's eligibility, once found, is cached onto
+`market_registry.section1_first_usable_at`/`section1_eligibility_checked_at`
+so the next FORWARD run never has to replay a symbol's whole history
+again (PART C: "persist it so a later snapshot does not recompute the
+whole history"). Giving `--as-of` reconstructs a snapshot as of that past
+timestamp: it never touches the network (there is nothing to backfill
+"as of the past"), and — critically — it never writes to the registry
+cache either, in either direction: a value computed from data truncated
+at an earlier T must never be mistaken for the general, full-history
+truth a later FORWARD run would otherwise trust. `exchange` is `None`
+for a BACKFILLED run and is a hard-required argument for a FORWARD one.
+
+**The listing-status limitation.** UNIVERSE_AS_OF_INVARIANT also
+requires "no future ... listing status ... may influence a snapshot at
+T." `market_registry` does not version `status` over time — it records
+only the current status plus `first_seen_in_venue_list_at`/
+`last_seen_in_venue_list_at` bounds. Merge 2B's practical approximation:
+a BACKFILLED snapshot at T only considers symbols with
+`first_seen_in_venue_list_at <= T`, which prevents the clearest form of
+look-ahead (a symbol discovered well after T silently appearing in a
+snapshot claiming to represent T) but cannot reconstruct "was later
+delisted before T while still active at T," since the schema has no
+`absent_since` timestamp to check against. This is an honest limit of
+what Merges 1/2A's schema supports, not a silent gap — if full
+point-in-time venue-membership reconstruction is ever needed, it needs
+its own listing-history table and its own merge, not a quiet assumption
+here.
+
+**What Merge 2B still does not do.** It never touches `TIDEMARK_SYMBOLS`
+or `settings.symbol_list()` — every pipeline's symbol source is
+unaffected by a generated snapshot, verified by both a store-level test
+and a CLI-level regression test. `data/exchange.py`'s fetch path is
+untouched; step 3 reuses `run_backfill` exactly as Merge 2A left it. No
+Section 1 or Section 2 rule, parameter, or threshold changed. Wiring a
+snapshot's selection into what the pipelines actually evaluate remains
+Merge 3's, as its own explicit, separately-reviewed decision.
