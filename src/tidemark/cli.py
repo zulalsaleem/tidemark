@@ -30,6 +30,7 @@ from tidemark.data.universe_backfill import (
     active_symbols,
     run_universe_backfill,
 )
+from tidemark.data.universe_snapshot import generate_universe_snapshot
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
@@ -1027,7 +1028,7 @@ def universe_show(
         f"{snapshot.snapshot_id}  venue={snapshot.venue}  "
         f"at={snapshot.snapshot_at.isoformat()}  methodology={snapshot.methodology_version}  "
         f"metric={snapshot.metric_name} ({snapshot.metric_window_days}d)  "
-        f"n_selected={snapshot.n_selected}  provenance={snapshot.provenance}"
+        f"k={snapshot.k}  n_selected={snapshot.n_selected}  provenance={snapshot.provenance}"
     )
     typer.echo("")
 
@@ -1045,10 +1046,115 @@ def universe_show(
     for row in ordered:
         metric = f"{row.metric_value:.2f}" if row.metric_value is not None else "-"
         reason = row.exclusion_reason or "-"
+        eligible = "-" if row.eligible is None else str(row.eligible)
         _safe_echo(
             f"{row.rank:<6} {row.symbol:<16} {metric:<14} "
-            f"{str(row.eligible):<9} {str(row.selected):<9} {reason}"
+            f"{eligible:<9} {str(row.selected):<9} {reason}"
         )
+
+
+@universe_app.command("snapshot")
+def universe_snapshot_command(
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help=(
+            "ISO timestamp; reconstructs a BACKFILLED snapshot as of that moment "
+            "instead of a live FORWARD one. A BACKFILLED snapshot never touches "
+            "the network and never updates market_registry's cached eligibility."
+        ),
+    ),
+) -> None:
+    """Generate and persist one universe snapshot (Phase 6, Merge 2B).
+
+    Ranks every ACTIVE registry symbol by
+    MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D, assesses Section 1 eligibility
+    (the LOCKED v1.1 engine, unmodified) for the top K=50, and selects the
+    top N=30 eligible by rank. Every ranked symbol gets a row, not only
+    the selected 30 - see `universe show`.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    as_of_dt = _parse_as_of(as_of)
+    exchange = ExchangeClient(venue=settings.venue) if as_of_dt is None else None
+
+    result = generate_universe_snapshot(store, exchange, settings.venue, as_of=as_of_dt)
+    snapshot = result.snapshot
+
+    typer.echo(
+        f"snapshot {snapshot.snapshot_id}  provenance={snapshot.provenance}  "
+        f"at={snapshot.snapshot_at.isoformat()}  ranked={len(result.rows)}  "
+        f"n_selected={snapshot.n_selected}/{snapshot.k}"
+    )
+    typer.echo("")
+    typer.echo("By exclusion_reason:")
+    for reason, count in sorted(snapshot.counts_by_exclusion_reason.items()):
+        typer.echo(f"  {reason:<36} {count}")
+
+
+@universe_app.command("coverage")
+def universe_coverage(
+    snapshot_id: str | None = typer.Option(
+        None, "--snapshot-id", help="Snapshot to report on; defaults to the latest for this venue."
+    ),
+) -> None:
+    """Coverage report: symbols on venue, eligible, assessed, selected,
+    data available, and counts by exclusion reason.
+    """
+    settings = get_settings()
+    store = _store(settings)
+
+    registry_rows = store.market_registry(settings.venue)
+    active_count = sum(1 for r in registry_rows if r.status == "ACTIVE")
+    absent_count = sum(1 for r in registry_rows if r.status == "ABSENT_FROM_VENUE")
+    with_daily = sum(1 for r in registry_rows if r.first_candle_seen_at is not None)
+    with_4h = sum(
+        1 for r in registry_rows if store.count_candles(settings.venue, r.symbol, "4h") > 0
+    )
+    with_cached_eligibility = sum(
+        1 for r in registry_rows if r.section1_first_usable_at is not None
+    )
+
+    typer.echo(f"Registry: {len(registry_rows)} symbol(s) on venue")
+    typer.echo(f"  ACTIVE:                            {active_count}")
+    typer.echo(f"  ABSENT_FROM_VENUE:                 {absent_count}")
+    typer.echo(f"  with daily candle data:            {with_daily}")
+    typer.echo(f"  with 4H candle data:               {with_4h}")
+    typer.echo(f"  with cached Section 1 eligibility: {with_cached_eligibility}")
+    typer.echo("")
+
+    if snapshot_id is not None:
+        snapshot = store.universe_snapshot_by_id(snapshot_id)
+        if snapshot is None:
+            typer.echo(f"No snapshot found with id {snapshot_id!r}.")
+            raise typer.Exit(code=1)
+    else:
+        snapshots = store.universe_snapshots(settings.venue)
+        snapshot = snapshots[0] if snapshots else None
+
+    if snapshot is None:
+        typer.echo("No snapshots found yet.")
+        return
+
+    rows = store.universe_snapshot_rows(snapshot.snapshot_id)
+    # "Assessed" means actually reached Section 1 eligibility (PART B step
+    # 4: rank <= K), not merely `eligible is not None` - a symbol excluded
+    # earlier for INSUFFICIENT_VOLUME_HISTORY also carries a non-NULL
+    # `eligible=False` regardless of its rank, so that alone would
+    # over-count rows this snapshot never actually assessed.
+    assessed = sum(1 for r in rows if r.rank <= snapshot.k)
+    typer.echo(
+        f"Snapshot {snapshot.snapshot_id} ({snapshot.provenance}, "
+        f"at={snapshot.snapshot_at.isoformat()}):"
+    )
+    typer.echo(f"  ranked:               {len(rows)}")
+    typer.echo(f"  assessed (rank<=K={snapshot.k}): {assessed}")
+    typer.echo(f"  eligible:             {sum(1 for r in rows if r.eligible is True)}")
+    typer.echo(f"  selected:             {sum(1 for r in rows if r.selected)}")
+    typer.echo("")
+    typer.echo("By exclusion_reason:")
+    for reason, count in sorted(snapshot.counts_by_exclusion_reason.items()):
+        typer.echo(f"  {reason:<36} {count}")
 
 
 def main() -> None:

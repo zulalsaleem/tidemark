@@ -1008,6 +1008,7 @@ def _seed_snapshot(url: str, snapshot_id: str) -> None:
             venue=VENUE,
             metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
             metric_window_days=30,
+            k=50,
             n_selected=1,
             provenance="FORWARD",
             candle_hash="deadbeef",
@@ -1105,6 +1106,168 @@ def test_universe_show_lists_full_ranking_selected_first(
     assert "BELOW_RANK_CUTOFF" in result.stdout
     # the selected symbol is listed before the excluded one
     assert result.stdout.index(SYMBOL) < result.stdout.index("DOGE/USDT:USDT")
+
+
+# -- universe snapshot / coverage (Phase 6, Merge 2B) --------------------------
+
+_ELIGIBLE_4H_VALUES = [
+    120,
+    115,
+    110,
+    105,
+    100,
+    110,
+    120,
+    130,
+    120,
+    115,
+    112,
+    110,
+    120,
+    130,
+    140,
+    150,
+    140,
+    130,
+    120,
+]
+
+
+def _seed_eligible_symbol(url: str, symbol: str, as_of: dt.datetime) -> None:
+    """A registry symbol with >=30 closed daily candles and a 4H zigzag
+    that exits INSUFFICIENT_STRUCTURE, so a BACKFILLED snapshot at
+    `as_of` selects it.
+    """
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.record_market_listing(VENUE, symbol, "perpetual", "USDT", as_of - dt.timedelta(days=200))
+    daily = [_raw_1d_candle(as_of - dt.timedelta(days=40 - i), close=100.0) for i in range(40)]
+    store.upsert_candles(VENUE, symbol, "1d", daily, as_of)
+    start = as_of - dt.timedelta(hours=4 * len(_ELIGIBLE_4H_VALUES))
+    four_h = [
+        RawCandle(
+            open_time=start + dt.timedelta(hours=4 * i),
+            close_time=start + dt.timedelta(hours=4 * (i + 1)),
+            open=v,
+            high=v,
+            low=v,
+            close=v,
+            volume=1.0,
+        )
+        for i, v in enumerate(_ELIGIBLE_4H_VALUES)
+    ]
+    store.upsert_candles(VENUE, symbol, "4h", four_h, as_of)
+
+
+def test_universe_snapshot_command_backfilled_generates_a_snapshot(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    as_of = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    _seed_eligible_symbol(url, SYMBOL, as_of)
+
+    result = runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+
+    assert result.exit_code == 0
+    assert "BACKFILLED" in result.stdout
+    assert "n_selected=1/50" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    [snapshot] = store.universe_snapshots(VENUE)
+    assert snapshot.provenance == "BACKFILLED"
+    [row] = store.universe_snapshot_rows(snapshot.snapshot_id)
+    assert row.symbol == SYMBOL
+    assert row.selected is True
+
+
+def test_universe_snapshot_command_backfilled_never_touches_registry_cache(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    as_of = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    _seed_eligible_symbol(url, SYMBOL, as_of)
+
+    runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    row = store.market_registry_row(VENUE, SYMBOL)
+    assert row is not None
+    assert row.section1_first_usable_at is None
+
+
+def test_universe_coverage_reports_gracefully_when_empty(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "coverage"])
+
+    assert result.exit_code == 0
+    assert "No snapshots found yet." in result.stdout
+
+
+def test_universe_coverage_reports_snapshot_summary(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    as_of = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    _seed_eligible_symbol(url, SYMBOL, as_of)
+    runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+
+    result = runner.invoke(app, ["universe", "coverage"])
+
+    assert result.exit_code == 0
+    assert "ranked:               1" in result.stdout
+    assert "eligible:             1" in result.stdout
+    assert "selected:             1" in result.stdout
+
+
+def test_universe_coverage_accepts_explicit_snapshot_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_snapshot(url, "snap-1")
+
+    result = runner.invoke(app, ["universe", "coverage", "--snapshot-id", "snap-1"])
+
+    assert result.exit_code == 0
+    assert "snap-1" in result.stdout
+
+
+def test_universe_coverage_unknown_snapshot_id_errors(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "coverage", "--snapshot-id", "nope"])
+
+    assert result.exit_code == 1
+
+
+def test_observer_symbol_source_unaffected_by_a_generated_snapshot(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final Phase 6 hard-constraint regression check: a real,
+    generated snapshot (not just seeded registry/snapshot rows) must not
+    change which symbols `observe run` processes."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+    as_of = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    _seed_eligible_symbol(url, "ETH/USDT:USDT", as_of)  # a different, selected symbol
+
+    runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=2)
+
+    result = runner.invoke(app, ["observe", "run"])
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "ETH/USDT:USDT" not in result.stdout
 
 
 def test_universe_commands_read_no_quote_volume_column(
@@ -1284,6 +1447,7 @@ def test_universe_show_does_not_crash_on_a_non_ascii_symbol(
             venue=VENUE,
             metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
             metric_window_days=30,
+            k=50,
             n_selected=1,
             provenance="FORWARD",
             candle_hash="deadbeef",
