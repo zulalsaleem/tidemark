@@ -131,6 +131,35 @@ def test_run_update_without_prior_data_uses_fallback_lookback(store: TidemarkSto
     assert store.count_candles(VENUE, "BTC/USDT:USDT", "4h") == 1
 
 
+def test_on_outcome_callback_fires_once_per_symbol_timeframe(store: TidemarkStore) -> None:
+    """Phase 6, Merge 2A: `on_outcome` is additive progress reporting for
+    callers driving many symbols (e.g. `tidemark universe backfill`) -
+    existing callers that omit it (the assertions above) are unaffected.
+    """
+    now = dt.datetime(2026, 9, 22, 12, tzinfo=dt.UTC)
+    fake = _FakeExchange(rows_by_symbol={})
+    exchange = ExchangeClient(exchange=fake, now_fn=lambda: now)
+    seen: list[tuple[str, str]] = []
+
+    run_backfill(
+        store,
+        exchange,
+        VENUE,
+        ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+        ["4h", "1d"],
+        days=1,
+        now=now,
+        on_outcome=lambda o: seen.append((o.symbol, o.timeframe)),
+    )
+
+    assert sorted(seen) == [
+        ("BTC/USDT:USDT", "1d"),
+        ("BTC/USDT:USDT", "4h"),
+        ("ETH/USDT:USDT", "1d"),
+        ("ETH/USDT:USDT", "4h"),
+    ]
+
+
 def test_crash_mid_run_leaves_a_failed_row_not_no_row(store: TidemarkStore, monkeypatch) -> None:
     """An exception escaping `_execute` (not a per-symbol failure caught by
     `_fetch_and_store`) must still leave a Run row, and that row must be
