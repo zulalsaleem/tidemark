@@ -83,6 +83,17 @@ health_app = typer.Typer(
 )
 app.add_typer(health_app, name="health")
 
+universe_app = typer.Typer(
+    name="universe",
+    help=(
+        "Universe selection (Phase 6, Merge 1): read-only registry and snapshot "
+        "inspection. No selection/eligibility logic runs here yet - see "
+        "docs/adr/0009-universe-selection-architecture.md."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(universe_app, name="universe")
+
 STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
 
@@ -832,6 +843,100 @@ def health_heartbeat() -> None:
         raise typer.Exit(code=2)
 
     raise typer.Exit(code=EXIT_CODES[report.status])
+
+
+@universe_app.command("registry")
+def universe_registry() -> None:
+    """List `market_registry` rows for the configured venue.
+
+    Read-only: reports what's stored, never computes anything. Merge 2
+    is what actually populates this table.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    rows = store.market_registry(settings.venue)
+
+    if not rows:
+        typer.echo("No registry rows found yet.")
+        return
+
+    header = (
+        f"{'SYMBOL':<16} {'STATUS':<18} {'FIRST_CANDLE':<20} {'LAST_CANDLE':<20} SECTION1_USABLE"
+    )
+    typer.echo(header)
+    for row in rows:
+        usable = row.section1_first_usable_at.isoformat() if row.section1_first_usable_at else "-"
+        typer.echo(
+            f"{row.symbol:<16} {row.status:<18} "
+            f"{row.first_candle_seen_at.isoformat():<20} "
+            f"{row.last_candle_seen_at.isoformat():<20} {usable}"
+        )
+
+
+@universe_app.command("snapshots")
+def universe_snapshots() -> None:
+    """List `universe_snapshot` headers for the configured venue, newest first."""
+    settings = get_settings()
+    store = _store(settings)
+    snapshots = store.universe_snapshots(settings.venue)
+
+    if not snapshots:
+        typer.echo("No snapshots found yet.")
+        return
+
+    header = (
+        f"{'SNAPSHOT_ID':<36} {'SNAPSHOT_AT':<20} {'METHODOLOGY':<14} {'N_SELECTED':<10} PROVENANCE"
+    )
+    typer.echo(header)
+    for snap in snapshots:
+        typer.echo(
+            f"{snap.snapshot_id:<36} {snap.snapshot_at.isoformat():<20} "
+            f"{snap.methodology_version:<14} {snap.n_selected:<10} {snap.provenance}"
+        )
+
+
+@universe_app.command("show")
+def universe_show(
+    snapshot_id: str = typer.Option(..., "--snapshot-id", help="The snapshot to show."),
+) -> None:
+    """Print one snapshot's full ranking, selected symbols first.
+
+    Every ranked symbol is shown, not only the selected ones - an
+    excluded symbol's rank and exclusion_reason stay visible.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    snapshot = store.universe_snapshot_by_id(snapshot_id)
+    if snapshot is None:
+        typer.echo(f"No snapshot found with id {snapshot_id!r}.")
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"{snapshot.snapshot_id}  venue={snapshot.venue}  "
+        f"at={snapshot.snapshot_at.isoformat()}  methodology={snapshot.methodology_version}  "
+        f"metric={snapshot.metric_name} ({snapshot.metric_window_days}d)  "
+        f"n_selected={snapshot.n_selected}  provenance={snapshot.provenance}"
+    )
+    typer.echo("")
+
+    rows = store.universe_snapshot_rows(snapshot_id)
+    if not rows:
+        typer.echo("No ranked rows found for this snapshot.")
+        return
+
+    ordered = sorted(rows, key=lambda r: (not r.selected, r.rank))
+    header = (
+        f"{'RANK':<6} {'SYMBOL':<16} {'METRIC_VALUE':<14} "
+        f"{'ELIGIBLE':<9} {'SELECTED':<9} EXCLUSION_REASON"
+    )
+    typer.echo(header)
+    for row in ordered:
+        metric = f"{row.metric_value:.2f}" if row.metric_value is not None else "-"
+        reason = row.exclusion_reason or "-"
+        typer.echo(
+            f"{row.rank:<6} {row.symbol:<16} {metric:<14} "
+            f"{str(row.eligible):<9} {str(row.selected):<9} {reason}"
+        )
 
 
 def main() -> None:
