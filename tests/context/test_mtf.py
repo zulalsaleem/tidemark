@@ -352,3 +352,157 @@ def test_look_ahead_guard_truncation_reproduces_the_same_rows() -> None:
         assert truncated_results == full_results[: len(truncated_results)], (
             f"mismatch at truncation index {i}"
         )
+
+
+def test_v02_look_ahead_guard_truncation_reproduces_the_same_rows() -> None:
+    candles = _frame(_order_test_candles())
+    entry = _journal_entry(BASE, htf.LONG_WATCH, _level())
+
+    full_results = mtf.evaluate(ASSET, [entry], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    for i in range(len(candles)):
+        truncated = candles.iloc[: i + 1].reset_index(drop=True)
+        truncated_results = mtf.evaluate(
+            ASSET, [entry], truncated, rule_version=mtf.RULE_VERSION_V2
+        )
+        assert truncated_results == full_results[: len(truncated_results)], (
+            f"mismatch at truncation index {i}"
+        )
+
+
+# -- section-02-v0.2: session termination (the one variable that changes) ---
+
+
+def test_rule_version_constants() -> None:
+    assert mtf.RULE_VERSION_V1 == "section-02-v0.1"
+    assert mtf.RULE_VERSION_V2 == "section-02-v0.2"
+    assert mtf.SUPPORTED_RULE_VERSIONS == (mtf.RULE_VERSION_V1, mtf.RULE_VERSION_V2)
+
+
+def test_default_rule_version_is_v01() -> None:
+    level = _level()
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, level, grade="B")
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, level, grade="A")
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    default_results = mtf.evaluate(ASSET, [entry1, entry2], candles)
+    v1_results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V1)
+
+    assert default_results == v1_results
+
+
+def test_grade_only_change_ends_session_in_v01_but_not_in_v02() -> None:
+    # Documents the one thing v0.2 reverses from v0.1 (section-02-v0.2-
+    # justification.md, Part 1): the SAME two journal entries (state and
+    # watch unchanged, grade B -> A) end a session under v0.1 and do not
+    # under v0.2.
+    level = _level()
+    entry_b = _journal_entry(BASE, htf.LONG_WATCH, level, grade="B")
+    entry_a = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, level, grade="A")
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    v1_results = mtf.evaluate(ASSET, [entry_b, entry_a], candles, rule_version=mtf.RULE_VERSION_V1)
+    v2_results = mtf.evaluate(ASSET, [entry_b, entry_a], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert v1_results[0].state == mtf.NO_INTERACTION
+    assert v1_results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+
+    assert v2_results[0].state == mtf.NO_INTERACTION
+    assert v2_results[1].state == mtf.NO_INTERACTION
+    assert v2_results[1].section_1_grade == "A"
+    assert v2_results[1].grade_at_start == "B"
+
+
+def test_v02_ends_session_on_watch_direction_change() -> None:
+    long_level = _level(role="support")
+    short_level = _level(price=200.0, role="resistance")
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, long_level)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.SHORT_WATCH, short_level)
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert results[0].state == mtf.NO_INTERACTION
+    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+
+
+def test_v02_ends_session_when_watch_disappears() -> None:
+    level = _level()
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, level)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.WAIT, level)
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert results[0].state == mtf.NO_INTERACTION
+    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+
+
+def test_v02_ends_session_when_held_level_moves_outside_original_zone() -> None:
+    original = _level(price=100.0)  # zone [99, 101]
+    moved_outside = _level(price=103.0)  # price 103 is outside [99, 101]
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, original)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, moved_outside)
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert results[0].state == mtf.NO_INTERACTION
+    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+
+
+def test_v02_continues_when_held_level_moves_but_stays_inside_original_zone() -> None:
+    original = _level(price=100.0)  # zone [99, 101]
+    moved_inside = _level(price=100.5)  # a different price, still within [99, 101]
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, original)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, moved_inside)
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert results[0].state == mtf.NO_INTERACTION
+    assert results[1].state == mtf.NO_INTERACTION
+    # Section 2's own pinned level never moves mid-session - only the
+    # newest as-of active_levels are used for the containment check itself.
+    assert results[1].section_1_level_price == 100.0
+
+
+def test_v02_ends_session_when_no_level_of_that_role_holds_anymore() -> None:
+    level = _level()
+    entry1 = _journal_entry(BASE, htf.LONG_WATCH, level)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, _level(held=False))
+    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
+
+    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+
+
+def test_v02_records_grade_at_start_and_full_grade_history_across_changes() -> None:
+    level = _level()
+    entries = [
+        _journal_entry(BASE, htf.LONG_WATCH, level, grade="B"),
+        _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, level, grade="A"),
+        _journal_entry(BASE + dt.timedelta(hours=4), htf.LONG_WATCH, level, grade="B"),
+    ]
+    candles = _frame(
+        [
+            _candle(0, 110, 111, 110, 110.5),
+            _candle(2, 110, 111, 110, 110.5),
+            _candle(4, 110, 111, 110, 110.5),
+        ]
+    )
+
+    results = mtf.evaluate(ASSET, entries, candles, rule_version=mtf.RULE_VERSION_V2)
+
+    assert [r.state for r in results] == [mtf.NO_INTERACTION] * 3
+    assert [r.section_1_grade for r in results] == ["B", "A", "B"]
+    assert all(r.grade_at_start == "B" for r in results)
+    assert results[0].grade_history == []
+    assert results[1].grade_history == [
+        {"evaluated_at": results[1].evaluated_at.isoformat(), "grade": "A"}
+    ]
+    assert results[2].grade_history == [
+        {"evaluated_at": results[1].evaluated_at.isoformat(), "grade": "A"},
+        {"evaluated_at": results[2].evaluated_at.isoformat(), "grade": "B"},
+    ]

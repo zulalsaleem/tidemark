@@ -75,7 +75,7 @@ def _report(table2_row: Table2Row) -> ReplayReport:
     )
     table3_row = Table3Row(symbol="BTC/USDT:USDT", total_evaluations=0, state_counts={})
     return ReplayReport(
-        rule_version=mtf.RULE_VERSION,
+        rule_version=mtf.RULE_VERSION_V1,
         command="tidemark replay --rule-version section-02-v0.1",
         generated_at=BASE,
         snapshot=_empty_snapshot(),
