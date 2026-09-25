@@ -4,6 +4,7 @@ import datetime as dt
 import json
 
 import pytest
+from sqlalchemy import inspect
 from typer.testing import CliRunner
 
 from tidemark import __version__
@@ -11,7 +12,7 @@ from tidemark import cli as cli_module
 from tidemark.cli import _parse_csv, app
 from tidemark.context import htf, mtf
 from tidemark.data.exchange import RawCandle
-from tidemark.data.models import JournalEntry
+from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
 from tidemark.notify.telegram import build_message
@@ -956,3 +957,186 @@ def test_replay_reports_deterministically_across_two_invocations(
     first_lines = [line for line in first.stdout.splitlines() if "generated_at" not in line]
     second_lines = [line for line in second.stdout.splitlines() if "generated_at" not in line]
     assert first_lines == second_lines
+
+
+# -- universe (Phase 6, Merge 1) -----------------------------------------------
+
+
+def _seed_registry_row(url: str, symbol: str) -> None:
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    store.upsert_market_registry_row(
+        MarketRegistry(
+            venue=VENUE,
+            symbol=symbol,
+            contract_type="perpetual",
+            quote_currency="USDT",
+            first_candle_seen_at=base,
+            last_candle_seen_at=base + dt.timedelta(days=1),
+            first_seen_in_venue_list_at=base,
+            last_seen_in_venue_list_at=base + dt.timedelta(days=1),
+            status="ACTIVE",
+            section1_first_usable_at=None,
+            section1_eligibility_checked_at=None,
+        )
+    )
+
+
+def _seed_snapshot(url: str, snapshot_id: str) -> None:
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.save_universe_snapshot(
+        UniverseSnapshot(
+            snapshot_id=snapshot_id,
+            snapshot_at=dt.datetime(2026, 9, 25, tzinfo=dt.UTC),
+            methodology_version="universe-v1",
+            venue=VENUE,
+            metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+            metric_window_days=30,
+            n_selected=1,
+            provenance="FORWARD",
+            candle_hash="deadbeef",
+            counts_by_exclusion_reason={},
+        ),
+        [
+            UniverseSnapshotRow(
+                snapshot_id=snapshot_id,
+                symbol=SYMBOL,
+                rank=1,
+                metric_value=1_000_000.0,
+                eligible=True,
+                selected=True,
+                exclusion_reason=None,
+            ),
+            UniverseSnapshotRow(
+                snapshot_id=snapshot_id,
+                symbol="DOGE/USDT:USDT",
+                rank=2,
+                metric_value=10.0,
+                eligible=False,
+                selected=False,
+                exclusion_reason="BELOW_RANK_CUTOFF",
+            ),
+        ],
+    )
+
+
+def test_universe_registry_reports_none_when_empty(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "registry"])
+
+    assert result.exit_code == 0
+    assert "No registry rows found yet." in result.stdout
+
+
+def test_universe_registry_lists_seeded_rows(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_registry_row(url, SYMBOL)
+
+    result = runner.invoke(app, ["universe", "registry"])
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "ACTIVE" in result.stdout
+
+
+def test_universe_snapshots_reports_none_when_empty(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "snapshots"])
+
+    assert result.exit_code == 0
+    assert "No snapshots found yet." in result.stdout
+
+
+def test_universe_snapshots_lists_seeded_headers(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_snapshot(url, "snap-1")
+
+    result = runner.invoke(app, ["universe", "snapshots"])
+
+    assert result.exit_code == 0
+    assert "snap-1" in result.stdout
+    assert "FORWARD" in result.stdout
+
+
+def test_universe_show_reports_error_for_unknown_snapshot(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "show", "--snapshot-id", "nope"])
+
+    assert result.exit_code == 1
+    assert "No snapshot found" in result.stdout
+
+
+def test_universe_show_lists_full_ranking_selected_first(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_snapshot(url, "snap-1")
+
+    result = runner.invoke(app, ["universe", "show", "--snapshot-id", "snap-1"])
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "DOGE/USDT:USDT" in result.stdout
+    assert "BELOW_RANK_CUTOFF" in result.stdout
+    # the selected symbol is listed before the excluded one
+    assert result.stdout.index(SYMBOL) < result.stdout.index("DOGE/USDT:USDT")
+
+
+def test_universe_commands_read_no_quote_volume_column(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hard constraint, checked via the schema itself: `candles` gained no
+    quote_volume column for this merge - there is nothing for a universe
+    command to have read it from."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+    columns = {col["name"] for col in inspect(engine).get_columns("candles")}
+    assert "quote_volume" not in columns
+
+
+# -- Phase 6 hard constraint: observer symbol source is unchanged -------------
+
+
+def test_observer_symbol_source_is_unaffected_by_universe_tables(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """settings.symbol_list() (TIDEMARK_SYMBOLS) must remain the only
+    symbol source every pipeline reads - a populated market_registry /
+    universe_snapshot must not change which symbols `observe run`
+    processes when no --symbols flag is given.
+    """
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+
+    # Seed universe tables for a DIFFERENT symbol only - if the pipeline
+    # read from them instead of settings.symbol_list(), that symbol (not
+    # SYMBOL) would be the one evaluated below.
+    _seed_registry_row(url, "ETH/USDT:USDT")
+    _seed_snapshot(url, "snap-1")
+
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=2)
+
+    result = runner.invoke(app, ["observe", "run"])  # no --symbols: reads TIDEMARK_SYMBOLS
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "ETH/USDT:USDT" not in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert len(store.observation_history(SYMBOL)) == 2
