@@ -23,10 +23,13 @@ from tidemark.data.models import (
     Candle,
     ContextRecord,
     JournalEntry,
+    MarketRegistry,
     Observation,
     RejectedCandle,
     Run,
     RunSymbolStat,
+    UniverseSnapshot,
+    UniverseSnapshotRow,
 )
 from tidemark.data.timeframes import TIMEFRAME_DURATIONS
 
@@ -84,6 +87,23 @@ class ObservationWriteResult:
 
     observation: Observation
     inserted: bool
+
+
+@dataclass(frozen=True)
+class UniverseSnapshotWriteResult:
+    """Outcome of writing one universe snapshot (header + rows).
+
+    Both are written in a single transaction: either the whole snapshot
+    lands or none of it does. Unlike `JournalWriteResult`/
+    `ObservationWriteResult`, a duplicate (venue, snapshot_at,
+    methodology_version) is not a silent no-op — `save_universe_snapshot`
+    raises instead, since a repeated universe-generation run is a real
+    problem to surface, not an expected replay of an already-known
+    schedule tick.
+    """
+
+    snapshot: UniverseSnapshot
+    rows: list[UniverseSnapshotRow]
 
 
 @dataclass(frozen=True)
@@ -605,4 +625,182 @@ class TidemarkStore:
             if since is not None:
                 stmt = stmt.where(Observation.evaluated_at >= since)
             stmt = stmt.order_by(Observation.evaluated_at.desc())
+            return list(session.scalars(stmt))
+
+    # -- market registry (Phase 6, Merge 1) ----------------------------------
+
+    def upsert_market_registry_row(self, row: MarketRegistry) -> MarketRegistry:
+        """Idempotent upsert keyed on `(venue, symbol)`.
+
+        Updates every mutable field on an existing row, or inserts a new
+        one — a repeated registry scan for a symbol already tracked
+        always converges on that symbol's single row, never a duplicate.
+        No generation/eligibility logic lives here (Merge 2); this only
+        stores whatever the caller already computed.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(MarketRegistry).where(
+                    MarketRegistry.venue == row.venue, MarketRegistry.symbol == row.symbol
+                )
+            ).one_or_none()
+            if existing is not None:
+                existing.contract_type = row.contract_type
+                existing.quote_currency = row.quote_currency
+                existing.first_candle_seen_at = row.first_candle_seen_at
+                existing.last_candle_seen_at = row.last_candle_seen_at
+                existing.first_seen_in_venue_list_at = row.first_seen_in_venue_list_at
+                existing.last_seen_in_venue_list_at = row.last_seen_in_venue_list_at
+                existing.status = row.status
+                existing.section1_first_usable_at = row.section1_first_usable_at
+                existing.section1_eligibility_checked_at = row.section1_eligibility_checked_at
+                session.commit()
+                session.refresh(existing)
+                return existing
+
+            new_row = MarketRegistry(
+                venue=row.venue,
+                symbol=row.symbol,
+                contract_type=row.contract_type,
+                quote_currency=row.quote_currency,
+                first_candle_seen_at=row.first_candle_seen_at,
+                last_candle_seen_at=row.last_candle_seen_at,
+                first_seen_in_venue_list_at=row.first_seen_in_venue_list_at,
+                last_seen_in_venue_list_at=row.last_seen_in_venue_list_at,
+                status=row.status,
+                section1_first_usable_at=row.section1_first_usable_at,
+                section1_eligibility_checked_at=row.section1_eligibility_checked_at,
+            )
+            session.add(new_row)
+            session.commit()
+            session.refresh(new_row)
+            return new_row
+
+    def market_registry(self, venue: str | None = None) -> list[MarketRegistry]:
+        """Fetch registry rows, optionally scoped to one venue, by symbol."""
+        with self._session_factory() as session:
+            stmt = select(MarketRegistry)
+            if venue is not None:
+                stmt = stmt.where(MarketRegistry.venue == venue)
+            stmt = stmt.order_by(MarketRegistry.symbol)
+            return list(session.scalars(stmt))
+
+    def market_registry_row(self, venue: str, symbol: str) -> MarketRegistry | None:
+        """Fetch the single registry row for one (venue, symbol), if any."""
+        with self._session_factory() as session:
+            stmt = select(MarketRegistry).where(
+                MarketRegistry.venue == venue, MarketRegistry.symbol == symbol
+            )
+            return session.scalars(stmt).first()
+
+    # -- universe snapshots (Phase 6, Merge 1) -------------------------------
+
+    def save_universe_snapshot(
+        self, snapshot: UniverseSnapshot, rows: Sequence[UniverseSnapshotRow]
+    ) -> UniverseSnapshotWriteResult:
+        """Write a snapshot header and every one of its ranked rows in a
+        single transaction — both land or neither does.
+
+        Append-only, and NOT idempotent like `save_journal_entry`/
+        `save_observation`: a duplicate `(venue, snapshot_at,
+        methodology_version)` raises `ValueError` rather than silently
+        returning the existing snapshot, since a repeated
+        universe-generation attempt for an already-generated timestamp is
+        a caller bug worth surfacing, not an expected replay. No
+        selection/eligibility logic lives here (Merge 2) — this only
+        persists whatever header and rows the caller already computed.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(UniverseSnapshot).where(
+                    UniverseSnapshot.venue == snapshot.venue,
+                    UniverseSnapshot.snapshot_at == snapshot.snapshot_at,
+                    UniverseSnapshot.methodology_version == snapshot.methodology_version,
+                )
+            ).one_or_none()
+            if existing is not None:
+                raise ValueError(
+                    "universe snapshot already exists for "
+                    f"venue={snapshot.venue!r} snapshot_at={snapshot.snapshot_at.isoformat()} "
+                    f"methodology_version={snapshot.methodology_version!r}"
+                )
+
+            new_snapshot = UniverseSnapshot(
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_at=snapshot.snapshot_at,
+                methodology_version=snapshot.methodology_version,
+                venue=snapshot.venue,
+                metric_name=snapshot.metric_name,
+                metric_window_days=snapshot.metric_window_days,
+                n_selected=snapshot.n_selected,
+                provenance=snapshot.provenance,
+                candle_hash=snapshot.candle_hash,
+                counts_by_exclusion_reason=snapshot.counts_by_exclusion_reason,
+            )
+            session.add(new_snapshot)
+
+            new_rows = [
+                UniverseSnapshotRow(
+                    snapshot_id=snapshot.snapshot_id,
+                    symbol=row.symbol,
+                    rank=row.rank,
+                    metric_value=row.metric_value,
+                    eligible=row.eligible,
+                    selected=row.selected,
+                    exclusion_reason=row.exclusion_reason,
+                )
+                for row in rows
+            ]
+            session.add_all(new_rows)
+
+            session.commit()
+            session.refresh(new_snapshot)
+            for new_row in new_rows:
+                session.refresh(new_row)
+
+            return UniverseSnapshotWriteResult(snapshot=new_snapshot, rows=new_rows)
+
+    def universe_snapshots(self, venue: str | None = None) -> list[UniverseSnapshot]:
+        """Fetch snapshot headers, optionally scoped to one venue, newest first."""
+        with self._session_factory() as session:
+            stmt = select(UniverseSnapshot)
+            if venue is not None:
+                stmt = stmt.where(UniverseSnapshot.venue == venue)
+            stmt = stmt.order_by(UniverseSnapshot.snapshot_at.desc())
+            return list(session.scalars(stmt))
+
+    def universe_snapshot_by_id(self, snapshot_id: str) -> UniverseSnapshot | None:
+        """Fetch one snapshot header by its `snapshot_id`, if any."""
+        with self._session_factory() as session:
+            stmt = select(UniverseSnapshot).where(UniverseSnapshot.snapshot_id == snapshot_id)
+            return session.scalars(stmt).first()
+
+    def latest_universe_snapshot(self, venue: str, as_of: dt.datetime) -> UniverseSnapshot | None:
+        """The most recent snapshot header for `venue` at or before `as_of`.
+
+        This is the lookup `observation_record` consumers (Merge 3) would
+        use to answer "what universe was in effect at this evaluation" —
+        Merge 1 only provides the read.
+        """
+        with self._session_factory() as session:
+            stmt = (
+                select(UniverseSnapshot)
+                .where(UniverseSnapshot.venue == venue, UniverseSnapshot.snapshot_at <= as_of)
+                .order_by(UniverseSnapshot.snapshot_at.desc())
+                .limit(1)
+            )
+            return session.scalars(stmt).first()
+
+    def universe_snapshot_rows(self, snapshot_id: str) -> list[UniverseSnapshotRow]:
+        """Every ranked row for one snapshot, ordered by rank (selected
+        symbols first, since rank 1 is the top of the methodology's
+        ranking) — every ranked symbol is returned, not only the selected
+        ones.
+        """
+        with self._session_factory() as session:
+            stmt = (
+                select(UniverseSnapshotRow)
+                .where(UniverseSnapshotRow.snapshot_id == snapshot_id)
+                .order_by(UniverseSnapshotRow.rank)
+            )
             return list(session.scalars(stmt))
