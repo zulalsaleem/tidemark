@@ -236,6 +236,40 @@ The frozen v0.1 baseline this produced is committed at
 [docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md)
 — what a future v0.2 replay is compared against.
 
+## Universe selection (Phase 6, Merge 1)
+
+A universe-selection layer is being added on top of the fixed,
+manually-configured `TIDEMARK_SYMBOLS` list, split into three separate
+tables so "not selected" can never be confused with "no data existed" —
+see [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md):
+`market_registry` (what the venue has ever contained), `universe_snapshot`
+/ `universe_snapshot_row` (what a methodology selected, every ranked
+symbol recorded, not only the winners), and the existing journal/
+observation tables (what Tidemark actually evaluated).
+
+Merge 1 (this one) is schema and read-only plumbing only — new tables,
+store methods, and CLI commands, nothing computed yet:
+
+```bash
+# Market-registry rows: what the venue has ever contained, per symbol.
+uv run tidemark universe registry
+
+# Universe snapshot headers, newest first.
+uv run tidemark universe snapshots
+
+# One snapshot's full ranking - selected symbols first, excluded symbols
+# shown too with their exclusion_reason.
+uv run tidemark universe show --snapshot-id <id>
+```
+
+All three report an empty database gracefully ("No ... found yet.")
+rather than erroring. **`TIDEMARK_SYMBOLS` / `settings.symbol_list()`
+remains the only symbol source every pipeline reads** — `tidemark run`,
+`tidemark observe run`, and `tidemark health check` are unaffected by
+this merge. Merge 2 (eligibility + the derived volume metric) and
+Merge 3 (snapshot generation and, as its own separate decision, wiring
+selection into the pipelines) follow later.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -275,6 +309,16 @@ per-session counts as separate, never-merged tables — see
 [docs/adr/0008-replay-as-a-repo-command.md](docs/adr/0008-replay-as-a-repo-command.md)
 and the committed
 [docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md).
+
+**Phase 6, Merge 1 — universe registry and snapshot schema.** Additive
+only: three new tables (`market_registry`, `universe_snapshot`,
+`universe_snapshot_row`), idempotent registry upserts, atomic
+snapshot-header-plus-rows writes, and read-only `tidemark universe
+registry/snapshots/show` CLI commands — see
+[docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md).
+No selection or eligibility computation exists yet, `Candle` gained no
+column, `data/exchange.py` is untouched, and every pipeline's symbol
+source is still `TIDEMARK_SYMBOLS` exactly as before this merge.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
