@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json as json_module
+import sys
 
 import pandas as pd
 import typer
@@ -17,11 +18,18 @@ from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
 from tidemark.context import htf, mtf
 from tidemark.core.atr import atr as compute_atr
+from tidemark.data.discover import DiscoveryOutcome, run_discovery
 from tidemark.data.exchange import ExchangeClient
-from tidemark.data.ingest import RunOutcome, run_backfill, run_update
+from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.data.universe_backfill import (
+    DEFAULT_BACKFILL_DAYS,
+    UniverseBackfillOutcome,
+    active_symbols,
+    run_universe_backfill,
+)
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
@@ -86,8 +94,9 @@ app.add_typer(health_app, name="health")
 universe_app = typer.Typer(
     name="universe",
     help=(
-        "Universe selection (Phase 6, Merge 1): read-only registry and snapshot "
-        "inspection. No selection/eligibility logic runs here yet - see "
+        "Universe selection (Phase 6): discover/backfill the venue's symbol "
+        "catalog (Merge 2A) plus read-only registry/snapshot inspection. No "
+        "selection, eligibility, or metric computation runs here yet - see "
         "docs/adr/0009-universe-selection-architecture.md."
     ),
     no_args_is_help=True,
@@ -221,6 +230,30 @@ def _parse_csv(values: list[str] | None) -> list[str] | None:
         return None
     items = [item.strip() for value in values for item in value.split(",") if item.strip()]
     return items or None
+
+
+def _encode_for_display(text: str, encoding: str) -> str:
+    """Replace any character `encoding` can't represent with a
+    substitute, rather than letting a later write crash on it.
+    """
+    return text.encode(encoding, errors="replace").decode(encoding)
+
+
+def _safe_echo(text: str) -> None:
+    """Print `text`, substituting any character the terminal's stdout
+    encoding can't represent, instead of crashing.
+
+    `TIDEMARK_SYMBOLS`-derived output is always operator-chosen ASCII, so
+    every command before Phase 6 could assume plain `typer.echo` was
+    safe. `universe discover`/`backfill`/`registry`/`show` (Merge 2A)
+    print ticker symbols straight from the live venue listing instead,
+    and a real venue can and does list non-Latin-1 tickers (e.g. several
+    CJK-named meme-coin perpetuals on binanceusdm today) - those crash a
+    plain `echo` under a legacy Windows console codepage (cp1252) that
+    can't encode them. This never touches what's stored; only display.
+    """
+    encoding = sys.stdout.encoding or "utf-8"
+    typer.echo(_encode_for_display(text, encoding))
 
 
 def _store(settings: Settings) -> TidemarkStore:
@@ -845,12 +878,88 @@ def health_heartbeat() -> None:
     raise typer.Exit(code=EXIT_CODES[report.status])
 
 
+@universe_app.command("discover")
+def universe_discover(
+    quote_currency: str = typer.Option(
+        "USDT", "--quote-currency", help="Quote currency to filter the venue listing to."
+    ),
+) -> None:
+    """Refresh `market_registry` from the venue's current symbol listing.
+
+    Lists active perpetual contracts via ccxt's unified `load_markets`
+    (a separate, additive call from candle fetching — see
+    `data/exchange.py`'s `list_perpetual_symbols` and ADR 0002).
+    Currently-listed symbols are upserted ACTIVE; previously-registered
+    symbols no longer listed are marked ABSENT_FROM_VENUE, never deleted.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    exchange = ExchangeClient(venue=settings.venue)
+
+    outcome: DiscoveryOutcome = run_discovery(store, exchange, settings.venue, quote_currency)
+
+    typer.echo(f"discover {outcome.run_id}: {outcome.status}")
+    typer.echo(f"  discovered (ACTIVE): {outcome.discovered}")
+    typer.echo(f"  marked ABSENT_FROM_VENUE: {outcome.marked_absent}")
+
+
+@universe_app.command("backfill")
+def universe_backfill(
+    days: int = typer.Option(
+        DEFAULT_BACKFILL_DAYS,
+        "--days",
+        help="Daily-candle backfill depth in days; enough for the 30-day median plus margin.",
+    ),
+) -> None:
+    """Backfill closed 1D candles for every ACTIVE `market_registry` symbol.
+
+    Reuses the existing `data backfill` ingest path unchanged (per-symbol
+    failure isolation; one symbol failing gives PARTIAL, not FAILED) for
+    exactly one timeframe (1D) — the volume metric (Merge 2B) needs
+    nothing else at this stage. Prints one line per symbol as it
+    completes, since a full venue listing can be several hundred symbols
+    and this can take a while.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    exchange = ExchangeClient(venue=settings.venue)
+
+    symbols = active_symbols(store, settings.venue)
+    if not symbols:
+        typer.echo("No ACTIVE registry symbols found. Run `tidemark universe discover` first.")
+        return
+
+    typer.echo(f"Backfilling {len(symbols)} ACTIVE symbol(s), {days} days of 1D candles...")
+
+    def _report_progress(outcome: SymbolTimeframeOutcome) -> None:
+        if outcome.error is not None:
+            _safe_echo(f"  {outcome.symbol:<16} FAILED: {outcome.error}")
+        else:
+            r = outcome.result
+            _safe_echo(
+                f"  {outcome.symbol:<16} fetched={r.fetched} inserted={r.inserted} "
+                f"duplicates={r.duplicates_skipped} rejected={r.rejected}"
+            )
+
+    outcome: UniverseBackfillOutcome = run_universe_backfill(
+        store, exchange, settings.venue, days=days, on_outcome=_report_progress
+    )
+
+    typer.echo("")
+    typer.echo(
+        f"backfill {outcome.run_outcome.run_id}: {outcome.run_outcome.status} "
+        f"({outcome.symbols_with_coverage_updated}/{outcome.symbols_attempted} "
+        "symbols got candles)"
+    )
+
+
 @universe_app.command("registry")
 def universe_registry() -> None:
-    """List `market_registry` rows for the configured venue.
+    """List `market_registry` rows for the configured venue: status,
+    candle coverage, and stored row counts.
 
-    Read-only: reports what's stored, never computes anything. Merge 2
-    is what actually populates this table.
+    Read-only: reports what's stored, never computes anything. Merge 2B
+    is what fills `section1_first_usable_at`.
     """
     settings = get_settings()
     store = _store(settings)
@@ -861,15 +970,18 @@ def universe_registry() -> None:
         return
 
     header = (
-        f"{'SYMBOL':<16} {'STATUS':<18} {'FIRST_CANDLE':<20} {'LAST_CANDLE':<20} SECTION1_USABLE"
+        f"{'SYMBOL':<16} {'STATUS':<18} {'FIRST_CANDLE':<20} "
+        f"{'LAST_CANDLE':<20} {'ROWS':<8} SECTION1_USABLE"
     )
     typer.echo(header)
     for row in rows:
+        first_candle = row.first_candle_seen_at.isoformat() if row.first_candle_seen_at else "-"
+        last_candle = row.last_candle_seen_at.isoformat() if row.last_candle_seen_at else "-"
         usable = row.section1_first_usable_at.isoformat() if row.section1_first_usable_at else "-"
-        typer.echo(
-            f"{row.symbol:<16} {row.status:<18} "
-            f"{row.first_candle_seen_at.isoformat():<20} "
-            f"{row.last_candle_seen_at.isoformat():<20} {usable}"
+        row_count = store.count_candles(settings.venue, row.symbol, "1d")
+        _safe_echo(
+            f"{row.symbol:<16} {row.status:<18} {first_candle:<20} {last_candle:<20} "
+            f"{row_count:<8} {usable}"
         )
 
 
@@ -933,7 +1045,7 @@ def universe_show(
     for row in ordered:
         metric = f"{row.metric_value:.2f}" if row.metric_value is not None else "-"
         reason = row.exclusion_reason or "-"
-        typer.echo(
+        _safe_echo(
             f"{row.rank:<6} {row.symbol:<16} {metric:<14} "
             f"{str(row.eligible):<9} {str(row.selected):<9} {reason}"
         )
