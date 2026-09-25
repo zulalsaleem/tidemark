@@ -297,6 +297,7 @@ def _snapshot(
         venue=VENUE,
         metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
         metric_window_days=30,
+        k=50,
         n_selected=2,
         provenance="FORWARD",
         candle_hash="deadbeef",

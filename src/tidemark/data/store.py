@@ -794,6 +794,66 @@ class TidemarkStore:
             session.refresh(existing)
             return existing
 
+    def record_section1_eligibility(
+        self,
+        venue: str,
+        symbol: str,
+        first_usable_at: dt.datetime | None,
+        checked_at: dt.datetime,
+    ) -> MarketRegistry | None:
+        """Update only `section1_first_usable_at`/
+        `section1_eligibility_checked_at` on an existing registry row
+        (Phase 6, Merge 2B, PART C). Only a FORWARD snapshot run ever
+        calls this — see `data/universe_snapshot.py` — so this cache
+        always reflects current, full-history knowledge, never a
+        BACKFILLED (as-of-the-past) computation. `first_usable_at=None`
+        is a valid write: it means Section 1 has not yet exited
+        INSUFFICIENT_STRUCTURE as of this check, and a later FORWARD run
+        (with more data by then) will check again rather than trusting a
+        None forever. Returns `None` if no registry row exists for
+        `(venue, symbol)`, mirroring `record_candle_coverage`.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(MarketRegistry).where(
+                    MarketRegistry.venue == venue, MarketRegistry.symbol == symbol
+                )
+            ).one_or_none()
+            if existing is None:
+                return None
+            existing.section1_first_usable_at = first_usable_at
+            existing.section1_eligibility_checked_at = checked_at
+            session.commit()
+            session.refresh(existing)
+            return existing
+
+    def count_rejected_candles(
+        self, venue: str, symbol: str, timeframe: str, as_of: dt.datetime | None = None
+    ) -> int:
+        """Count `rejected_candles` rows for one symbol/timeframe (Phase 6,
+        Merge 2B, PART C: the INVALID_OHLCV eligibility check).
+
+        `as_of`, if given, filters to rows whose own `close_time <= as_of`
+        — the candle's own market timestamp, not when the rejection was
+        recorded — so a BACKFILLED snapshot at an earlier T is never
+        affected by a rejection an ingestion run only discovered later
+        (the same look-ahead guard every other as-of computation here
+        relies on).
+        """
+        with self._session_factory() as session:
+            stmt = (
+                select(func.count())
+                .select_from(RejectedCandle)
+                .where(
+                    RejectedCandle.venue == venue,
+                    RejectedCandle.symbol == symbol,
+                    RejectedCandle.timeframe == timeframe,
+                )
+            )
+            if as_of is not None:
+                stmt = stmt.where(RejectedCandle.close_time <= as_of)
+            return session.scalar(stmt) or 0
+
     # -- universe snapshots (Phase 6, Merge 1) -------------------------------
 
     def save_universe_snapshot(
@@ -833,6 +893,7 @@ class TidemarkStore:
                 venue=snapshot.venue,
                 metric_name=snapshot.metric_name,
                 metric_window_days=snapshot.metric_window_days,
+                k=snapshot.k,
                 n_selected=snapshot.n_selected,
                 provenance=snapshot.provenance,
                 candle_hash=snapshot.candle_hash,
