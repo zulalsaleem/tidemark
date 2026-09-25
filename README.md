@@ -298,9 +298,31 @@ empty database gracefully ("No ... found yet.") rather than erroring.
 **`TIDEMARK_SYMBOLS` / `settings.symbol_list()` remains the only symbol
 source every pipeline reads** — `tidemark run`, `tidemark observe run`,
 and `tidemark health check` are unaffected by any of this, even after a
-real snapshot has been generated. Merge 3 (the daily refresh schedule
-and, as its own separate decision, wiring selection into the pipelines)
-follows later.
+real snapshot has been generated.
+
+**UNIV-08 — asset-class domain constraint.** The first real snapshot
+selected 14 of 30 symbols (47%) from outside cryptocurrency: tokenised
+equities and commodities (MSTR, TSLA-style single stocks, gold, oil...).
+A full-venue scan found 202 of 727 ACTIVE symbols (27.8%) are non-crypto.
+Tidemark's rulebook is validated for crypto market structure only, so
+`universe snapshot` now excludes any symbol whose Binance
+`underlyingType` (read from the same `load_markets()` response discovery
+already consumes — no new call) isn't `COIN`: `INDEX` (crypto-basket
+products like BTCDOM) is excluded as `NON_ELIGIBLE_INDEX`, every other
+known TradFi type as `NON_CRYPTO_UNDERLYING`, and anything the classifier
+doesn't recognize fails closed to `UNKNOWN_UNDERLYING_TYPE` rather than
+being guessed. `universe show` now displays each row's `ASSET_CLASS`.
+Classification is captured once at discovery time and never
+overwritten — a later venue-metadata change can never retroactively
+alter what an already-generated snapshot's classification meant, the
+same UNIVERSE_AS_OF_INVARIANT already applied to candle data. The
+pre-UNIV-08 snapshot (`methodology_version="universe-v1"`) is untouched,
+append-only, and kept as engineering data only; every snapshot from this
+point on is tagged `"universe-v2"`. Ranking, N, and K are unchanged —
+this is a domain eligibility correction, not a ranking change.
+
+Merge 3 (the daily refresh schedule and, as its own separate decision,
+wiring selection into the pipelines) follows later.
 
 ## Project status
 
@@ -396,6 +418,29 @@ generated. See
 [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md)'s
 Merge 2B addendum for the full design, including the rank-first order
 and the listing-status-as-of limitation.
+
+**Phase 6, UNIV-08 — asset-class domain constraint.** A live inspection
+found 202 of 727 ACTIVE registry symbols (27.8%), and 14 of the first
+snapshot's 30 selections (47%), were non-crypto — tokenised equities,
+commodities, FX, and pre-IPO synthetics that Section 1's structural
+rules have never been validated against. `data/asset_class.py` classifies
+every symbol from Binance's `underlyingType` field alone (`COIN` →
+`CRYPTO`; `INDEX` → `NON_ELIGIBLE_INDEX`; a known TradFi type →
+`NON_CRYPTO`; anything unrecognized → `UNKNOWN`, fail closed, never
+guessed) — read from the same `load_markets()` response
+`data/discover.py` already consumes, zero new API calls. Captured once at
+first discovery (`record_classification`, never-moved semantics
+mirroring `first_seen_in_venue_list_at`) and persisted on
+`market_registry`; `generate_universe_snapshot` reads only that
+persisted value, never a live call, so a later reclassification can
+never alter a past snapshot — UNIVERSE_AS_OF_INVARIANT applied to asset
+class. Carried onto `UniverseSnapshotRow` too, so every row is
+self-auditing. Ranking, N=30, and K=50 are unchanged. The pre-UNIV-08
+snapshot is untouched (append-only, `methodology_version="universe-v1"`
+forever); `data/universe_snapshot.py`'s methodology version moved to
+`"universe-v2"` so the two are trivially distinguishable. See
+[docs/adr/0009](docs/adr/0009-universe-selection-architecture.md)'s
+UNIV-08 section for the full inspection evidence and design.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.

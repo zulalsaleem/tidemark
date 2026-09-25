@@ -375,3 +375,100 @@ untouched; step 3 reuses `run_backfill` exactly as Merge 2A left it. No
 Section 1 or Section 2 rule, parameter, or threshold changed. Wiring a
 snapshot's selection into what the pipelines actually evaluate remains
 Merge 3's, as its own explicit, separately-reviewed decision.
+
+## UNIV-08: asset-class domain constraint
+
+**The problem.** The first real, post-Merge-2B snapshot selected 14 of
+its 30 symbols (47%) from outside cryptocurrency entirely: tokenised
+equities (SNDK, SPCX, SOXL, SKHYNIX, MU, KORU, SKHY, SNXX, MSTR, CRCL)
+and tokenised commodities (XAU, CL, XAG, BZ). A full-venue scan found
+this was not a fluke — **202 of the 727 ACTIVE registry symbols (27.8%)**
+carry a non-crypto underlying: 162 single equities, 15 Hong Kong
+equities, 8 Korean equities, 8 commodities, 4 pre-IPO synthetic
+contracts, 2 Chinese equities, and 1 FX pair. This is not a ranking
+defect — the metric and the rank-first order both worked exactly as
+designed. UNIV-01/UNIV-02/UNIV-07's eligibility definition simply never
+asked "is this even a cryptocurrency," and the Tidemark rulebook's 4H/1H
+structural behaviour (Section 1's swing/level/ATR mechanics) has never
+been validated against equity, commodity, or FX market structure — only
+crypto.
+
+**The classifier.** A Phase 6 asset-class inspection (2026-09-25, live
+`load_markets()` calls against binanceusdm) found that Binance's raw
+`market['info']['underlyingType']` field — already present in the exact
+`load_markets()` response `data/discover.py` consumes, no new endpoint or
+API call — reliably and deterministically separates the two groups:
+`COIN` for every crypto contract tested, including all 5 non-ASCII
+CJK-ticker meme-coin perpetuals from Merge 2A; a fixed, enumerable set of
+TradFi values (`EQUITY`, `KR_EQUITY`, `HK_EQUITY`, `CN_EQUITY`,
+`COMMODITY`, `FX`, `PREMARKET`) for every named non-crypto contract; and
+a third bucket, `INDEX` (`BTCDOM`, `ALL`), for crypto-basket products
+that are crypto-*related* but not a single underlying coin, and which
+Section 1 was never validated for either. ccxt's own unified market
+fields (`type`, `swap`, `contract`, `linear`, `settle`) carry no such
+signal at all — identical shape for both groups. `contractType`
+corroborates `underlyingType` on every symbol checked but is never
+substituted for it. Ticker text, price, volume, and `underlyingSubType`
+are never used to decide asset class.
+
+    underlyingType == "COIN"        -> asset_class CRYPTO, eligible
+    underlyingType == "INDEX"       -> NON_ELIGIBLE_INDEX, excluded
+    a known non-crypto TradFi type  -> NON_CRYPTO, excluded
+    missing or unrecognised         -> UNKNOWN, excluded (fail closed)
+
+`UNKNOWN` is reserved for metadata that could not classify a symbol at
+all — never for an instrument type the codebase understands and rejects
+(that is `NON_CRYPTO`/`NON_ELIGIBLE_INDEX`). A `underlyingType` value not
+in the known set above (a future Binance category this module was never
+told about) is `UNKNOWN`, not silently folded into `NON_CRYPTO`.
+
+**Persistence and lookahead.** Classification is captured once, at first
+discovery (`data/discover.py`, via `store.record_classification`), and
+never overwritten on a later discovery run — the same never-moved
+semantics `first_seen_in_venue_list_at` already has. This is deliberate:
+Binance's classification tags are an editorial/administrative label, not
+a structural property tied to contract creation, and the inspection found
+no evidence either way about whether they can change after listing. If
+one ever does, a snapshot generated before that change must still read
+what was true when it ran — `generate_universe_snapshot` reads only the
+*persisted* `market_registry` classification, never a live
+`load_markets()` call, so a reclassification after T can never alter a
+snapshot at T. This is UNIVERSE_AS_OF_INVARIANT applied to asset class,
+alongside candle data. `market_registry.underlying_type`/`asset_class`/
+`classification_source` (`BINANCE_MARKET_METADATA`)/`classification_as_of`/
+`classification_methodology_version` are all nullable — the 727 registry
+rows that existed before UNIV-08 shipped had none of them until the next
+discovery run backfills them, added via a manual `ALTER TABLE` against
+the real, already-populated database — the first schema change in this
+phase to land on a table that already held real data, rather than an
+empty one, since `market_registry` had accumulated 727 real rows and
+`universe_snapshot_row` 727 real rows by the time UNIV-08 landed. The
+same five fields are carried onto `UniverseSnapshotRow` so each row is
+auditable on its own without a join back to the registry.
+
+**What was explicitly not done.** The domain check does not change the
+ranking methodology, N, or K: a non-crypto symbol is still ranked by
+volume exactly as before (its `rank`/`metric_value` are still shown, for
+a complete audit trail — "not selected" must never mean "no data
+existed," the same principle ADR 0009 already established for
+`NOT_ASSESSED`), it is simply excluded immediately, ahead of every other
+check, on domain grounds. The only behavioural optimization: a symbol
+already known non-crypto from its persisted classification is skipped by
+the 4H backfill step, since it will be excluded regardless of whether
+that data is fetched — this does not change assessment-set membership,
+N, or K, only which of the already-doomed-to-exclude symbols get a
+wasted network call.
+
+**The existing (pre-UNIV-08) snapshot.** It is never rewritten, mutated,
+or repaired — snapshots are append-only, and it is a truthful record of
+what the methodology actually selected before UNIV-08 existed.
+`data/universe_snapshot.py`'s `METHODOLOGY_VERSION` constant moved from
+`"universe-v1"` to `"universe-v2"`, so the old snapshot (still tagged
+`universe-v1` forever) and every snapshot from this point on are
+trivially distinguishable in the `universe_snapshot` table. Per UNIV-06's
+own treatment of `BACKFILLED` provenance: because classification was not
+historically persisted before UNIV-08, any snapshot ever backfilled
+(`--as-of` an earlier T) from *before* this point is engineering data
+only and never valid for a performance claim — its asset-class fields
+(if computed at all, retroactively) reflect today's classification read
+backward, not what was known at that historical T.
