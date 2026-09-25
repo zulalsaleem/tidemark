@@ -573,6 +573,61 @@ def test_replay_section1_look_ahead_guard(tmp_path) -> None:
         )
 
 
+# -- replay_section1's stop_when (Phase 6, Merge 2B: eligibility early-exit) --
+
+
+def _store_with_4h(tmp_path, values: list[float]):
+    candles = [_candle_4h(BASE + dt.timedelta(hours=4 * i), v) for i, v in enumerate(values)]
+    engine = create_store_engine(f"sqlite:///{tmp_path / 'store.db'}")
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.upsert_candles(VENUE, SYMBOL, "4h", candles, dt.datetime.now(dt.UTC))
+    return {"4h": store.get_candles(VENUE, SYMBOL, "4h"), "1d": [], "1w": []}
+
+
+def test_stop_when_omitted_replays_every_candle_as_before(tmp_path) -> None:
+    by_tf = _store_with_4h(tmp_path, _VALUES_4H)
+    records = replay_report.replay_section1(by_tf, SYMBOL)
+    assert len(records) == len(_VALUES_4H)
+
+
+def test_stop_when_stops_at_the_first_matching_record(tmp_path) -> None:
+    by_tf = _store_with_4h(tmp_path, _VALUES_4H)
+
+    full = replay_report.replay_section1(by_tf, SYMBOL)
+    first_exit_index = next(i for i, r in enumerate(full) if r.state != htf.INSUFFICIENT_STRUCTURE)
+
+    early = replay_report.replay_section1(
+        by_tf, SYMBOL, stop_when=lambda r: r.state != htf.INSUFFICIENT_STRUCTURE
+    )
+
+    assert len(early) == first_exit_index + 1
+    assert early[-1].state != htf.INSUFFICIENT_STRUCTURE
+    assert _section1_fields(early[-1]) == _section1_fields(full[first_exit_index])
+
+
+def test_stop_when_that_never_matches_replays_everything(tmp_path) -> None:
+    by_tf = _store_with_4h(tmp_path, _VALUES_4H)
+
+    records = replay_report.replay_section1(by_tf, SYMBOL, stop_when=lambda r: False)
+
+    assert len(records) == len(_VALUES_4H)
+
+
+def test_stop_when_a_flat_never_exiting_series_still_replays_everything(tmp_path) -> None:
+    """A series with no swings never exits INSUFFICIENT_STRUCTURE - the
+    predicate never matches, so this must fall back to a full replay, not
+    stop early or crash."""
+    by_tf = _store_with_4h(tmp_path, [100.0] * 40)
+
+    records = replay_report.replay_section1(
+        by_tf, SYMBOL, stop_when=lambda r: r.state != htf.INSUFFICIENT_STRUCTURE
+    )
+
+    assert len(records) == 40
+    assert all(r.state == htf.INSUFFICIENT_STRUCTURE for r in records)
+
+
 # -- per-evaluation vs per-session: separate code paths, never summed --------
 
 
