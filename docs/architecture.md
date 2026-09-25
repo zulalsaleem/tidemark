@@ -117,10 +117,12 @@ ships as measurement rather than signal.
 | --- | --- |
 | `config/settings.py` | Load configuration from environment variables (via `.env` in development). No secrets in code; secret fields are `SecretStr` and never logged; no field may hold an exchange credential. |
 | `data/models.py` | SQLAlchemy ORM models: `Candle`, `RejectedCandle`, `Run`, `RunSymbolStat`, `Swing`, `Level`, `ContextRecord`, `JournalEntry`, `Observation`, `MarketRegistry`, `UniverseSnapshot`, `UniverseSnapshotRow` (Phase 6, Merge 1 — schema only, see [ADR 0009](adr/0009-universe-selection-architecture.md)). A `UTCDateTime` type keeps every stored timestamp UTC-aware despite SQLite having no native timezone type. Structural points carry `formed_at`/`confirmed_at`; emitted records carry `rule_version`. `Candle` gained no column for this merge. |
-| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, idempotent context-record upserts (keyed on asset + evaluated_at + rule_version), append-only journal writes (`UNIQUE(asset, evaluated_at, rule_version)` — a repeat is a no-op, never a second row or an update) plus the one narrow exception, `record_alert_outcome`, append-only observation writes (`UNIQUE(asset, evaluated_at, rule_version)`, same no-op-on-repeat contract), idempotent `market_registry` upserts (keyed on venue + symbol), and atomic `universe_snapshot`/`universe_snapshot_row` writes (`UNIQUE(venue, snapshot_at, methodology_version)` — unlike the journal/observation tables, a duplicate here raises rather than no-ops). No selection/eligibility logic lives here yet. |
-| `data/exchange.py` | ccxt-backed market-data client. Venue is configuration (default `binanceusdm`; also works with `bitget`, `mexc`, ... unchanged). Constructed with no credentials — `apiKey`/`secret` are asserted empty. Fetches closed candles only, with bounded-retry backoff on transient network errors. |
+| `data/store.py` | SQLite persistence: idempotent candle upserts (`UNIQUE(venue, symbol, timeframe, open_time)`), per-row sanity checks with rejection recording, gap detection, run bookkeeping, idempotent context-record upserts (keyed on asset + evaluated_at + rule_version), append-only journal writes (`UNIQUE(asset, evaluated_at, rule_version)` — a repeat is a no-op, never a second row or an update) plus the one narrow exception, `record_alert_outcome`, append-only observation writes (`UNIQUE(asset, evaluated_at, rule_version)`, same no-op-on-repeat contract), a full-row `market_registry` upsert (keyed on venue + symbol) plus two narrower Merge-2A writes that touch only their own fields — `record_market_listing` (listing fields; never clobbers candle coverage) and `record_candle_coverage` (candle-coverage fields; never clobbers listing data) — and `mark_absent_from_venue` (status only, never deletes a row), and atomic `universe_snapshot`/`universe_snapshot_row` writes (`UNIQUE(venue, snapshot_at, methodology_version)` — unlike the journal/observation tables, a duplicate here raises rather than no-ops). No selection/eligibility logic lives here yet. |
+| `data/exchange.py` | ccxt-backed market-data client. Venue is configuration (default `binanceusdm`; also works with `bitget`, `mexc`, ... unchanged). Constructed with no credentials — `apiKey`/`secret` are asserted empty. Fetches closed candles only, with bounded-retry backoff on transient network errors. `list_perpetual_symbols` (Phase 6, Merge 2A) is a second, separate read-only call — ccxt's unified `load_markets`, filtered to active/`swap`/quote-currency — added alongside candle fetching without changing it. |
 | `data/timeframes.py` | The stored timeframe set (5m, 15m, 1h, 4h, 1d, 1w) and their durations — the single source of truth shared by the exchange client, store, and CLI. |
-| `data/ingest.py` | Orchestrates exchange fetch + store upsert + run recording for `backfill`/`update`. One symbol/timeframe failing never aborts the others; run status is COMPLETED/PARTIAL/FAILED. |
+| `data/ingest.py` | Orchestrates exchange fetch + store upsert + run recording for `backfill`/`update`. One symbol/timeframe failing never aborts the others; run status is COMPLETED/PARTIAL/FAILED. `run_backfill`/`run_update` take an optional `on_outcome` progress callback (Phase 6, Merge 2A) — backward compatible, existing callers unaffected. |
+| `data/discover.py` | (Phase 6, Merge 2A, PART A) `tidemark universe discover`'s orchestrator: lists the venue's active USDT perpetuals via `ExchangeClient.list_perpetual_symbols` and syncs `market_registry` — upserts every currently-listed symbol ACTIVE, marks any previously-registered symbol no longer listed ABSENT_FROM_VENUE (never deleted). One listing call, so COMPLETED/FAILED only, never PARTIAL. |
+| `data/universe_backfill.py` | (Phase 6, Merge 2A, PART B) `tidemark universe backfill`'s orchestrator: backfills `1d` candles for every ACTIVE `market_registry` symbol via the unmodified `data/ingest.py` path, then records each symbol's actual stored candle range back onto its registry row via `record_candle_coverage`. No eligibility or metric computation. |
 | `core/atr.py` | ATR(14) on 4H via Wilder's smoothing — the distance unit used throughout Section 1. |
 | `core/swings.py` | Fractal swing detection (N=2), each swing storing `formed_at`/`confirmed_at` separately; `confirmed_swings_as_of` is the only way downstream code sees a swing. |
 | `core/levels.py` | Swing clustering into support/resistance levels/zones (0.5x ATR cluster distance, 120-candle lookback); previous day/week high & low. |
@@ -133,7 +135,7 @@ ships as measurement rather than signal.
 | `journal/observe_pipeline.py` | Orchestrates `tidemark observe run`: evaluate Section 2 -> journal every returned row, per symbol, with the same per-symbol failure isolation and run lifecycle as `journal/pipeline.py`. Takes no notifier parameter at all — there is no code path by which this could reach Telegram. |
 | `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
 | `health/checks.py` | Pure health checks reading only `data/store.py`: database reachability/schema, candle freshness, last run per command, journal activity, gap counts, Telegram config presence. Never sends anything itself — see [ADR 0006](adr/0006-health-check-design.md). |
-| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `observe run`/`list`/`stats` drive Section 2 - measurement only, no alerts; `universe registry`/`snapshots`/`show` (Phase 6, Merge 1) are read-only inspection of the new universe tables - they report an empty database gracefully rather than erroring, and take no `--symbols` flag of their own. |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` drives the full journal/alert pipeline; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `observe run`/`list`/`stats` drive Section 2 - measurement only, no alerts; `universe discover` (Phase 6, Merge 2A) refreshes `market_registry` from the venue's live listing, `universe backfill [--days]` backfills 1D candles for every ACTIVE registry symbol and prints per-symbol progress, and `universe registry`/`snapshots`/`show` are read-only inspection (`registry` now also shows candle coverage and stored row counts) - all report an empty database gracefully rather than erroring, and none takes the pipelines' `--symbols` flag. |
 
 ## Universe selection (Phase 6)
 
@@ -157,12 +159,25 @@ rationale:
 source every pipeline (`tidemark run`, `tidemark observe run`,
 `tidemark health check`) reads. This layer does not wire into that yet.
 
-The work is sequenced as three merges:
+The work is sequenced as merges:
 
-- **Merge 1 (this one)** — schema for all three new tables, read/write
-  store methods, and read-only `tidemark universe registry/snapshots/show`
-  CLI commands. No selection or eligibility logic exists yet.
-- **Merge 2** — eligibility computation (UNIV-01: Section 1 demonstrably
+- **Merge 1** — schema for all three new tables, read/write store
+  methods, and read-only `tidemark universe registry/snapshots/show` CLI
+  commands. No selection or eligibility logic exists yet.
+- **Merge 2A (this one)** — venue symbol discovery
+  (`tidemark universe discover`, `data/discover.py`) via ccxt's unified
+  `load_markets` — a second, additive, venue-agnostic call alongside
+  `fetch_closed_candles`, never a venue-specific raw endpoint. Syncs
+  `market_registry`: every currently-listed active USDT-quoted perpetual
+  is upserted ACTIVE, and any previously-registered symbol no longer
+  listed is marked ABSENT_FROM_VENUE (never deleted). Paired with daily
+  candle backfill for every ACTIVE symbol
+  (`tidemark universe backfill`, `data/universe_backfill.py`), which
+  reuses `data/ingest.py`'s existing backfill path unmodified — same
+  chunked upsert, same per-symbol failure isolation — restricted to the
+  `1d` timeframe, then records each symbol's actual candle coverage back
+  onto its registry row. Still no eligibility, metric, or ranking logic.
+- **Merge 2B** — eligibility computation (UNIV-01: Section 1 demonstrably
   exiting `INSUFFICIENT_STRUCTURE` at least once, never a calendar-history
   requirement) and the derived quote-volume metric
   (`MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D` — UNIV-02/07), populating

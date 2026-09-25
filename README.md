@@ -236,7 +236,7 @@ The frozen v0.1 baseline this produced is committed at
 [docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md)
 — what a future v0.2 replay is compared against.
 
-## Universe selection (Phase 6, Merge 1)
+## Universe selection (Phase 6)
 
 A universe-selection layer is being added on top of the fixed,
 manually-configured `TIDEMARK_SYMBOLS` list, split into three separate
@@ -247,11 +247,23 @@ see [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-se
 symbol recorded, not only the winners), and the existing journal/
 observation tables (what Tidemark actually evaluated).
 
-Merge 1 (this one) is schema and read-only plumbing only — new tables,
-store methods, and CLI commands, nothing computed yet:
+Merge 2A (this one) discovers the venue's symbol catalog and backfills
+daily candles for it — still no selection, eligibility, or metric
+computation:
 
 ```bash
-# Market-registry rows: what the venue has ever contained, per symbol.
+# Refresh market_registry from the venue's live listing: active
+# USDT-quoted perpetuals become ACTIVE, previously-registered symbols no
+# longer listed become ABSENT_FROM_VENUE (never deleted).
+uv run tidemark universe discover
+
+# Backfill 1D candles for every ACTIVE registry symbol - a separate step
+# from Section 1/2's 4H/1H/1D/1W backfill, and independent of it. Prints
+# progress per symbol; a full venue listing can be several hundred
+# symbols and take a while.
+uv run tidemark universe backfill --days 120
+
+# Market-registry rows: status, candle coverage, and stored row counts.
 uv run tidemark universe registry
 
 # Universe snapshot headers, newest first.
@@ -262,13 +274,17 @@ uv run tidemark universe snapshots
 uv run tidemark universe show --snapshot-id <id>
 ```
 
-All three report an empty database gracefully ("No ... found yet.")
-rather than erroring. **`TIDEMARK_SYMBOLS` / `settings.symbol_list()`
-remains the only symbol source every pipeline reads** — `tidemark run`,
-`tidemark observe run`, and `tidemark health check` are unaffected by
-this merge. Merge 2 (eligibility + the derived volume metric) and
-Merge 3 (snapshot generation and, as its own separate decision, wiring
-selection into the pipelines) follow later.
+Discovery uses ccxt's unified `load_markets` — a second, separate,
+venue-agnostic read-only call alongside candle fetching (never a
+venue-specific raw endpoint); backfill reuses the existing `data backfill`
+ingest path unmodified, restricted to `1d`. All read-only commands report
+an empty database gracefully ("No ... found yet.") rather than erroring.
+**`TIDEMARK_SYMBOLS` / `settings.symbol_list()` remains the only symbol
+source every pipeline reads** — `tidemark run`, `tidemark observe run`,
+and `tidemark health check` are unaffected by this merge, even though
+`market_registry` may now hold hundreds of symbols. Merge 2B (eligibility
++ the derived volume metric) and Merge 3 (snapshot generation and, as its
+own separate decision, wiring selection into the pipelines) follow later.
 
 ## Project status
 
@@ -312,13 +328,28 @@ and the committed
 
 **Phase 6, Merge 1 — universe registry and snapshot schema.** Additive
 only: three new tables (`market_registry`, `universe_snapshot`,
-`universe_snapshot_row`), idempotent registry upserts, atomic
+`universe_snapshot_row`), registry upserts, atomic
 snapshot-header-plus-rows writes, and read-only `tidemark universe
 registry/snapshots/show` CLI commands — see
 [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md).
 No selection or eligibility computation exists yet, `Candle` gained no
-column, `data/exchange.py` is untouched, and every pipeline's symbol
-source is still `TIDEMARK_SYMBOLS` exactly as before this merge.
+column, and every pipeline's symbol source is still `TIDEMARK_SYMBOLS`.
+
+**Phase 6, Merge 2A — venue discovery and daily candle backfill.**
+`tidemark universe discover` lists the venue's active USDT-quoted
+perpetuals via ccxt's unified `load_markets` (a second, venue-agnostic,
+read-only call, added alongside `data/exchange.py`'s candle fetching
+without changing it) and syncs `market_registry`, marking symbols no
+longer listed ABSENT_FROM_VENUE rather than deleting them.
+`tidemark universe backfill` then backfills `1d` candles for every ACTIVE
+symbol via the unmodified `data backfill` ingest path (same per-symbol
+failure isolation, same PARTIAL-on-partial-failure), and records what
+actually landed back onto each registry row. `market_registry`'s
+`first_candle_seen_at`/`last_candle_seen_at` became nullable (amended
+from Merge 1, before anything had ever written to the table) so a
+freshly-discovered symbol is a valid row before its first backfill.
+Still no eligibility, metric, or ranking logic, and every pipeline's
+symbol source remains exactly `TIDEMARK_SYMBOLS`.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.

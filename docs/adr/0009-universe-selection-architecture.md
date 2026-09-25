@@ -211,6 +211,50 @@ This invariant is not verified by Merge 1 (there is no generation logic
 yet to verify). It is recorded here as a gate Merge 2 and Merge 3 must
 each be checked against before Phase 6 is considered complete.
 
+## Addendum: Merge 2A — venue discovery and daily candle backfill
+
+Merge 2A populates `market_registry` for real, via two separate steps:
+
+- **Discovery** (`data/discover.py`, `ExchangeClient.list_perpetual_symbols`)
+  lists the venue's active USDT-quoted perpetual contracts through ccxt's
+  unified `load_markets` — a second, separate read-only call from
+  `fetch_closed_candles`, filtering on ccxt's own unified `type`, `quote`,
+  and `active` fields. This is exactly as venue-agnostic as candle
+  fetching already is: `load_markets` is part of ccxt's unified market
+  structure, not a venue-specific raw endpoint, so it works unchanged
+  against any ccxt venue id the same way `fetch_ohlcv` does (ADR 0002).
+  `data/exchange.py`'s candle-fetch path (`fetch_closed_candles`,
+  `_fetch_with_retry`) is untouched by this addition.
+- **Backfill** (`data/universe_backfill.py`) reuses `data/ingest.py`'s
+  existing backfill path unmodified in its fetch behavior (same chunked
+  upsert, same per-symbol/timeframe failure isolation and
+  COMPLETED/PARTIAL/FAILED status), restricted to the `1d` timeframe and
+  to symbols with registry `status = ACTIVE`. `run_backfill`/`run_update`
+  gained one optional, backward-compatible parameter (`on_outcome`, a
+  per-symbol progress callback) so a caller backfilling several hundred
+  symbols can report progress; every existing caller that omits it is
+  unaffected.
+
+This required one schema amendment to Merge 1's original definition:
+`market_registry.first_candle_seen_at`/`last_candle_seen_at` become
+nullable (were `NOT NULL`). Merge 1 shipped these as required because its
+schema assumed a registry row would always carry candle data; Merge 2A's
+two-phase discover-then-backfill design means a freshly-discovered symbol
+legitimately has a registry row before any candle has ever been fetched
+for it. This is not a migration in the sense CLAUDE.md's "no migration
+tooling" constraint is guarding against — nothing had ever written to
+`market_registry` before Merge 2A (Merge 1 shipped schema and read-only
+plumbing only), so there is no existing data to reconcile; a fresh
+`create_all` picks up the corrected nullability directly. Two new,
+narrower store methods (`record_market_listing`, `record_candle_coverage`)
+replace `upsert_market_registry_row` for these write paths specifically,
+because that method overwrites every field unconditionally and would let
+discovery clobber a prior backfill's candle coverage, or vice versa.
+
+No selection, eligibility, or metric computation exists after Merge 2A —
+`section1_first_usable_at`, `MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D`, and
+ranking are still entirely Merge 2B's, per UNIV-01 and UNIV-02/07 above.
+
 ## Consequences
 
 - Two additional append-only tables (`universe_snapshot`,
@@ -219,18 +263,23 @@ each be checked against before Phase 6 is considered complete.
   existing `init_db`/`create_all` — no migration tooling was added or is
   needed, since every new column is either on a brand-new table or is
   nullable-by-construction (`section1_first_usable_at`,
-  `section1_eligibility_checked_at`).
+  `section1_eligibility_checked_at`, and — from Merge 2A —
+  `first_candle_seen_at`/`last_candle_seen_at`).
 - `Candle` is untouched: no new column, no schema risk to the one table
-  every pipeline already depends on. `data/exchange.py` is untouched:
-  quote volume is derived at read time from stored `close`/`volume`,
-  never ingested.
+  every pipeline already depends on. `data/exchange.py`'s candle-fetch
+  path is untouched (Merge 2A only adds a second, separate
+  `list_perpetual_symbols` call alongside it); quote volume is derived
+  at read time from stored `close`/`volume`, never ingested.
 - `TIDEMARK_SYMBOLS` / `settings.symbol_list()` remain the only symbol
-  source any pipeline reads. This merge is observable only through new,
-  additive CLI commands (`tidemark universe registry/snapshots/show`);
-  `tidemark run`, `tidemark observe run`, and `tidemark health check`
-  behave identically before and after it.
-- Merge 2 (eligibility computation, `section1_first_usable_at` backfill,
-  metric computation) and Merge 3 (snapshot generation, refresh
+  source any pipeline reads. This is true after Merge 2A as well, even
+  though `market_registry` is now populated with potentially hundreds of
+  symbols via `tidemark universe discover`/`backfill` — those symbols
+  are inert to every existing pipeline until a future, explicit merge
+  wires selection in. `tidemark run`, `tidemark observe run`, and
+  `tidemark health check` behave identically before and after both
+  merges.
+- Merge 2B (eligibility computation, `section1_first_usable_at`, the
+  derived volume metric) and Merge 3 (snapshot generation, refresh
   scheduling, and — as its own explicit, separately-reviewed decision —
   wiring a snapshot's selection into what the pipelines actually
   evaluate) are each their own change, checked against
