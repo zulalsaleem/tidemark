@@ -20,21 +20,29 @@ CHANGE FROM v0.1
   New rule (v0.2): a session ends when, and only when, ANY of:
     - the WATCH direction changes (LONG_WATCH <-> SHORT_WATCH), or
     - the WATCH disappears (Section 1 no longer reports a WATCH — watch
-      becomes WAIT), or
-    - the level identity changes: the currently held major level's price
-      (of the matching role) falls OUTSIDE the ORIGINAL level's zone —
-      the same zone_low/zone_high Section 1 computed for the level this
-      session pinned at its start. No new tolerance is introduced; this
-      reuses Section 1's existing zone exactly as INTERACTION already
-      does. If no major level of the matching role holds at all anymore,
-      that also ends the session (there is nothing left to test
-      containment against).
-  A grade change alone (A <-> B) does NOT end a session. Section 2's own
-  pinned level (the one INTERACTION and Stage A/B test against) is never
-  reassigned mid-session — it stays exactly what it was at session start,
-  for the life of the session, exactly as v0.1 already did. Only the
-  session-ending test itself reads the newest Section 1 record's currently
-  held level, to check whether it still falls inside the original zone.
+      becomes WAIT).
+  A grade change alone (A <-> B) does NOT end a session. That is the only
+  variable this version changes.
+
+  DEFERRED TO v0.3 — level identity (NOT part of this version)
+  An earlier draft of this version also ended a session when the
+  currently held major level's price left the *original* pinned level's
+  zone ("level identity"). That draft was measured against the same
+  pinned snapshot this document uses and found to change a SECOND
+  variable at once: it fired 73 times, replacing the 48 grade-only
+  terminations it also removed — a net session-count INCREASE (+25), not
+  the decrease the justification predicted, and not attributable to grade
+  alone. Per section-02-v0.2-justification.md Part 5 ("this proposal
+  changes exactly one thing... if anything else changed at the same time
+  ... a difference in v0.2's numbers could not be attributed to the
+  session-boundary fix specifically"), that draft could not by itself
+  answer the grade question and is not part of this version. Level
+  identity remains open (see OPEN QUESTIONS (4)) and is deferred to a
+  future v0.3, to be tested on its own, as a single-variable change,
+  against this v0.2 baseline once it is measured. Section 2's own pinned
+  level (what INTERACTION and Stage A/B test against) is unaffected by
+  this deferral either way — it is never reassigned mid-session under any
+  version.
 
   Grade becomes data, not a session-ending switch. Every session records
   grade_at_start (the grade at the first evaluation of the session) and a
@@ -149,20 +157,15 @@ TERMINAL STATES
   HTF_CONTEXT_INVALIDATED  [CHANGED FROM v0.1 — see CHANGE FROM v0.1]
     The session ends when, and only when, ANY of:
       - the WATCH direction changes (LONG_WATCH <-> SHORT_WATCH), or
-      - the WATCH disappears (watch becomes WAIT), or
-      - the level identity changes: the currently held major level of the
-        matching role no longer falls inside the ORIGINAL level's zone
-        that this session pinned at its start (no new tolerance; reuses
-        Section 1's zone, per INTERACTION above), including the case
-        where no major level of that role holds at all anymore.
+      - the WATCH disappears (watch becomes WAIT).
     A grade change alone (A <-> B) does NOT end a session — grade is
     recorded (grade_at_start, grade_history) rather than gating
-    continuation. Section 2 is subordinate to Section 1 and never
-    continues past it — this ends the observation outright, not just the
-    current reaction. See OPEN QUESTIONS (4), now resolved by this
-    version for the grade component; the level-identity definition itself
-    remains the one judgment call flagged in section-02-v0.2-
-    justification.md, Part 2.
+    continuation. The level Section 2 pinned at session start is NOT
+    re-checked against Section 1's current holdings while the session
+    runs — level identity is deferred to v0.3 (see DEFERRED TO v0.3
+    above and OPEN QUESTIONS (4)). Section 2 is subordinate to Section 1
+    and never continues past a WATCH change — this ends the observation
+    outright, not just the current reaction.
 
   CONTINUATION_CANDIDATE_NOT_EVALUATED
     Path B (continuation — a WATCH holding without ever producing a
@@ -217,13 +220,20 @@ OPEN QUESTIONS
      tolerance, independent of Section 1's 0.25 × ATR, is open.
   4. v0.1's open question ("how long a reaction survives a Section 1
      context change") is resolved for the grade component by this
-     version: a grade change alone no longer ends a session. What
-     remains open is the level-identity definition itself — testing
-     containment against the *original* level's zone (section-02-v0.2-
-     justification.md, Part 2) is one reasonable way to decide "is this
-     still the same level", chosen because it is directly reusable from
-     Section 1 without a new tolerance, but it is a judgment call the
-     rulebook author approved for this version, not a re-statement of an
-     existing rule. A future version could revisit it (e.g. testing
-     against the *current* zone instead, or requiring an exact price
-     match) if evidence suggests it draws the line in the wrong place.
+     version: a grade change alone no longer ends a session. What remains
+     open is level identity: whether, and how, a session should end when
+     the currently held major level of the matching role stops being the
+     level Section 2 originally pinned, even though the WATCH direction
+     itself hasn't changed. A draft of this rule (testing the currently
+     held level's price against the *original* pinned zone) was measured
+     against this same pinned snapshot and found to fire 73 times where
+     v0.1's grade-only condition fired 48 — a different, larger population
+     of endings, not a like-for-like replacement, so it cannot be adopted
+     in the same version that removes grade without changing two
+     variables at once (section-02-v0.2-justification.md, Part 5). It is
+     deferred to a v0.3 proposal, to be measured on its own against this
+     v0.2 baseline, once a specific definition is proposed and approved
+     (original zone vs. current zone vs. exact price match; and what
+     counts as "the matching held level" when several majors are close
+     together, per the near-duplicate-levels question already open in
+     docs/rulebook/open-questions.md).

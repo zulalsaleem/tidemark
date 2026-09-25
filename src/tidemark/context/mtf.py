@@ -141,10 +141,10 @@ def evaluate(
     replay - `RULE_VERSION_V1` (docs/rulebook/section-02-1h-behaviour-
     v0.1.md: a session ends the moment the pinned (state, watch, grade)
     tuple stops matching) or `RULE_VERSION_V2` (section-02-1h-behaviour-
-    v0.2.md: a session ends only on a WATCH direction change, a WATCH
-    disappearing, or the held level's price leaving the *original*
-    level's zone - a grade change alone no longer ends it). Everything
-    else - reaction tiers, structure confirmation, expiry - is identical
+    v0.2.md: a session ends only on a WATCH direction change or a WATCH
+    disappearing - a grade change alone no longer ends it; that is the
+    ONE variable v0.2 changes). Everything else - reaction tiers,
+    structure confirmation, expiry, and level identity - is identical
     between the two; only `_session_ended` and the grade bookkeeping
     below differ.
 
@@ -229,23 +229,23 @@ def _session_ended(rule_version: str, session: _Session, as_of: JournalEntry) ->
     v0.2: grade is no longer part of this test (section-02-v0.2-
     justification.md, Part 2). A session ends only when the WATCH
     direction changes or disappears (`as_of.watch != session.watch`
-    covers both - `session.watch` is never WAIT), or when the currently
-    held major level of that role no longer falls inside the *original*
-    pinned level's zone. `session.level` itself is never reassigned - it
-    stays pinned to whatever was held at session start for the life of
-    the session, exactly as v0.1 already did; only this containment
-    check reads the newest as-of active_levels.
+    covers both - `session.watch` is never WAIT). This is the ONLY
+    variable changed from v0.1: grade is excluded, and nothing else is
+    added in its place. An earlier draft of this version also ended a
+    session when the currently held major level's price left the
+    original pinned zone - that "level identity" condition is a SECOND
+    variable change (measured live: it fired 73 times against 48 for the
+    grade-only condition it replaced, so removing grade and adding level
+    identity in the same version cannot isolate what grade-only removal
+    itself does). It is deferred to v0.3, to be tested on its own against
+    this same v0.2 baseline - see docs/rulebook/section-02-1h-behaviour-
+    v0.2.md's CHANGE FROM v0.1 section and section-02-v0.2-
+    justification.md.
     """
     if rule_version == RULE_VERSION_V1:
         return (as_of.state, as_of.watch, as_of.grade) != session.pin
 
-    if as_of.watch != session.watch:
-        return True
-    current_level = _pick_level(as_of.active_levels, _WATCH_ROLE[session.watch])
-    if current_level is None:
-        return True
-    zone_low, zone_high = session.level["zone_low"], session.level["zone_high"]
-    return not (zone_low <= current_level["price"] <= zone_high)
+    return as_of.watch != session.watch
 
 
 def _pick_level(active_levels: list[dict], role: str) -> dict | None:
