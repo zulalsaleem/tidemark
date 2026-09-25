@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from tidemark import __version__
 from tidemark import cli as cli_module
-from tidemark.cli import _parse_csv, app
+from tidemark.cli import _encode_for_display, _parse_csv, app
 from tidemark.context import htf, mtf
 from tidemark.data.exchange import RawCandle
 from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
@@ -169,6 +169,18 @@ def _raw_candle(open_time: dt.datetime, close: float = 100.0) -> RawCandle:
     return RawCandle(
         open_time=open_time,
         close_time=open_time + dt.timedelta(hours=4),
+        open=close,
+        high=close + 1,
+        low=close - 1,
+        close=close,
+        volume=1.0,
+    )
+
+
+def _raw_1d_candle(open_time: dt.datetime, close: float = 100.0) -> RawCandle:
+    return RawCandle(
+        open_time=open_time,
+        close_time=open_time + dt.timedelta(days=1),
         open=close,
         high=close + 1,
         low=close - 1,
@@ -1140,3 +1152,156 @@ def test_observer_symbol_source_is_unaffected_by_universe_tables(
     engine = create_store_engine(url)
     store = TidemarkStore(engine)
     assert len(store.observation_history(SYMBOL)) == 2
+
+
+def test_observer_symbol_source_unaffected_by_discovery_and_backfill_writes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same guarantee as the test above, but populated through Merge 2A's
+    actual write paths (record_market_listing/record_candle_coverage)
+    rather than a hand-built MarketRegistry row - the observer must be
+    unaffected either way.
+    """
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    now = dt.datetime.now(dt.UTC)
+    store.record_market_listing(VENUE, "ETH/USDT:USDT", "perpetual", "USDT", now)
+    store.record_candle_coverage(VENUE, "ETH/USDT:USDT", now, now)
+
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=2)
+
+    result = runner.invoke(app, ["observe", "run"])
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "ETH/USDT:USDT" not in result.stdout
+
+
+# -- universe registry: extended output (Phase 6, Merge 2A) -------------------
+
+
+def test_universe_registry_shows_row_counts_and_handles_no_candle_coverage(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Merge 2A: a freshly-discovered symbol has no candle coverage yet
+    (first_candle_seen_at/last_candle_seen_at are None) - the registry
+    command must render that as '-', not crash, and show the stored 1D
+    row count.
+    """
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    now = dt.datetime.now(dt.UTC)
+    store.record_market_listing(VENUE, SYMBOL, "perpetual", "USDT", now)
+
+    result = runner.invoke(app, ["universe", "registry"])
+
+    assert result.exit_code == 0
+    assert "ROWS" in result.stdout
+    row_line = next(line for line in result.stdout.splitlines() if SYMBOL in line)
+    symbol, status, first_candle, last_candle, rows, usable = row_line.split()
+    assert symbol == SYMBOL
+    assert status == "ACTIVE"
+    assert first_candle == "-"  # no candle coverage yet renders as '-', not a crash
+    assert last_candle == "-"
+    assert rows == "0"
+    assert usable == "-"
+
+
+def test_universe_registry_shows_candle_row_count_after_backfill(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    now = dt.datetime.now(dt.UTC)
+    store.record_market_listing(VENUE, SYMBOL, "perpetual", "USDT", now)
+    store.record_candle_coverage(VENUE, SYMBOL, now, now)
+    store.upsert_candles(VENUE, SYMBOL, "1d", [_raw_1d_candle(now)], now)
+
+    result = runner.invoke(app, ["universe", "registry"])
+
+    assert result.exit_code == 0
+    row_line = next(line for line in result.stdout.splitlines() if SYMBOL in line)
+    fields = row_line.split()
+    assert fields[4] == "1"  # ROWS
+
+
+# -- Windows console encoding: real venue symbols are not always ASCII --------
+# A live acceptance run against binanceusdm surfaced 5 real CJK-ticker
+# meme-coin perpetuals (e.g. "哈基米/USDT:USDT") that crashed `universe
+# registry` under Windows' legacy cp1252 console codepage - every command
+# before Phase 6 only ever printed operator-chosen ASCII (TIDEMARK_SYMBOLS),
+# so this never came up before `universe registry`/`backfill`/`show` started
+# printing symbols straight from the live venue listing.
+
+
+def test_encode_for_display_replaces_characters_the_encoding_cannot_represent() -> None:
+    result = _encode_for_display("哈基米/USDT:USDT", "cp1252")
+    assert result != "哈基米/USDT:USDT"  # substituted, not raised
+    # a plain-ASCII symbol round-trips unchanged
+    assert _encode_for_display("BTC/USDT:USDT", "cp1252") == "BTC/USDT:USDT"
+
+
+def test_encode_for_display_is_a_noop_under_utf8() -> None:
+    assert _encode_for_display("哈基米/USDT:USDT", "utf-8") == "哈基米/USDT:USDT"
+
+
+def test_universe_registry_does_not_crash_on_a_non_ascii_symbol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    now = dt.datetime.now(dt.UTC)
+    store.record_market_listing(VENUE, "哈基米/USDT:USDT", "perpetual", "USDT", now)
+
+    result = runner.invoke(app, ["universe", "registry"])
+
+    assert result.exit_code == 0
+
+
+def test_universe_show_does_not_crash_on_a_non_ascii_symbol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.save_universe_snapshot(
+        UniverseSnapshot(
+            snapshot_id="snap-cjk",
+            snapshot_at=dt.datetime(2026, 9, 25, tzinfo=dt.UTC),
+            methodology_version="universe-v1",
+            venue=VENUE,
+            metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+            metric_window_days=30,
+            n_selected=1,
+            provenance="FORWARD",
+            candle_hash="deadbeef",
+            counts_by_exclusion_reason={},
+        ),
+        [
+            UniverseSnapshotRow(
+                snapshot_id="snap-cjk",
+                symbol="哈基米/USDT:USDT",
+                rank=1,
+                metric_value=1.0,
+                eligible=True,
+                selected=True,
+                exclusion_reason=None,
+            )
+        ],
+    )
+
+    result = runner.invoke(app, ["universe", "show", "--snapshot-id", "snap-cjk"])
+
+    assert result.exit_code == 0
