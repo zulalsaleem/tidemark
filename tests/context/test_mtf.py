@@ -438,36 +438,30 @@ def test_v02_ends_session_when_watch_disappears() -> None:
     assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
 
 
-def test_v02_ends_session_when_held_level_moves_outside_original_zone() -> None:
-    original = _level(price=100.0)  # zone [99, 101]
-    moved_outside = _level(price=103.0)  # price 103 is outside [99, 101]
+def test_v02_does_not_end_session_when_held_level_moves_to_a_different_price() -> None:
+    # Level identity is deferred to v0.3 as its own single-variable test
+    # (see mtf._session_ended's docstring and section-02-v0.2-
+    # justification.md): v0.2 changes exactly one variable, grade, so a
+    # completely different held level - watch unchanged - does not end
+    # the session either.
+    original = _level(price=100.0)
+    moved_far = _level(price=103.0)
     entry1 = _journal_entry(BASE, htf.LONG_WATCH, original)
-    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, moved_outside)
-    candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
-
-    results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
-
-    assert results[0].state == mtf.NO_INTERACTION
-    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
-
-
-def test_v02_continues_when_held_level_moves_but_stays_inside_original_zone() -> None:
-    original = _level(price=100.0)  # zone [99, 101]
-    moved_inside = _level(price=100.5)  # a different price, still within [99, 101]
-    entry1 = _journal_entry(BASE, htf.LONG_WATCH, original)
-    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, moved_inside)
+    entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, moved_far)
     candles = _frame([_candle(0, 110, 111, 110, 110.5), _candle(2, 110, 111, 110, 110.5)])
 
     results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
 
     assert results[0].state == mtf.NO_INTERACTION
     assert results[1].state == mtf.NO_INTERACTION
-    # Section 2's own pinned level never moves mid-session - only the
-    # newest as-of active_levels are used for the containment check itself.
+    # Section 2's own pinned level never moves mid-session regardless.
     assert results[1].section_1_level_price == 100.0
 
 
-def test_v02_ends_session_when_no_level_of_that_role_holds_anymore() -> None:
+def test_v02_does_not_end_session_when_no_level_of_that_role_holds_anymore() -> None:
+    # Same deferral as above: v0.2 has no level-identity termination at
+    # all, so even a Section 1 record with no held level of the matching
+    # role doesn't end the session while watch itself is unchanged.
     level = _level()
     entry1 = _journal_entry(BASE, htf.LONG_WATCH, level)
     entry2 = _journal_entry(BASE + dt.timedelta(hours=2), htf.LONG_WATCH, _level(held=False))
@@ -475,7 +469,7 @@ def test_v02_ends_session_when_no_level_of_that_role_holds_anymore() -> None:
 
     results = mtf.evaluate(ASSET, [entry1, entry2], candles, rule_version=mtf.RULE_VERSION_V2)
 
-    assert results[1].state == mtf.HTF_CONTEXT_INVALIDATED
+    assert results[1].state == mtf.NO_INTERACTION
 
 
 def test_v02_records_grade_at_start_and_full_grade_history_across_changes() -> None:

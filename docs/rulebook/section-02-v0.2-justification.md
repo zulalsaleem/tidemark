@@ -17,8 +17,8 @@ BTC/ETH/SOL/XRP/DOGE, 2026-03-28 to 2026-09-24, 476 Section 2 sessions).
 1. THE PROBLEM
 
 Of 476 Section 2 sessions in the baseline, 366 ended in
-`HTF_CONTEXT_INVALIDATED`. Of those 366, 39 ended on a grade-only change
-— Section 1's `(state, watch)` pair was unchanged; only `grade` moved
+`HTF_CONTEXT_INVALIDATED`. Of those, 48 ended on a grade-only change —
+Section 1's `(state, watch)` pair was unchanged; only `grade` moved
 between A and B.
 
 Grade is not a measure of whether Section 2 is still watching the same
@@ -35,18 +35,28 @@ Section 2 today treats it exactly like a full context change, discarding
 whatever reaction tier or structural reference had been building and
 starting an entirely new session from the next 1H candle.
 
-39 of 476 sessions (8.2%) ended this way. That is not price action — it
+48 of 476 sessions (10.1%) ended this way. That is not price action — it
 is Section 2's session boundary reacting to a Section 1 field that was
 never meant to describe continuity at the level.
 
-(Note on the number: an earlier informal count of this same population,
-made before a gating bug in the report's own "why did this session end"
-breakdown was fixed, reported 48. That count incorrectly included
-sessions that had already resolved — a structure change or a level
-failure — before later also picking up a trailing invalidation row it
-should not have been credited to. 39 is the corrected figure, gated on
-each session's actual classified outcome, and is what the committed
-baseline reports.)
+(Note on the number: an earlier draft of this document reported 39,
+described as "gated on each session's actual classified outcome" via
+Table 2's own `group_sessions`/`_classify_session`. That figure is not
+reproducible from the replay code and should be treated as wrong. Table
+2's session grouping cannot see this event at all: `group_sessions`
+closes a session on a time gap or on a row whose own `state` is
+`HTF_CONTEXT_INVALIDATED` — it has no per-session field recording
+*which* Section 1 field changed to cause that row, so no query over
+Table 2's output can recover "grade-only" as a category. 48 is measured
+a different way — directly at `mtf.py`'s `_session_ended`, instrumented
+to record why each `True` result fired (watch direction changed, watch
+disappeared, or — for v0.1 specifically — grade changed with state and
+watch unchanged) and counted before any session grouping happens. That
+count sums exactly to the corrected baseline's 476 sessions (427 watch-
+disappeared + 1 watch-direction-changed + 48 grade-only), which is the
+same kind of direct verification this section should have used the first
+time instead of asserting a number attributed to a report code path that
+cannot produce it.)
 
 ---
 
@@ -79,6 +89,20 @@ one reasonable way to say "still the same level," but it is a choice, not
 a re-statement of a rule already written down. It needs the rulebook
 author's explicit sign-off before it is implemented, exactly like
 Section 1's RULE 1.7a tie-break needed one.
+
+**Outcome: not approved for this version.** A draft implementing this
+level-identity clause alongside the grade change was measured against
+the same pinned snapshot and instrumented at `_session_ended` directly:
+it fired 73 times, replacing the 48 grade-only terminations it also
+removed — net +25 sessions, not the decrease Part 4 predicts, and not a
+number attributable to grade removal alone (Part 5's own "isolating one
+variable" requirement applies to this document's own proposal, not only
+to hypothetical future changes). v0.2 as implemented is grade-only: the
+bullet above ("the Section 1 level identity changes") is NOT part of the
+implemented rule. Level identity is deferred to a v0.3 proposal, to be
+measured on its own against this v0.2 baseline. See docs/rulebook/
+section-02-1h-behaviour-v0.2.md's "DEFERRED TO v0.3" section and OPEN
+QUESTIONS (4).
 
 Everything else about session termination is unchanged: `mtf.py`'s own
 comparison already treats `state` and `watch` correctly (a `state` change
@@ -225,11 +249,79 @@ itself, before it means anything.
 
 ---
 
+8. RESULTS — measured against the same pinned snapshot, grade-only v0.2
+
+v0.2 was implemented grade-only (level identity deferred — see the
+"Outcome" note under Part 2) and replayed against the same 476-session
+v0.1 baseline this document is built on. Numbers below are ALL-row totals
+from both replays.
+
+| | v0.1 | v0.2 (grade-only) |
+| --- | ---: | ---: |
+| Sessions | 476 | 428 |
+| STRUCTURE_CHANGE_LONG / SHORT | 13 / 3 | 13 / 5 |
+| LEVEL_FAILURE_SUPPORT / RESISTANCE | 50 / 44 | 50 / 43 |
+| HTF_CONTEXT_INVALIDATED | 366 | 317 |
+| STILL_OPEN_AT_END_OF_DATA | 0 | 0 |
+| Median session length (1H candles) | 5.0 | 5.0 |
+| Max session length | 25 | 33 |
+| NO_STRUCTURAL_REFERENCE (Table 3 share) | 32.61% | 33.42% |
+
+**Predictions 1 and 2: confirmed.** Session count fell from 476 to 428 —
+a drop of exactly 48, matching the 48 grade-only terminations measured
+directly at `_session_ended` (Part 1's corrected count), not an
+approximate figure. Grade-only terminations are zero by construction:
+`_session_ended`'s v0.2 branch does not read `grade` at all.
+
+**Predictions 3 and 4: NOT confirmed.** Median session length is
+unchanged (5.0 → 5.0 candles) — only the tail moved (max 25 → 33).
+`NO_STRUCTURAL_REFERENCE`'s share of Table 3 evaluations got slightly
+*worse* (32.61% → 33.42%), not better. Structure changes are essentially
+flat (13 bullish / 3 bearish → 13 / 5) — no material increase in
+sessions reaching a structural reference.
+
+**The falsification condition (Part 4) was flawed.** As written, it
+tested resolved-sessions ÷ total-sessions staying "essentially the same."
+But v0.2 mechanically shrinks the denominator (fewer sessions, by
+construction, per predictions 1/2) without touching the numerator by the
+same logic — so the ratio moving is not evidence of anything. It did
+move: 110/476 = 23.11% → 111/428 = 25.93%. Judged on the correct test —
+absolute counts, not a ratio the change itself moves — resolved sessions
+went 110 → 111. That is flat. v0.2 did not improve measurement by the
+metric that matters.
+
+**Conclusion.** v0.2 is kept as a correctness fix: grade should never
+have been able to terminate an observation, since Section 1's grade field
+was never meant to describe continuity at a level (Part 1). It is not
+kept as an improvement to Section 2's measurement — session count
+dropping and the resolution *rate* rising are both mechanical
+consequences of removing 48 terminations, not evidence that Section 2 is
+now better at finding structural references or level failures. Whatever
+limits how often a reaction reaches a confirmed structural change is not
+the grade field; it lies elsewhere in Section 2 (the 12-candle reaction
+expiry, the R1/R2/R3 tier definitions, or the WATCH duration Section 1
+itself produces are candidates a future justification would need to test
+one at a time, per Part 5's own rule).
+
+**Note for future justifications.** A falsification condition must use a
+metric the change being tested does not itself mechanically move. A ratio
+whose denominator the change directly shrinks or grows is not a valid
+falsification test for that change — this document's own Part 4 violated
+its own Part 5 principle ("isolating one variable is what makes the
+predictions... falsifiable") by picking a metric coupled to the variable
+being changed. Absolute counts, not rates built from the population the
+change resizes, are the correct comparison.
+
+---
+
 APPROVAL
 
-This document requires the rulebook author's explicit approval before any
-part of it is implemented — in particular, Part 2's level-identity
-definition, which is a judgment call, not a restatement of an existing
-rule. Until approved, `context/mtf.py` continues to implement v0.1 exactly
-as locked, and Section 2's session boundary continues to end on any
-grade change, per the current rulebook.
+Grade-only termination removal is approved and implemented as
+`section-02-v0.2` (docs/rulebook/section-02-1h-behaviour-v0.2.md):
+`context/mtf.py` implements both v0.1 and v0.2 side by side, selected by
+`rule_version`, and v0.1 is unedited and still available for replay.
+
+Part 2's level-identity definition is NOT approved and NOT implemented —
+see the "Outcome" note under Part 2. It remains a judgment call, not a
+restatement of an existing rule, and needs its own single-variable
+justification document (a v0.3 proposal) before any code implements it.
