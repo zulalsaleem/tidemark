@@ -52,11 +52,19 @@ class MarketListing:
     """One symbol's entry in the venue's current market catalog, as
     filtered by `ExchangeClient.list_perpetual_symbols` (Phase 6, Merge
     2A, PART A: venue discovery).
+
+    `underlying_type` (Phase 6, UNIV-08) is Binance's raw
+    `market['info']['underlyingType']` field, read from the same
+    `load_markets()` response this method already calls - no new endpoint
+    or API call. `None` if the venue's market info doesn't carry the
+    field at all (e.g. a different ccxt venue); `data/asset_class.py`
+    treats that as UNKNOWN, never as a guessed default.
     """
 
     symbol: str
     quote_currency: str
     contract_type: str
+    underlying_type: str | None
 
 
 def build_exchange(venue: str) -> Any:
@@ -183,6 +191,7 @@ class ExchangeClient:
                     symbol=market["symbol"],
                     quote_currency=market["quote"],
                     contract_type="perpetual",
+                    underlying_type=(market.get("info") or {}).get("underlyingType"),
                 )
             )
         return listings

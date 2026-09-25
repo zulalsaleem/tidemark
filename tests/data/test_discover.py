@@ -9,6 +9,7 @@ import datetime as dt
 
 import pytest
 
+from tidemark.data.asset_class import CRYPTO, NON_CRYPTO, UNKNOWN
 from tidemark.data.discover import run_discovery
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
@@ -29,8 +30,20 @@ class FakeMarketsExchange:
         return self._markets
 
 
-def _market(symbol: str, type_: str = "swap", quote: str = "USDT", active: bool = True) -> dict:
-    return {"symbol": symbol, "type": type_, "quote": quote, "active": active}
+def _market(
+    symbol: str,
+    type_: str = "swap",
+    quote: str = "USDT",
+    active: bool = True,
+    underlying_type: str | None = "COIN",
+) -> dict:
+    return {
+        "symbol": symbol,
+        "type": type_,
+        "quote": quote,
+        "active": active,
+        "info": {"underlyingType": underlying_type} if underlying_type is not None else {},
+    }
 
 
 @pytest.fixture
@@ -161,3 +174,122 @@ def test_discovery_with_no_matching_markets_completes_with_zero(store: TidemarkS
     assert outcome.status == "COMPLETED"
     assert outcome.discovered == 0
     assert store.market_registry(VENUE) == []
+
+
+# -- asset-class classification captured at discovery time (Phase 6, UNIV-08) -
+
+
+def test_discovery_classifies_a_coin_symbol_as_crypto(store: TidemarkStore) -> None:
+    markets = {"BTC/USDT:USDT": _market("BTC/USDT:USDT", underlying_type="COIN")}
+    exchange = ExchangeClient(exchange=FakeMarketsExchange(markets))
+    now = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+
+    run_discovery(store, exchange, VENUE, now=now)
+
+    row = store.market_registry_row(VENUE, "BTC/USDT:USDT")
+    assert row is not None
+    assert row.underlying_type == "COIN"
+    assert row.asset_class == CRYPTO
+    assert row.classification_source == "BINANCE_MARKET_METADATA"
+    assert row.classification_as_of == now
+    assert row.classification_methodology_version == "asset-class-v1"
+
+
+def test_discovery_classifies_a_non_crypto_symbol(store: TidemarkStore) -> None:
+    markets = {"MSTR/USDT:USDT": _market("MSTR/USDT:USDT", underlying_type="EQUITY")}
+    exchange = ExchangeClient(exchange=FakeMarketsExchange(markets))
+
+    run_discovery(store, exchange, VENUE)
+
+    row = store.market_registry_row(VENUE, "MSTR/USDT:USDT")
+    assert row is not None
+    assert row.asset_class == NON_CRYPTO
+
+
+def test_discovery_classifies_a_symbol_with_no_underlying_type_as_unknown(
+    store: TidemarkStore,
+) -> None:
+    markets = {"WEIRD/USDT:USDT": _market("WEIRD/USDT:USDT", underlying_type=None)}
+    exchange = ExchangeClient(exchange=FakeMarketsExchange(markets))
+
+    run_discovery(store, exchange, VENUE)
+
+    row = store.market_registry_row(VENUE, "WEIRD/USDT:USDT")
+    assert row is not None
+    assert row.underlying_type is None
+    assert row.asset_class == UNKNOWN
+
+
+def test_discovery_classifies_a_non_ascii_ticker_as_crypto(store: TidemarkStore) -> None:
+    """The 5 real CJK-ticker meme-coin perpetuals found in Merge 2A all
+    carry underlyingType=COIN - discovery must not misclassify or drop
+    them because of their non-ASCII symbol."""
+    markets = {"哈基米/USDT:USDT": _market("哈基米/USDT:USDT", underlying_type="COIN")}
+    exchange = ExchangeClient(exchange=FakeMarketsExchange(markets))
+
+    run_discovery(store, exchange, VENUE)
+
+    row = store.market_registry_row(VENUE, "哈基米/USDT:USDT")
+    assert row is not None
+    assert row.asset_class == CRYPTO
+
+
+def test_classification_is_captured_once_and_never_overwritten(store: TidemarkStore) -> None:
+    """Mirrors first_seen_in_venue_list_at's never-moved semantics: a
+    later venue-metadata change must never silently rewrite what an
+    already-generated snapshot's classification meant at the time."""
+    symbol = "BTC/USDT:USDT"
+    first_run = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    second_run = first_run + dt.timedelta(days=1)
+
+    run_discovery(
+        store,
+        ExchangeClient(
+            exchange=FakeMarketsExchange({symbol: _market(symbol, underlying_type="COIN")})
+        ),
+        VENUE,
+        now=first_run,
+    )
+    # Simulate Binance reclassifying the symbol on a later discovery run.
+    run_discovery(
+        store,
+        ExchangeClient(
+            exchange=FakeMarketsExchange({symbol: _market(symbol, underlying_type="EQUITY")})
+        ),
+        VENUE,
+        now=second_run,
+    )
+
+    row = store.market_registry_row(VENUE, symbol)
+    assert row is not None
+    assert row.underlying_type == "COIN"  # unchanged
+    assert row.asset_class == CRYPTO  # unchanged
+    assert row.classification_as_of == first_run  # unchanged
+
+
+def test_a_pre_univ08_row_gets_classified_on_next_discovery(store: TidemarkStore) -> None:
+    """A registry row from before UNIV-08 existed has no classification
+    at all (record_classification was never called for it) - the next
+    discovery run must backfill it, since 'never overwritten' only
+    applies once a classification actually exists."""
+    symbol = "BTC/USDT:USDT"
+    seen_at = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    store.record_market_listing(VENUE, symbol, "perpetual", "USDT", seen_at)
+    row = store.market_registry_row(VENUE, symbol)
+    assert row is not None
+    assert row.asset_class is None  # pre-UNIV-08 state
+
+    now = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    run_discovery(
+        store,
+        ExchangeClient(
+            exchange=FakeMarketsExchange({symbol: _market(symbol, underlying_type="COIN")})
+        ),
+        VENUE,
+        now=now,
+    )
+
+    row = store.market_registry_row(VENUE, symbol)
+    assert row is not None
+    assert row.asset_class == CRYPTO
+    assert row.classification_as_of == now
