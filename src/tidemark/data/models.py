@@ -270,6 +270,19 @@ class MarketRegistry(Base):
     symbol legitimately has no candle coverage yet. This changes no data
     - nothing had ever written to this table before Merge 2A, so there is
     nothing to migrate; see docs/adr/0009-universe-selection-architecture.md.
+
+    `underlying_type`/`asset_class`/`classification_source`/
+    `classification_as_of`/`classification_methodology_version` (UNIV-08)
+    are captured once, at first discovery, and never overwritten
+    afterward - the same never-moved semantics as
+    `first_seen_in_venue_list_at`. This is deliberate: a later venue-
+    metadata reclassification must never silently rewrite what an already-
+    generated snapshot's classification meant at the time. All five are
+    nullable: the 727 real registry rows that existed before UNIV-08
+    shipped have none of them until the next discovery run backfills them
+    (added via a manual ALTER TABLE against the real, already-populated
+    database - this table had real data by the time UNIV-08 landed,
+    unlike every prior additive schema change in this phase).
     """
 
     __tablename__ = "market_registry"
@@ -289,6 +302,11 @@ class MarketRegistry(Base):
     section1_eligibility_checked_at: Mapped[dt.datetime | None] = mapped_column(
         UTCDateTime, nullable=True
     )
+    underlying_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    asset_class: Mapped[str | None] = mapped_column(String, nullable=True)
+    classification_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    classification_as_of: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    classification_methodology_version: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class UniverseSnapshot(Base):
@@ -350,6 +368,16 @@ class UniverseSnapshotRow(Base):
     failure. `eligible=False` means an assessment ran and failed one of
     the other exclusion reasons; `eligible IS NULL` (with
     `exclusion_reason = NOT_ASSESSED`) means no assessment ran at all.
+
+    `underlying_type`/`asset_class`/`classification_source`/
+    `classification_as_of`/`classification_methodology_version` (UNIV-08)
+    mirror the same fields on `MarketRegistry`, copied onto the row at
+    snapshot-generation time from the *persisted* registry value (never a
+    live `load_markets()` call - UNIVERSE_AS_OF_INVARIANT applied to
+    asset class) so each row is auditable on its own without a join back
+    to the registry. Nullable for the same reason as everywhere else in
+    this phase: the one snapshot generated before UNIV-08 existed has
+    none of them, and it is never rewritten to add them - see UNIV-08.
     """
 
     __tablename__ = "universe_snapshot_row"
@@ -367,6 +395,11 @@ class UniverseSnapshotRow(Base):
     eligible: Mapped[bool | None] = mapped_column(nullable=True)
     selected: Mapped[bool] = mapped_column(nullable=False, default=False)
     exclusion_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    underlying_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    asset_class: Mapped[str | None] = mapped_column(String, nullable=True)
+    classification_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    classification_as_of: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    classification_methodology_version: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Observation(Base):

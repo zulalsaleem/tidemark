@@ -6,6 +6,11 @@ never a venue-specific raw endpoint, never touching the candle-fetch
 path) and syncs `market_registry` against that listing. A separate,
 additive step from candle ingestion (`data/ingest.py`): discovery only
 writes to `market_registry`, never to `candles`.
+
+Also classifies each listing's asset class (Phase 6, UNIV-08) from the
+same `load_markets()` response — no second call — and persists it once,
+at this first discovery, via `record_classification`'s never-moved
+semantics. See `data/asset_class.py`.
 """
 
 from __future__ import annotations
@@ -15,6 +20,11 @@ import logging
 import uuid
 from dataclasses import dataclass
 
+from tidemark.data.asset_class import (
+    CLASSIFICATION_METHODOLOGY_VERSION,
+    CLASSIFICATION_SOURCE,
+    classify_underlying_type,
+)
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.store import TidemarkStore
 
@@ -76,6 +86,16 @@ def run_discovery(
                 contract_type=listing.contract_type,
                 quote_currency=listing.quote_currency,
                 seen_at=now,
+            )
+            classification = classify_underlying_type(listing.underlying_type)
+            store.record_classification(
+                venue=venue,
+                symbol=listing.symbol,
+                underlying_type=listing.underlying_type,
+                asset_class=classification.asset_class,
+                classification_source=CLASSIFICATION_SOURCE,
+                classification_as_of=now,
+                classification_methodology_version=CLASSIFICATION_METHODOLOGY_VERSION,
             )
             discovered += 1
 

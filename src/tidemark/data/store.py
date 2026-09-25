@@ -827,6 +827,49 @@ class TidemarkStore:
             session.refresh(existing)
             return existing
 
+    def record_classification(
+        self,
+        venue: str,
+        symbol: str,
+        underlying_type: str | None,
+        asset_class: str,
+        classification_source: str,
+        classification_as_of: dt.datetime,
+        classification_methodology_version: str,
+    ) -> MarketRegistry | None:
+        """Set classification fields once, at first discovery (Phase 6,
+        UNIV-08), mirroring `first_seen_in_venue_list_at`'s never-moved
+        semantics.
+
+        A no-op if the registry row already carries a classification
+        (`asset_class is not None`) — re-running discovery must never
+        silently reclassify a symbol whose classification was already
+        captured, which is exactly what would let a later venue-metadata
+        change quietly rewrite what an already-generated snapshot's
+        classification meant at the time. Returns `None` if no registry
+        row exists for `(venue, symbol)` — classification is layered onto
+        a listing that must already exist, mirroring
+        `record_candle_coverage`/`record_section1_eligibility`.
+        """
+        with self._session_factory() as session:
+            existing = session.scalars(
+                select(MarketRegistry).where(
+                    MarketRegistry.venue == venue, MarketRegistry.symbol == symbol
+                )
+            ).one_or_none()
+            if existing is None:
+                return None
+            if existing.asset_class is not None:
+                return existing
+            existing.underlying_type = underlying_type
+            existing.asset_class = asset_class
+            existing.classification_source = classification_source
+            existing.classification_as_of = classification_as_of
+            existing.classification_methodology_version = classification_methodology_version
+            session.commit()
+            session.refresh(existing)
+            return existing
+
     def count_rejected_candles(
         self, venue: str, symbol: str, timeframe: str, as_of: dt.datetime | None = None
     ) -> int:
@@ -910,6 +953,11 @@ class TidemarkStore:
                     eligible=row.eligible,
                     selected=row.selected,
                     exclusion_reason=row.exclusion_reason,
+                    underlying_type=row.underlying_type,
+                    asset_class=row.asset_class,
+                    classification_source=row.classification_source,
+                    classification_as_of=row.classification_as_of,
+                    classification_methodology_version=row.classification_methodology_version,
                 )
                 for row in rows
             ]
