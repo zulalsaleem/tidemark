@@ -24,6 +24,7 @@ import bisect
 import datetime as dt
 import hashlib
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -199,7 +200,9 @@ def _candles_to_frame(candles: list[Candle]) -> pd.DataFrame:
 
 
 def replay_section1(
-    candles_by_timeframe: dict[str, list[Candle]], symbol: str
+    candles_by_timeframe: dict[str, list[Candle]],
+    symbol: str,
+    stop_when: Callable[[ContextRecord], bool] | None = None,
 ) -> list[ContextRecord]:
     """Replay Section 1 at every closed 4H candle, point-in-time.
 
@@ -209,6 +212,33 @@ def replay_section1(
     truncated database, just computed as a slice instead of a second query.
     1D/1W are truncated the same way via `bisect` on their own close times.
     Nothing is written anywhere; this returns the evaluated records only.
+
+    `stop_when`, if given, is checked against each record as it's
+    produced; the replay stops (the matching record is the last one
+    returned) as soon as it returns `True`, instead of always replaying
+    every candle. Every existing caller omits it and is unaffected. This
+    exists for callers (Phase 6 Merge 2B's `data/universe_eligibility.py`)
+    that only need the *first* record matching some condition — e.g. "the
+    first time Section 1 exits INSUFFICIENT_STRUCTURE" is, in practice,
+    almost always within the first 15-20 candles once ATR(14) warms up,
+    so a caller that only needs that answer would otherwise pay to
+    replay the remaining hundreds of candles in the stored history for
+    nothing. `htf.evaluate()` (Section 1 itself) is unmodified and still
+    called exactly the same way per candle; this only changes when the
+    loop around it stops.
+
+    ATR is computed once over the full 4H series, then indexed per
+    truncation point, rather than recomputed on the growing prefix at
+    every i - Wilder's smoothing (`core/atr.py`) is already strictly
+    causal (the value at i depends only on true ranges 0..i, never on any
+    row after i), so `compute_atr(frame_4h_full).iloc[i]` and
+    `compute_atr(frame_4h_full.iloc[:i+1]).iloc[-1]` are mathematically
+    identical for every i - this is a pure O(n^2) -> O(n) performance fix
+    with no output change, not a reimplementation of the indicator.
+    Recomputing it per prefix made a full replay (and, at real scale, the
+    Phase 6 Merge 2B eligibility assessment calling this once per
+    candidate symbol) take minutes to hours instead of seconds; that
+    scale is exactly what first exposed this.
     """
     candles_4h = candles_by_timeframe["4h"]
     candles_1d = candles_by_timeframe["1d"]
@@ -221,6 +251,7 @@ def replay_section1(
     frame_1w_full = _candles_to_frame(candles_1w) if candles_1w else None
     close_1d = [c.close_time for c in candles_1d]
     close_1w = [c.close_time for c in candles_1w]
+    atr_full = compute_atr(frame_4h_full)
 
     records: list[ContextRecord] = []
     for i in range(len(candles_4h)):
@@ -237,9 +268,24 @@ def replay_section1(
             cutoff = bisect.bisect_right(close_1w, as_of)
             trunc_1w = frame_1w_full.iloc[:cutoff] if cutoff > 0 else None
 
-        atr_value = compute_atr(trunc_4h).iloc[-1]
+        # `atr()` fills pre-warmup entries with `None`; pandas keeps those
+        # as literal `None` (object dtype) when a Series is *all* `None`
+        # (a short prefix, computed the old way), but silently coerces
+        # them to `NaN` (float64) once the *same* Series also holds real
+        # float values further along - which the full-series computation
+        # above always does. `htf.evaluate` only special-cases `is None`,
+        # not `NaN`, so this must be converted back explicitly or a
+        # pre-warmup candle would wrongly get a real (NaN) ATR instead of
+        # the "not enough data yet" signal - this is what
+        # `tests/replay/test_report.py::test_replay_section1_look_ahead_guard`
+        # catches.
+        atr_value = atr_full.iloc[i]
+        if pd.isna(atr_value):
+            atr_value = None
         record = htf.evaluate(symbol, trunc_4h, atr_value, candles_1d=trunc_1d, candles_1w=trunc_1w)
         records.append(record)
+        if stop_when is not None and stop_when(record):
+            break
 
     return records
 
