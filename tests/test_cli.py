@@ -11,6 +11,7 @@ from tidemark import __version__
 from tidemark import cli as cli_module
 from tidemark.cli import _encode_for_display, _parse_csv, app
 from tidemark.context import htf, mtf
+from tidemark.data import asset_class as asset_class_module
 from tidemark.data.exchange import RawCandle
 from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
@@ -1141,7 +1142,17 @@ def _seed_eligible_symbol(url: str, symbol: str, as_of: dt.datetime) -> None:
     engine = create_store_engine(url)
     init_db(engine)
     store = TidemarkStore(engine)
-    store.record_market_listing(VENUE, symbol, "perpetual", "USDT", as_of - dt.timedelta(days=200))
+    seen_at = as_of - dt.timedelta(days=200)
+    store.record_market_listing(VENUE, symbol, "perpetual", "USDT", seen_at)
+    store.record_classification(
+        VENUE,
+        symbol,
+        "COIN",
+        asset_class_module.CRYPTO,
+        asset_class_module.CLASSIFICATION_SOURCE,
+        seen_at,
+        asset_class_module.CLASSIFICATION_METHODOLOGY_VERSION,
+    )
     daily = [_raw_1d_candle(as_of - dt.timedelta(days=40 - i), close=100.0) for i in range(40)]
     store.upsert_candles(VENUE, symbol, "1d", daily, as_of)
     start = as_of - dt.timedelta(hours=4 * len(_ELIGIBLE_4H_VALUES))
@@ -1343,6 +1354,40 @@ def test_observer_symbol_source_unaffected_by_discovery_and_backfill_writes(
     assert result.exit_code == 0
     assert SYMBOL in result.stdout
     assert "ETH/USDT:USDT" not in result.stdout
+
+
+def test_observer_symbol_source_unaffected_by_asset_class_classification(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNIV-08 regression check: classifying registry symbols (some of
+    them NON_CRYPTO) must not change which symbols `observe run`
+    processes - it still reads only settings.symbol_list()."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    now = dt.datetime.now(dt.UTC)
+    store.record_market_listing(VENUE, "MSTR/USDT:USDT", "perpetual", "USDT", now)
+    store.record_classification(
+        VENUE,
+        "MSTR/USDT:USDT",
+        "EQUITY",
+        asset_class_module.NON_CRYPTO,
+        asset_class_module.CLASSIFICATION_SOURCE,
+        now,
+        asset_class_module.CLASSIFICATION_METHODOLOGY_VERSION,
+    )
+
+    _seed_section1_watch(url, SYMBOL, START)
+    _seed_1h_candles(url, SYMBOL, n=2)
+
+    result = runner.invoke(app, ["observe", "run"])
+
+    assert result.exit_code == 0
+    assert SYMBOL in result.stdout
+    assert "MSTR/USDT:USDT" not in result.stdout
 
 
 # -- universe registry: extended output (Phase 6, Merge 2A) -------------------

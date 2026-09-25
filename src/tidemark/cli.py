@@ -18,6 +18,11 @@ from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
 from tidemark.context import htf, mtf
 from tidemark.core.atr import atr as compute_atr
+from tidemark.data.asset_class import (
+    NON_CRYPTO_UNDERLYING,
+    NON_ELIGIBLE_INDEX,
+    UNKNOWN_UNDERLYING_TYPE,
+)
 from tidemark.data.discover import DiscoveryOutcome, run_discovery
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
@@ -30,6 +35,7 @@ from tidemark.data.universe_backfill import (
     active_symbols,
     run_universe_backfill,
 )
+from tidemark.data.universe_eligibility import INSUFFICIENT_VOLUME_HISTORY, NOT_ASSESSED
 from tidemark.data.universe_snapshot import generate_universe_snapshot
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
@@ -1039,7 +1045,7 @@ def universe_show(
 
     ordered = sorted(rows, key=lambda r: (not r.selected, r.rank))
     header = (
-        f"{'RANK':<6} {'SYMBOL':<16} {'METRIC_VALUE':<14} "
+        f"{'RANK':<6} {'SYMBOL':<16} {'METRIC_VALUE':<14} {'ASSET_CLASS':<18} "
         f"{'ELIGIBLE':<9} {'SELECTED':<9} EXCLUSION_REASON"
     )
     typer.echo(header)
@@ -1047,8 +1053,9 @@ def universe_show(
         metric = f"{row.metric_value:.2f}" if row.metric_value is not None else "-"
         reason = row.exclusion_reason or "-"
         eligible = "-" if row.eligible is None else str(row.eligible)
+        asset_class = row.asset_class or "-"
         _safe_echo(
-            f"{row.rank:<6} {row.symbol:<16} {metric:<14} "
+            f"{row.rank:<6} {row.symbol:<16} {metric:<14} {asset_class:<18} "
             f"{eligible:<9} {str(row.selected):<9} {reason}"
         )
 
@@ -1138,17 +1145,29 @@ def universe_coverage(
 
     rows = store.universe_snapshot_rows(snapshot.snapshot_id)
     # "Assessed" means actually reached Section 1 eligibility (PART B step
-    # 4: rank <= K), not merely `eligible is not None` - a symbol excluded
-    # earlier for INSUFFICIENT_VOLUME_HISTORY also carries a non-NULL
-    # `eligible=False` regardless of its rank, so that alone would
-    # over-count rows this snapshot never actually assessed.
-    assessed = sum(1 for r in rows if r.rank <= snapshot.k)
+    # 4). Not `rank <= K`: UNIV-08 scopes the assessment set to CRYPTO
+    # candidates only, so a crypto symbol's raw rank can exceed K (pushed
+    # down by non-crypto symbols ranked above it) while still having been
+    # assessed, and a non-crypto symbol's raw rank can be <= K without
+    # ever reaching this step. Not `eligible is not None` either - a
+    # symbol excluded pre-assessment (NOT_ASSESSED, INSUFFICIENT_VOLUME_
+    # HISTORY, or any UNIV-08 domain reason) also carries a non-NULL
+    # `eligible=False` for the domain ones. "Assessed" is precisely: not
+    # excluded for one of those five pre-assessment reasons.
+    _not_assessed_reasons = {
+        NOT_ASSESSED,
+        INSUFFICIENT_VOLUME_HISTORY,
+        NON_CRYPTO_UNDERLYING,
+        NON_ELIGIBLE_INDEX,
+        UNKNOWN_UNDERLYING_TYPE,
+    }
+    assessed = sum(1 for r in rows if r.exclusion_reason not in _not_assessed_reasons)
     typer.echo(
         f"Snapshot {snapshot.snapshot_id} ({snapshot.provenance}, "
         f"at={snapshot.snapshot_at.isoformat()}):"
     )
     typer.echo(f"  ranked:               {len(rows)}")
-    typer.echo(f"  assessed (rank<=K={snapshot.k}): {assessed}")
+    typer.echo(f"  assessed (top-{snapshot.k} crypto candidates): {assessed}")
     typer.echo(f"  eligible:             {sum(1 for r in rows if r.eligible is True)}")
     typer.echo(f"  selected:             {sum(1 for r in rows if r.selected)}")
     typer.echo("")
