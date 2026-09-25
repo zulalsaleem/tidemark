@@ -247,6 +247,106 @@ class JournalEntry(Base):
     alert_reason: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
+class MarketRegistry(Base):
+    """What the venue has ever contained for one (venue, symbol) pair.
+
+    A factual record, not a decision: `status` tracks whether the venue
+    still lists the symbol and whether candle data still exists for it,
+    independent of whether any universe methodology has ever selected it
+    (see `UniverseSnapshot`/`UniverseSnapshotRow` and
+    docs/adr/0009-universe-selection-architecture.md). `status` is one of
+    ACTIVE, STALE, or ABSENT_FROM_VENUE.
+
+    `section1_first_usable_at` and `section1_eligibility_checked_at` are
+    nullable here and filled in by Merge 2 (UNIV-01: eligibility is "has
+    Section 1 demonstrably exited INSUFFICIENT_STRUCTURE at least once,"
+    never a calendar-history requirement) - Merge 1 only adds the columns.
+    """
+
+    __tablename__ = "market_registry"
+    __table_args__ = (UniqueConstraint("venue", "symbol", name="uq_market_registry_venue_symbol"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    contract_type: Mapped[str] = mapped_column(String, nullable=False)
+    quote_currency: Mapped[str] = mapped_column(String, nullable=False)
+    first_candle_seen_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    last_candle_seen_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    first_seen_in_venue_list_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    last_seen_in_venue_list_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    section1_first_usable_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    section1_eligibility_checked_at: Mapped[dt.datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
+
+
+class UniverseSnapshot(Base):
+    """One universe-selection run's header (PART B, Phase 6 Merge 1).
+
+    Append-only: a snapshot is never updated after creation. `provenance`
+    is FORWARD (generated at the time it claims to represent) or
+    BACKFILLED (reconstructed retroactively - see UNIV-06, never valid
+    for performance claims because the venue's current symbol list
+    contains only survivors). `candle_hash` fixes exactly which candle
+    data produced this snapshot, so a later re-derivation can be checked
+    against it. `counts_by_exclusion_reason` is a JSON summary; the full
+    per-symbol detail lives in `UniverseSnapshotRow`.
+
+    Merge 1 adds the schema only - nothing in this codebase yet writes a
+    snapshot outside of tests exercising the store methods.
+    """
+
+    __tablename__ = "universe_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "snapshot_at",
+            "methodology_version",
+            name="uq_universe_snapshot_venue_at_methodology",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    snapshot_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
+    methodology_version: Mapped[str] = mapped_column(String, nullable=False)
+    venue: Mapped[str] = mapped_column(String, nullable=False)
+    metric_name: Mapped[str] = mapped_column(String, nullable=False)
+    metric_window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    n_selected: Mapped[int] = mapped_column(Integer, nullable=False)
+    provenance: Mapped[str] = mapped_column(String, nullable=False)
+    candle_hash: Mapped[str] = mapped_column(String, nullable=False)
+    counts_by_exclusion_reason: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class UniverseSnapshotRow(Base):
+    """One ranked symbol within one `UniverseSnapshot` (PART B).
+
+    Every ranked symbol is stored, not only the selected N - so an
+    excluded symbol's rank and `exclusion_reason` stay recoverable, not
+    just the survivors (docs/adr/0009, "not selected" must never mean
+    "no data existed"). Append-only, like its parent snapshot.
+    """
+
+    __tablename__ = "universe_snapshot_row"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "symbol", name="uq_universe_snapshot_row_snapshot_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        String, ForeignKey("universe_snapshot.snapshot_id"), nullable=False, index=True
+    )
+    symbol: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    metric_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    eligible: Mapped[bool] = mapped_column(nullable=False, default=False)
+    selected: Mapped[bool] = mapped_column(nullable=False, default=False)
+    exclusion_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 class Observation(Base):
     """An append-only Section 2 (1H) observation row — see
     `docs/rulebook/section-02-1h-behaviour-v0.1.md`, PROVISIONAL /
