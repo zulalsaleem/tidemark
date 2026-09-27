@@ -101,7 +101,8 @@ Requires Python 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                        # install dependencies
-cp .env.example .env           # fill in Telegram config (market data needs no credentials)
+cp .env.example .env           # fill in Telegram config (market data needs no credentials);
+                                # add TIDEMARK_COINALYZE_API_KEY only if you want `tidemark intel`
 uv run tidemark --help         # verify the CLI is wired up
 uv run pytest                  # run the test suite
 uv run ruff check .            # lint
@@ -376,6 +377,35 @@ append-only, and kept as engineering data only; every snapshot from this
 point on is tagged `"universe-v2"`. Ranking, N, and K are unchanged —
 this is a domain eligibility correction, not a ranking change.
 
+## Live market intelligence (Coinalyze)
+
+A live, read-only derivatives-data layer — strictly separate from the
+research engine above (Section 1/2, the journal, universe selection).
+It never influences a rulebook evaluation, and it never writes to
+`observations`, `journal_entries`, `context_records`, or `candles`. See
+[docs/adr/0011-market-intelligence-layer.md](docs/adr/0011-market-intelligence-layer.md).
+
+```bash
+# Requires TIDEMARK_COINALYZE_API_KEY in .env (free key: see .env.example).
+uv run tidemark intel market --symbol BTC/USDT:USDT
+uv run tidemark intel market --symbol BTC/USDT:USDT --json
+```
+
+Prints one symbol's open interest, OI change, current and predicted
+funding rate, long/short ratio, liquidations, futures volume, and
+buy/sell volume — each with its own unit and the exact closed period it
+covers (or its own live-update timestamp for a point-in-time reading).
+Coinalyze does not truncate to closed periods on its own, so this always
+computes and clamps to the latest fully-elapsed window itself, never the
+in-progress one. A symbol Coinalyze doesn't list prints `MARKET_NOT_FOUND`
+with a non-zero exit; a symbol that's listed but has no data flowing for
+a given metric prints `NO_DATA` for that metric only — never a fabricated
+zero. Every figure is Binance-only (ADR 0002's canonical venue) and, where
+Coinalyze supports it, USD-converted via Coinalyze's own undocumented
+methodology. Raw data only: no interpretation, no bias, no trading
+recommendation, and BTC dominance is not available from this source at
+all (see the ADR for what sourcing it would require).
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -530,6 +560,23 @@ sufficiency verdict per question, and breaks every count out by week
 and month alongside a Section 1 regime proxy — see
 [docs/adr/0010-evidence-command.md](docs/adr/0010-evidence-command.md).
 No Section 1/2 rule, parameter, or threshold changed.
+
+**Phase 8, Merge 1 — the market intelligence layer.** A read-only
+inspection of Coinalyze's derivatives API (auth, rate limits, symbol
+mapping including a CJK-ticker meme coin, closed-period behavior, and
+what's genuinely unavailable — BTC dominance) preceded a new, fully
+isolated package, `market_intel/`, and one new command,
+`tidemark intel market [--json]`. Enforced by a static-analysis test,
+not discipline: it never imports the research engine, is never imported
+by it, and never writes to any research table. Computes its own
+closed-period boundary rather than trusting Coinalyze's `to=now` (which
+returns an in-progress bucket), and distinguishes a symbol Coinalyze
+doesn't list (`MARKET_NOT_FOUND`) from one that's listed but has no data
+flowing for a metric (`NO_DATA`) — never a fabricated zero. Raw data
+only: no Telegram, no scheduling, no bias, no trading recommendation.
+`docs/rulebook/derivatives-context-v0.1.md` records six price/OI/funding
+interpretations as a `PROVISIONAL`, unwired document only — see
+[docs/adr/0011-market-intelligence-layer.md](docs/adr/0011-market-intelligence-layer.md).
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
