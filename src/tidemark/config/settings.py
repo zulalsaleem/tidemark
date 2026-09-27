@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     # market data below; never used for price structure.
     coinalyze_api_key: SecretStr | None = None
 
+    # The /coin Telegram bot (Merge 2, see docs/adr/0011). Reuses
+    # telegram_bot_token above; authorization is by this numeric chat id
+    # ONLY - never username or display name. Any other chat is silently
+    # ignored, never replied to. The offset file is a flat JSON file with
+    # no relationship to tidemark.db - see market_intel/bot_state.py.
+    telegram_allowed_chat_id: int | None = None
+    telegram_bot_offset_file: str = "tidemark_telegram_offset.json"
+
     # Market data (read-only, public endpoints only; ccxt venue id, e.g.
     # "binanceusdm", "bitget", "mexc" — see docs/adr/0002)
     venue: str = "binanceusdm"

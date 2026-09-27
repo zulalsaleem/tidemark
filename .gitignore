@@ -25,6 +25,10 @@ env/
 *.sqlite
 *.sqlite3
 
+# /coin Telegram bot offset state (not a database - see
+# market_intel/bot_state.py)
+tidemark_telegram_offset.json*
+
 # Testing / coverage
 .pytest_cache/
 .ruff_cache/
