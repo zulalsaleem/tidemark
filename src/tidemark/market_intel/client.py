@@ -227,7 +227,9 @@ class CoinalyzeClient:
             call_units=1,
         )
 
-    def funding_rate_history(self, symbol: str, interval: str, from_ts: int, to_ts: int) -> list[dict]:
+    def funding_rate_history(
+        self, symbol: str, interval: str, from_ts: int, to_ts: int
+    ) -> list[dict]:
         """Closed-period funding rate candles - distinct from `funding_rate`
         (the live point-in-time reading). Used by the Merge 3 derivatives-
         context classifier, which needs the CLOSED 1H funding sign and a
