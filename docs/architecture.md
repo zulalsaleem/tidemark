@@ -102,7 +102,7 @@
                  |  data.exchange/data.store -   |
                  |  ONE exception (Merge 3):     |
                  |  context_read.py may read     |
-                 |  context_records read-only    |
+                 |  journal_entries read-only    |
                  |  -> `tidemark intel market`   |
                  |  -> `tidemark intel bot`      |
                  |     (own Telegram client,     |
@@ -177,7 +177,7 @@ discipline.
 | `market_intel/bot.py` | (Phase 8, Merge 2) `run_once`/`run_forever`: long-polling loop, chat-ID authorization (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID` only — unauthorized chats are silently ignored and only logged, chat id and timestamp, never message text), `/coin`/`/help`/`/start` command dispatch, `normalize_coin_input` (accepts `SOL`/`$SOL`/`sol`/`SOL/USDT:USDT`), a startup-backlog discard (a few minutes), and exponential backoff on a Telegram outage (immediate raise on an unrecoverable 401/403). Reuses `CoinalyzeClient.calls_in_last_minute` to throttle a `/coin` burst before it can exhaust the documented 40/minute budget. |
 | `market_intel/derivatives_classifier.py` | (Phase 8, Merge 3) `classify`: D1-D6/`NO_MATCH` against `docs/rulebook/derivatives-context-v0.1.md` - every threshold copied verbatim from that document, none defined here. Price/OI use strict-inequality thresholds (boundary values are FLAT); funding classifies by sign for D1-D4 and by trend (vs. the previous closed reading) for D5-D6. A funding reading of exactly 0.0, an UNCHANGED trend, any missing/non-`OK` input, or any of the other twelve of 18 possible combinations all yield `NO_MATCH` with a reason - pure function, no I/O. |
 | `market_intel/briefing_data.py` | (Phase 8, Merge 3) `fetch_classifier_inputs`: fetches BTC's closed-1H price % change, OI % change, and current+previous closed funding - independent from `service.py`'s `MarketIntelSnapshot`, a different, broader shape for `/coin`/`intel market` that was never meant to carry a price reading. |
-| `market_intel/context_read.py` | (Phase 8, Merge 3) The one narrow, explicitly-permitted exception to the isolation boundary: `read_latest_context_record` reads BTC's stored Section 1 result for the briefing's structure section. Imports only `tidemark.data.models.ContextRecord` - never `tidemark.context`, never `tidemark.data.store` (whose `TidemarkStore` transitively imports `tidemark.data.exchange`). Builds its own engine directly from a database URL, never calls `init_db`, and never writes anything. `is_stale` applies an 8h operational grace window (`CONTEXT_RECORD_STALE_AFTER`) `market_intel` owns for its own display, not a Section 1 parameter. |
+| `market_intel/context_read.py` | (Phase 8, Merge 3) The one narrow, explicitly-permitted exception to the isolation boundary: `read_latest_journal_entry` reads BTC's stored Section 1 result (a `JournalEntry` - the table `tidemark run` actually writes; an earlier version read `ContextRecord`/`context_records`, a table nothing in production writes to, until a live-deployment audit caught it - see ADR 0011) for the briefing's structure section. Imports only `tidemark.data.models.JournalEntry` - never `tidemark.context`, never `tidemark.data.store` (whose `TidemarkStore` transitively imports `tidemark.data.exchange`). Builds its own engine directly from a database URL, never calls `init_db`, and never writes anything. `is_stale` applies an 8h operational grace window (`SECTION1_STALE_AFTER`) `market_intel` owns for its own display, not a Section 1 parameter. |
 | `market_intel/evaluation_store.py` | (Phase 8, Merge 3) `market_intel`'s own table, `market_intel_evaluations`, in its own declarative `MarketIntelBase` - never `tidemark.data.models.Base`, never `journal_entries`/`observations`/`context_records`. Idempotent per `(asset, evaluated_at)` like `JournalEntry`, with the same narrow update exception (`sent`/`send_reason` only). Separate lookups for "the immediately prior evaluation" and "the last SENT evaluation" back the two different alerting comparisons `briefing.py` needs. |
 | `market_intel/briefing.py` | (Phase 8, Merge 3) `evaluate_briefing`: fetches the classifier's inputs, classifies, reads BTC's structure via `context_read.py`, decides whether to send (a classification change vs. the immediately prior evaluation, or a structural change vs. the last SENT one - `NO_MATCH` never sends), renders the message, and records every evaluation - sent or not. `mark_sent` updates an already-recorded evaluation's `sent`/`send_reason` after an actual Telegram delivery. |
 | `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
@@ -325,7 +325,11 @@ recomputing it. See the ADR's Merge 3 addendum for the full reasoning.
   commit before any classifier code; `derivatives_classifier.py` reads
   them and defines none of its own. The one narrow, explicitly-permitted
   exception to the isolation boundary (`context_read.py`, read-only
-  `context_records`) lets the briefing show BTC's stored Section 1
+  `journal_entries` - the table `tidemark run` actually writes Section 1
+  results to; corrected from an earlier `context_records` read after a
+  live-deployment audit found that table always empty, since only the
+  standalone `context evaluate` command ever writes it - see ADR 0011)
+  lets the briefing show BTC's stored Section 1
   structure without ever recomputing it. Alerts only on a real
   classification change (vs. the immediately prior evaluation) or a
   meaningful structural change (vs. the last SENT briefing) — `NO_MATCH`
