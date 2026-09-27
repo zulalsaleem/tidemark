@@ -190,3 +190,79 @@ def render_snapshot(snapshot: MarketIntelSnapshot) -> str:
 
     body = "\n\n".join([oi_group, funding_group, positioning_group, liquidations_and_volume_group])
     return f"{snapshot.symbol} ({snapshot.coinalyze_symbol})\n\n{body}\n\n{FOOTER}"
+
+
+# -- hourly BTC briefing (Merge 3) -------------------------------------------
+#
+# `structure`/`classification` are duck-typed here deliberately (see
+# `briefing.StructureSnapshot`/`derivatives_classifier.ClassificationResult`)
+# rather than imported for a type hint - `briefing.py` imports
+# `render_briefing` from this module, so importing its dataclass back
+# would be circular. Same "reads objects in, plain text out" contract as
+# the rest of this file.
+
+BRIEFING_FOOTER = (
+    "Sources: Tidemark Section 1 (BTC structure) and Coinalyze (Binance "
+    "USDT-M perpetuals, derivatives context). Market info only — not "
+    "a trade signal."
+)
+
+
+def _fmt_structure_section(structure, reference: dt.datetime) -> str:
+    if not structure.available:
+        reason = (
+            "stored Section 1 record is stale"
+            if structure.stale
+            else "no stored Section 1 record for BTC"
+        )
+        return f"UNAVAILABLE ({reason})"
+
+    grade_part = f", grade {structure.grade}" if structure.grade else ""
+    return (
+        f"State: {structure.state} / Watch: {structure.watch}{grade_part}\n"
+        f"Rule version: {structure.rule_version}\n"
+        f"4H candle: {_fmt_instant(structure.evaluated_at, reference)}"
+    )
+
+
+def _fmt_classifier_input_line(name: str, inp, reference: dt.datetime) -> str:
+    if inp.status != OK:
+        return f"{name}: UNAVAILABLE ({inp.status}: {inp.reason})"
+    value = inp.change_pct if hasattr(inp, "change_pct") else inp.value
+    return (
+        f"{name}: {_fmt_pct(value)} "
+        f"(period {_fmt_range(inp.period_start, inp.period_close, reference)})"
+    )
+
+
+def render_briefing(structure, classification, generated_at: dt.datetime) -> str:
+    """Everything the hourly BTC briefing sends: two independent
+    sections - stored Section 1 structure, then the D1-D6/NO_MATCH
+    derivatives classification and the inputs that produced it. No
+    trade direction, no bias line - `classification.interpretation` is
+    the rulebook's own verbatim text (or nothing at all for NO_MATCH,
+    which states only its reason).
+    """
+    lines = ["BTC STRUCTURE", "", _fmt_structure_section(structure, generated_at)]
+
+    lines.append("")
+    lines.append("DERIVATIVES CONTEXT")
+    lines.append("")
+    if classification.result == "NO_MATCH":
+        lines.append(f"NO_MATCH ({classification.reason})")
+    else:
+        lines.append(f"{classification.result}: {classification.interpretation}")
+
+    lines.append("")
+    lines.append(_fmt_classifier_input_line("Price", classification.price, generated_at))
+    lines.append(
+        _fmt_classifier_input_line("Open interest", classification.open_interest, generated_at)
+    )
+    lines.append(_fmt_classifier_input_line("Funding", classification.funding, generated_at))
+
+    lines.append("")
+    lines.append(f"rulebook: {classification.rulebook_version}")
+
+    lines.append("")
+    lines.append(BRIEFING_FOOTER)
+    return "\n".join(lines)
