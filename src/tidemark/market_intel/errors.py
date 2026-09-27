@@ -74,3 +74,36 @@ class RateLimitedError(CoinalyzeError):
         self.attempts = attempts
         self.last_retry_after = last_retry_after
         super().__init__(f"rate limited after {attempts} attempt(s)")
+
+
+class TelegramError(Exception):
+    """Base class for the /coin bot's own Telegram-client errors.
+
+    Deliberately its own hierarchy, not shared with `notify.telegram`'s
+    `TelegramSendError` - see `telegram_client.py` for why this bot never
+    imports `notify.telegram` at all.
+    """
+
+
+class MissingBotTokenError(TelegramError):
+    """`TIDEMARK_TELEGRAM_BOT_TOKEN` is unset or empty."""
+
+    def __init__(self) -> None:
+        super().__init__("TIDEMARK_TELEGRAM_BOT_TOKEN is not set")
+
+
+class TelegramConnectionError(TelegramError):
+    """A getUpdates/sendMessage request never reached Telegram at all."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+class TelegramHttpError(TelegramError):
+    """Telegram answered with a non-2xx HTTP status."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
