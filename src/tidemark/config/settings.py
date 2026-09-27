@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Default backfill depth in days.
     backfill_days: int = 180
 
+    # Phase 6, Merge 3: how old the latest universe snapshot may be
+    # before `tidemark run`/`tidemark observe run` stop trusting it and
+    # fall back to TIDEMARK_SYMBOLS instead (see data/symbol_source.py).
+    universe_staleness_hours: int = 48
+
     # Storage
     database_url: str = "sqlite:///tidemark.db"
 

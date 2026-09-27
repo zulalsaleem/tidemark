@@ -297,12 +297,26 @@ class TidemarkStore:
 
     # -- runs ---------------------------------------------------------------
 
-    def start_run(self, run_id: str, command: str, started_at: dt.datetime) -> None:
+    def start_run(
+        self,
+        run_id: str,
+        command: str,
+        started_at: dt.datetime,
+        symbol_source: str | None = None,
+        symbol_source_snapshot_id: str | None = None,
+    ) -> None:
         """Insert a run row in the transient RUNNING status.
 
         Callers must always follow this with `finish_run` — including on
         the exception path, via try/finally — so a crash never leaves a
         run with no row at all.
+
+        `symbol_source`/`symbol_source_snapshot_id` (Phase 6, Merge 3):
+        optional, and left `None` by every caller that doesn't resolve a
+        symbol source at all (`backfill`, `update`, `discover`,
+        `snapshot`) — only `tidemark run`/`tidemark observe run` pass
+        these, so a journal entry can always be traced back to which
+        universe produced it.
         """
         with self._session_factory() as session:
             session.add(
@@ -312,6 +326,8 @@ class TidemarkStore:
                     started_at=started_at,
                     finished_at=None,
                     status=RUNNING_STATUS,
+                    symbol_source=symbol_source,
+                    symbol_source_snapshot_id=symbol_source_snapshot_id,
                 )
             )
             session.commit()
