@@ -236,6 +236,46 @@ The frozen v0.1 baseline this produced is committed at
 [docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md)
 — what a future v0.2 replay is compared against.
 
+## Querying the evidence archive
+
+`tidemark evidence` is a read-only, frozen-metric query over the
+persisted `observations`/`journal_entries` archive — it never
+re-evaluates the rulebook (that's `tidemark replay`) and never writes
+anything. It exists to build an evidence base toward Section 2's four
+open questions (SEC2-01 through SEC2-04 — see
+[docs/rulebook/section-02-1h-behaviour-v0.2.md](docs/rulebook/section-02-1h-behaviour-v0.2.md)'s
+OPEN QUESTIONS) without answering any of them: every count it reports
+is raw ("sessions containing R1", "occurrences of
+`CONTINUATION_CANDIDATE_NOT_EVALUATED`"), never a judgment of validity
+or success. See
+[docs/adr/0010-evidence-command.md](docs/adr/0010-evidence-command.md)
+for the full design, including why its session-grouping logic is a
+deliberately independent copy of `tidemark replay`'s rather than a
+shared import.
+
+```bash
+# Full report: archive coverage, Section 2 sessions, SEC2-01..04 raw
+# evidence, a regime proxy, and data-sufficiency verdicts - each also
+# broken out by week and month.
+uv run tidemark evidence
+
+# Narrow to a symbol and/or a date range.
+uv run tidemark evidence --symbol BTC/USDT:USDT --from 2026-09-01 --to 2026-09-30
+
+# Machine-readable output.
+uv run tidemark evidence --json
+```
+
+**It refuses full output by default on a young archive** (spanning
+fewer than 14 days): only the coverage summary and the sufficiency
+verdicts print, and the command exits non-zero, so a single short
+regime can never be mistaken for general evidence.
+`--allow-insufficient` prints the full report anyway, headed
+`PRELIMINARY — ... not valid for Section 2 conclusions`. Data
+sufficiency (`INSUFFICIENT`/`EMERGING`/`SUFFICIENT`) is about whether a
+question can be *investigated at all* from the fixed thresholds in
+`data/evidence.py` — never what its answer would be.
+
 ## Universe selection (Phase 6)
 
 A universe-selection layer is being added on top of the fixed,
@@ -476,6 +516,20 @@ selected symbols only, reusing the existing chunked upsert, idempotent.
 No Section 1/2 rule, the ranking methodology, N, or K changed — see
 [docs/adr/0009](docs/adr/0009-universe-selection-architecture.md)'s
 Merge 3 section for the full resolution order and fallback rule.
+
+**Phase 7 — the plumbing check and `tidemark evidence`.** A read-only
+inspection of the live archive (observation start/end, universe
+coverage, ingestion gaps, evaluation failures, duplicates, and a
+pipeline-ordering gap it found) preceded a new, permanent command:
+`tidemark evidence` queries the persisted `observations`/
+`journal_entries` archive for raw evidence toward Section 2's four open
+questions, without re-simulating anything and without answering any of
+them. It refuses full output on an archive spanning fewer than 14 days
+(`--allow-insufficient` overrides, marked preliminary), reports a data-
+sufficiency verdict per question, and breaks every count out by week
+and month alongside a Section 1 regime proxy — see
+[docs/adr/0010-evidence-command.md](docs/adr/0010-evidence-command.md).
+No Section 1/2 rule, parameter, or threshold changed.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
