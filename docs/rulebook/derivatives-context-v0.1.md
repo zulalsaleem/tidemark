@@ -148,6 +148,24 @@ WHAT THIS DOCUMENT DOES NOT DO
     guessing undefined rulebook behavior — never invent a new threshold
     or a seventh combination to cover a gap.
 
+OPEN QUESTIONS
+  1. Funding EXACTLY UNCHANGED between the current and the previous
+     closed 1H reading is neither RISING nor FALLING, so it cannot
+     satisfy D5 or D6 even when price is FLAT and OI is UP or DOWN — the
+     result is NO_MATCH (see NO_MATCH above). This is not a defect: v0.1
+     already defines UNCHANGED as unmatched, deliberately, the same way
+     it leaves a funding reading of exactly 0.0 unmatched for D1-D4. It
+     is recorded here because it was an observed gap, not a hypothetical
+     one — it occurred on this classifier's first live run (2026-09-27,
+     BTC/USDT:USDT, price FLAT, OI UP, funding unchanged at 0.001051%
+     across both the current and previous closed period). Whether a v0.2
+     should define a genuine "funding unchanged" case for D5/D6 (a
+     seventh and eighth combination, or a redefinition of D5/D6 to admit
+     it) is open and would need its own justification, the same way any
+     other rulebook threshold or combination change does — it is not
+     decided by this one observation, and no threshold or classifier
+     behavior changes as a result of recording it here.
+
 CHANGE PROCESS
   This is a rulebook document like any other under docs/rulebook/: a
   change creates a new version file (v0.2, ...); this file is never
