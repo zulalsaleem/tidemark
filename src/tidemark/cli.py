@@ -101,9 +101,8 @@ app.add_typer(health_app, name="health")
 universe_app = typer.Typer(
     name="universe",
     help=(
-        "Universe selection (Phase 6): discover/backfill the venue's symbol "
-        "catalog (Merge 2A) plus read-only registry/snapshot inspection. No "
-        "selection, eligibility, or metric computation runs here yet - see "
+        "Universe selection (Phase 6, Merge 1): read-only registry and snapshot "
+        "inspection. No selection/eligibility logic runs here yet - see "
         "docs/adr/0009-universe-selection-architecture.md."
     ),
     no_args_is_help=True,
@@ -885,88 +884,12 @@ def health_heartbeat() -> None:
     raise typer.Exit(code=EXIT_CODES[report.status])
 
 
-@universe_app.command("discover")
-def universe_discover(
-    quote_currency: str = typer.Option(
-        "USDT", "--quote-currency", help="Quote currency to filter the venue listing to."
-    ),
-) -> None:
-    """Refresh `market_registry` from the venue's current symbol listing.
-
-    Lists active perpetual contracts via ccxt's unified `load_markets`
-    (a separate, additive call from candle fetching — see
-    `data/exchange.py`'s `list_perpetual_symbols` and ADR 0002).
-    Currently-listed symbols are upserted ACTIVE; previously-registered
-    symbols no longer listed are marked ABSENT_FROM_VENUE, never deleted.
-    """
-    settings = get_settings()
-    store = _store(settings)
-    exchange = ExchangeClient(venue=settings.venue)
-
-    outcome: DiscoveryOutcome = run_discovery(store, exchange, settings.venue, quote_currency)
-
-    typer.echo(f"discover {outcome.run_id}: {outcome.status}")
-    typer.echo(f"  discovered (ACTIVE): {outcome.discovered}")
-    typer.echo(f"  marked ABSENT_FROM_VENUE: {outcome.marked_absent}")
-
-
-@universe_app.command("backfill")
-def universe_backfill(
-    days: int = typer.Option(
-        DEFAULT_BACKFILL_DAYS,
-        "--days",
-        help="Daily-candle backfill depth in days; enough for the 30-day median plus margin.",
-    ),
-) -> None:
-    """Backfill closed 1D candles for every ACTIVE `market_registry` symbol.
-
-    Reuses the existing `data backfill` ingest path unchanged (per-symbol
-    failure isolation; one symbol failing gives PARTIAL, not FAILED) for
-    exactly one timeframe (1D) — the volume metric (Merge 2B) needs
-    nothing else at this stage. Prints one line per symbol as it
-    completes, since a full venue listing can be several hundred symbols
-    and this can take a while.
-    """
-    settings = get_settings()
-    store = _store(settings)
-    exchange = ExchangeClient(venue=settings.venue)
-
-    symbols = active_symbols(store, settings.venue)
-    if not symbols:
-        typer.echo("No ACTIVE registry symbols found. Run `tidemark universe discover` first.")
-        return
-
-    typer.echo(f"Backfilling {len(symbols)} ACTIVE symbol(s), {days} days of 1D candles...")
-
-    def _report_progress(outcome: SymbolTimeframeOutcome) -> None:
-        if outcome.error is not None:
-            _safe_echo(f"  {outcome.symbol:<16} FAILED: {outcome.error}")
-        else:
-            r = outcome.result
-            _safe_echo(
-                f"  {outcome.symbol:<16} fetched={r.fetched} inserted={r.inserted} "
-                f"duplicates={r.duplicates_skipped} rejected={r.rejected}"
-            )
-
-    outcome: UniverseBackfillOutcome = run_universe_backfill(
-        store, exchange, settings.venue, days=days, on_outcome=_report_progress
-    )
-
-    typer.echo("")
-    typer.echo(
-        f"backfill {outcome.run_outcome.run_id}: {outcome.run_outcome.status} "
-        f"({outcome.symbols_with_coverage_updated}/{outcome.symbols_attempted} "
-        "symbols got candles)"
-    )
-
-
 @universe_app.command("registry")
 def universe_registry() -> None:
-    """List `market_registry` rows for the configured venue: status,
-    candle coverage, and stored row counts.
+    """List `market_registry` rows for the configured venue.
 
-    Read-only: reports what's stored, never computes anything. Merge 2B
-    is what fills `section1_first_usable_at`.
+    Read-only: reports what's stored, never computes anything. Merge 2
+    is what actually populates this table.
     """
     settings = get_settings()
     store = _store(settings)
@@ -977,18 +900,15 @@ def universe_registry() -> None:
         return
 
     header = (
-        f"{'SYMBOL':<16} {'STATUS':<18} {'FIRST_CANDLE':<20} "
-        f"{'LAST_CANDLE':<20} {'ROWS':<8} SECTION1_USABLE"
+        f"{'SYMBOL':<16} {'STATUS':<18} {'FIRST_CANDLE':<20} {'LAST_CANDLE':<20} SECTION1_USABLE"
     )
     typer.echo(header)
     for row in rows:
-        first_candle = row.first_candle_seen_at.isoformat() if row.first_candle_seen_at else "-"
-        last_candle = row.last_candle_seen_at.isoformat() if row.last_candle_seen_at else "-"
         usable = row.section1_first_usable_at.isoformat() if row.section1_first_usable_at else "-"
-        row_count = store.count_candles(settings.venue, row.symbol, "1d")
-        _safe_echo(
-            f"{row.symbol:<16} {row.status:<18} {first_candle:<20} {last_candle:<20} "
-            f"{row_count:<8} {usable}"
+        typer.echo(
+            f"{row.symbol:<16} {row.status:<18} "
+            f"{row.first_candle_seen_at.isoformat():<20} "
+            f"{row.last_candle_seen_at.isoformat():<20} {usable}"
         )
 
 
@@ -1034,7 +954,7 @@ def universe_show(
         f"{snapshot.snapshot_id}  venue={snapshot.venue}  "
         f"at={snapshot.snapshot_at.isoformat()}  methodology={snapshot.methodology_version}  "
         f"metric={snapshot.metric_name} ({snapshot.metric_window_days}d)  "
-        f"k={snapshot.k}  n_selected={snapshot.n_selected}  provenance={snapshot.provenance}"
+        f"n_selected={snapshot.n_selected}  provenance={snapshot.provenance}"
     )
     typer.echo("")
 
@@ -1045,135 +965,17 @@ def universe_show(
 
     ordered = sorted(rows, key=lambda r: (not r.selected, r.rank))
     header = (
-        f"{'RANK':<6} {'SYMBOL':<16} {'METRIC_VALUE':<14} {'ASSET_CLASS':<18} "
+        f"{'RANK':<6} {'SYMBOL':<16} {'METRIC_VALUE':<14} "
         f"{'ELIGIBLE':<9} {'SELECTED':<9} EXCLUSION_REASON"
     )
     typer.echo(header)
     for row in ordered:
         metric = f"{row.metric_value:.2f}" if row.metric_value is not None else "-"
         reason = row.exclusion_reason or "-"
-        eligible = "-" if row.eligible is None else str(row.eligible)
-        asset_class = row.asset_class or "-"
-        _safe_echo(
-            f"{row.rank:<6} {row.symbol:<16} {metric:<14} {asset_class:<18} "
-            f"{eligible:<9} {str(row.selected):<9} {reason}"
+        typer.echo(
+            f"{row.rank:<6} {row.symbol:<16} {metric:<14} "
+            f"{str(row.eligible):<9} {str(row.selected):<9} {reason}"
         )
-
-
-@universe_app.command("snapshot")
-def universe_snapshot_command(
-    as_of: str | None = typer.Option(
-        None,
-        "--as-of",
-        help=(
-            "ISO timestamp; reconstructs a BACKFILLED snapshot as of that moment "
-            "instead of a live FORWARD one. A BACKFILLED snapshot never touches "
-            "the network and never updates market_registry's cached eligibility."
-        ),
-    ),
-) -> None:
-    """Generate and persist one universe snapshot (Phase 6, Merge 2B).
-
-    Ranks every ACTIVE registry symbol by
-    MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D, assesses Section 1 eligibility
-    (the LOCKED v1.1 engine, unmodified) for the top K=50, and selects the
-    top N=30 eligible by rank. Every ranked symbol gets a row, not only
-    the selected 30 - see `universe show`.
-    """
-    settings = get_settings()
-    store = _store(settings)
-    as_of_dt = _parse_as_of(as_of)
-    exchange = ExchangeClient(venue=settings.venue) if as_of_dt is None else None
-
-    result = generate_universe_snapshot(store, exchange, settings.venue, as_of=as_of_dt)
-    snapshot = result.snapshot
-
-    typer.echo(
-        f"snapshot {snapshot.snapshot_id}  provenance={snapshot.provenance}  "
-        f"at={snapshot.snapshot_at.isoformat()}  ranked={len(result.rows)}  "
-        f"n_selected={snapshot.n_selected}/{snapshot.k}"
-    )
-    typer.echo("")
-    typer.echo("By exclusion_reason:")
-    for reason, count in sorted(snapshot.counts_by_exclusion_reason.items()):
-        typer.echo(f"  {reason:<36} {count}")
-
-
-@universe_app.command("coverage")
-def universe_coverage(
-    snapshot_id: str | None = typer.Option(
-        None, "--snapshot-id", help="Snapshot to report on; defaults to the latest for this venue."
-    ),
-) -> None:
-    """Coverage report: symbols on venue, eligible, assessed, selected,
-    data available, and counts by exclusion reason.
-    """
-    settings = get_settings()
-    store = _store(settings)
-
-    registry_rows = store.market_registry(settings.venue)
-    active_count = sum(1 for r in registry_rows if r.status == "ACTIVE")
-    absent_count = sum(1 for r in registry_rows if r.status == "ABSENT_FROM_VENUE")
-    with_daily = sum(1 for r in registry_rows if r.first_candle_seen_at is not None)
-    with_4h = sum(
-        1 for r in registry_rows if store.count_candles(settings.venue, r.symbol, "4h") > 0
-    )
-    with_cached_eligibility = sum(
-        1 for r in registry_rows if r.section1_first_usable_at is not None
-    )
-
-    typer.echo(f"Registry: {len(registry_rows)} symbol(s) on venue")
-    typer.echo(f"  ACTIVE:                            {active_count}")
-    typer.echo(f"  ABSENT_FROM_VENUE:                 {absent_count}")
-    typer.echo(f"  with daily candle data:            {with_daily}")
-    typer.echo(f"  with 4H candle data:               {with_4h}")
-    typer.echo(f"  with cached Section 1 eligibility: {with_cached_eligibility}")
-    typer.echo("")
-
-    if snapshot_id is not None:
-        snapshot = store.universe_snapshot_by_id(snapshot_id)
-        if snapshot is None:
-            typer.echo(f"No snapshot found with id {snapshot_id!r}.")
-            raise typer.Exit(code=1)
-    else:
-        snapshots = store.universe_snapshots(settings.venue)
-        snapshot = snapshots[0] if snapshots else None
-
-    if snapshot is None:
-        typer.echo("No snapshots found yet.")
-        return
-
-    rows = store.universe_snapshot_rows(snapshot.snapshot_id)
-    # "Assessed" means actually reached Section 1 eligibility (PART B step
-    # 4). Not `rank <= K`: UNIV-08 scopes the assessment set to CRYPTO
-    # candidates only, so a crypto symbol's raw rank can exceed K (pushed
-    # down by non-crypto symbols ranked above it) while still having been
-    # assessed, and a non-crypto symbol's raw rank can be <= K without
-    # ever reaching this step. Not `eligible is not None` either - a
-    # symbol excluded pre-assessment (NOT_ASSESSED, INSUFFICIENT_VOLUME_
-    # HISTORY, or any UNIV-08 domain reason) also carries a non-NULL
-    # `eligible=False` for the domain ones. "Assessed" is precisely: not
-    # excluded for one of those five pre-assessment reasons.
-    _not_assessed_reasons = {
-        NOT_ASSESSED,
-        INSUFFICIENT_VOLUME_HISTORY,
-        NON_CRYPTO_UNDERLYING,
-        NON_ELIGIBLE_INDEX,
-        UNKNOWN_UNDERLYING_TYPE,
-    }
-    assessed = sum(1 for r in rows if r.exclusion_reason not in _not_assessed_reasons)
-    typer.echo(
-        f"Snapshot {snapshot.snapshot_id} ({snapshot.provenance}, "
-        f"at={snapshot.snapshot_at.isoformat()}):"
-    )
-    typer.echo(f"  ranked:               {len(rows)}")
-    typer.echo(f"  assessed (top-{snapshot.k} crypto candidates): {assessed}")
-    typer.echo(f"  eligible:             {sum(1 for r in rows if r.eligible is True)}")
-    typer.echo(f"  selected:             {sum(1 for r in rows if r.selected)}")
-    typer.echo("")
-    typer.echo("By exclusion_reason:")
-    for reason, count in sorted(snapshot.counts_by_exclusion_reason.items()):
-        typer.echo(f"  {reason:<36} {count}")
 
 
 def main() -> None:

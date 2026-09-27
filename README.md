@@ -236,7 +236,7 @@ The frozen v0.1 baseline this produced is committed at
 [docs/replay/section-02-v0.1-baseline.md](docs/replay/section-02-v0.1-baseline.md)
 — what a future v0.2 replay is compared against.
 
-## Universe selection (Phase 6)
+## Universe selection (Phase 6, Merge 1)
 
 A universe-selection layer is being added on top of the fixed,
 manually-configured `TIDEMARK_SYMBOLS` list, split into three separate
@@ -247,82 +247,28 @@ see [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-se
 symbol recorded, not only the winners), and the existing journal/
 observation tables (what Tidemark actually evaluated).
 
-Merge 2A discovered the venue's symbol catalog and backfilled daily
-candles for it. Merge 2B (this one) computes the metric, assesses
-eligibility, and generates the snapshot itself:
+Merge 1 (this one) is schema and read-only plumbing only — new tables,
+store methods, and CLI commands, nothing computed yet:
 
 ```bash
-# Refresh market_registry from the venue's live listing: active
-# USDT-quoted perpetuals become ACTIVE, previously-registered symbols no
-# longer listed become ABSENT_FROM_VENUE (never deleted).
-uv run tidemark universe discover
-
-# Backfill 1D candles for every ACTIVE registry symbol - a separate step
-# from Section 1/2's 4H/1H/1D/1W backfill, and independent of it. Prints
-# progress per symbol; a full venue listing can be several hundred
-# symbols and take a while.
-uv run tidemark universe backfill --days 120
-
-# Generate a snapshot: rank every ACTIVE symbol by
-# MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D, backfill 4H candles for the top
-# K=50 if not already stored, assess Section 1 eligibility (the LOCKED
-# v1.1 engine, unmodified) for those 50, and select the top N=30
-# eligible by rank.
-uv run tidemark universe snapshot
-
-# The same, reconstructed as of a past timestamp instead of live - never
-# touches the network, never updates market_registry's eligibility cache.
-uv run tidemark universe snapshot --as-of 2026-09-01T00:00:00+00:00
-
-# Market-registry rows: status, candle coverage, and stored row counts.
+# Market-registry rows: what the venue has ever contained, per symbol.
 uv run tidemark universe registry
 
 # Universe snapshot headers, newest first.
 uv run tidemark universe snapshots
 
 # One snapshot's full ranking - selected symbols first, excluded symbols
-# shown too with their exclusion_reason. A rank below K=50 shows
-# eligible as "-" (NULL): NOT_ASSESSED, never a reported failure.
+# shown too with their exclusion_reason.
 uv run tidemark universe show --snapshot-id <id>
-
-# Coverage report: symbols on venue, eligible, assessed, selected, data
-# available, and counts by exclusion reason.
-uv run tidemark universe coverage
 ```
 
-Discovery uses ccxt's unified `load_markets` — a second, separate,
-venue-agnostic read-only call alongside candle fetching (never a
-venue-specific raw endpoint); both backfill commands reuse the existing
-`data backfill` ingest path unmodified. All read-only commands report an
-empty database gracefully ("No ... found yet.") rather than erroring.
-**`TIDEMARK_SYMBOLS` / `settings.symbol_list()` remains the only symbol
-source every pipeline reads** — `tidemark run`, `tidemark observe run`,
-and `tidemark health check` are unaffected by any of this, even after a
-real snapshot has been generated.
-
-**UNIV-08 — asset-class domain constraint.** The first real snapshot
-selected 14 of 30 symbols (47%) from outside cryptocurrency: tokenised
-equities and commodities (MSTR, TSLA-style single stocks, gold, oil...).
-A full-venue scan found 202 of 727 ACTIVE symbols (27.8%) are non-crypto.
-Tidemark's rulebook is validated for crypto market structure only, so
-`universe snapshot` now excludes any symbol whose Binance
-`underlyingType` (read from the same `load_markets()` response discovery
-already consumes — no new call) isn't `COIN`: `INDEX` (crypto-basket
-products like BTCDOM) is excluded as `NON_ELIGIBLE_INDEX`, every other
-known TradFi type as `NON_CRYPTO_UNDERLYING`, and anything the classifier
-doesn't recognize fails closed to `UNKNOWN_UNDERLYING_TYPE` rather than
-being guessed. `universe show` now displays each row's `ASSET_CLASS`.
-Classification is captured once at discovery time and never
-overwritten — a later venue-metadata change can never retroactively
-alter what an already-generated snapshot's classification meant, the
-same UNIVERSE_AS_OF_INVARIANT already applied to candle data. The
-pre-UNIV-08 snapshot (`methodology_version="universe-v1"`) is untouched,
-append-only, and kept as engineering data only; every snapshot from this
-point on is tagged `"universe-v2"`. Ranking, N, and K are unchanged —
-this is a domain eligibility correction, not a ranking change.
-
-Merge 3 (the daily refresh schedule and, as its own separate decision,
-wiring selection into the pipelines) follows later.
+All three report an empty database gracefully ("No ... found yet.")
+rather than erroring. **`TIDEMARK_SYMBOLS` / `settings.symbol_list()`
+remains the only symbol source every pipeline reads** — `tidemark run`,
+`tidemark observe run`, and `tidemark health check` are unaffected by
+this merge. Merge 2 (eligibility + the derived volume metric) and
+Merge 3 (snapshot generation and, as its own separate decision, wiring
+selection into the pipelines) follow later.
 
 ## Project status
 
@@ -366,81 +312,13 @@ and the committed
 
 **Phase 6, Merge 1 — universe registry and snapshot schema.** Additive
 only: three new tables (`market_registry`, `universe_snapshot`,
-`universe_snapshot_row`), registry upserts, atomic
+`universe_snapshot_row`), idempotent registry upserts, atomic
 snapshot-header-plus-rows writes, and read-only `tidemark universe
 registry/snapshots/show` CLI commands — see
 [docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md).
 No selection or eligibility computation exists yet, `Candle` gained no
-column, and every pipeline's symbol source is still `TIDEMARK_SYMBOLS`.
-
-**Phase 6, Merge 2A — venue discovery and daily candle backfill.**
-`tidemark universe discover` lists the venue's active USDT-quoted
-perpetuals via ccxt's unified `load_markets` (a second, venue-agnostic,
-read-only call, added alongside `data/exchange.py`'s candle fetching
-without changing it) and syncs `market_registry`, marking symbols no
-longer listed ABSENT_FROM_VENUE rather than deleting them.
-`tidemark universe backfill` then backfills `1d` candles for every ACTIVE
-symbol via the unmodified `data backfill` ingest path (same per-symbol
-failure isolation, same PARTIAL-on-partial-failure), and records what
-actually landed back onto each registry row. `market_registry`'s
-`first_candle_seen_at`/`last_candle_seen_at` became nullable (amended
-from Merge 1, before anything had ever written to the table) so a
-freshly-discovered symbol is a valid row before its first backfill.
-Still no eligibility, metric, or ranking logic, and every pipeline's
-symbol source remains exactly `TIDEMARK_SYMBOLS`.
-
-**Phase 6, Merge 2B — the volume metric, eligibility, and snapshot
-generation.** `tidemark universe snapshot` computes
-`MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D` for every ACTIVE registry symbol
-(`data/universe_metric.py`), ranks them (deterministic, symbol-name
-tie-break), backfills 4H candles for the top K=50 if not already stored,
-and assesses Section 1 eligibility for those 50 by replaying the LOCKED
-v1.1 engine unmodified (`data/universe_eligibility.py`, via
-`replay.report.replay_section1`) — never a calendar-history requirement,
-per UNIV-01. The top N=30 eligible by rank are selected; every ranked
-symbol gets a row regardless. Rows below K are `NOT_ASSESSED` with
-`eligible = NULL`, deliberately distinct from an assessed-and-failed
-`eligible = False` (`UniverseSnapshotRow.eligible` and
-`UniverseSnapshot.k` were amended/added the same way Merge 2A amended
-`market_registry` — nothing had written to these tables in production
-yet). Omitting `--as-of` runs live (FORWARD): it may backfill 4H data and
-caches a found `section1_first_usable_at` onto `market_registry` so a
-later run never re-replays a symbol's whole history. Giving `--as-of`
-reconstructs a past snapshot (BACKFILLED): it never touches the network
-and never writes that cache, verified by `UNIVERSE_AS_OF_INVARIANT`
-tests across several timestamps
-(`tests/data/test_universe_snapshot.py`). `tidemark universe coverage`
-reports symbols on venue, eligible, assessed, selected, data available,
-and counts by exclusion reason. Every pipeline's symbol source remains
-exactly `TIDEMARK_SYMBOLS` — verified by both a store-level and a
-CLI-level regression test, even after a real snapshot has been
-generated. See
-[docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md)'s
-Merge 2B addendum for the full design, including the rank-first order
-and the listing-status-as-of limitation.
-
-**Phase 6, UNIV-08 — asset-class domain constraint.** A live inspection
-found 202 of 727 ACTIVE registry symbols (27.8%), and 14 of the first
-snapshot's 30 selections (47%), were non-crypto — tokenised equities,
-commodities, FX, and pre-IPO synthetics that Section 1's structural
-rules have never been validated against. `data/asset_class.py` classifies
-every symbol from Binance's `underlyingType` field alone (`COIN` →
-`CRYPTO`; `INDEX` → `NON_ELIGIBLE_INDEX`; a known TradFi type →
-`NON_CRYPTO`; anything unrecognized → `UNKNOWN`, fail closed, never
-guessed) — read from the same `load_markets()` response
-`data/discover.py` already consumes, zero new API calls. Captured once at
-first discovery (`record_classification`, never-moved semantics
-mirroring `first_seen_in_venue_list_at`) and persisted on
-`market_registry`; `generate_universe_snapshot` reads only that
-persisted value, never a live call, so a later reclassification can
-never alter a past snapshot — UNIVERSE_AS_OF_INVARIANT applied to asset
-class. Carried onto `UniverseSnapshotRow` too, so every row is
-self-auditing. Ranking, N=30, and K=50 are unchanged. The pre-UNIV-08
-snapshot is untouched (append-only, `methodology_version="universe-v1"`
-forever); `data/universe_snapshot.py`'s methodology version moved to
-`"universe-v2"` so the two are trivially distinguishable. See
-[docs/adr/0009](docs/adr/0009-universe-selection-architecture.md)'s
-UNIV-08 section for the full inspection evidence and design.
+column, `data/exchange.py` is untouched, and every pipeline's symbol
+source is still `TIDEMARK_SYMBOLS` exactly as before this merge.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
