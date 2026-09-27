@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
 
+    # Coinalyze (read-only derivatives data for the market_intel layer -
+    # see docs/adr/0011). Strictly separate from the research engine's
+    # market data below; never used for price structure.
+    coinalyze_api_key: SecretStr | None = None
+
     # Market data (read-only, public endpoints only; ccxt venue id, e.g.
     # "binanceusdm", "bitget", "mexc" — see docs/adr/0002)
     venue: str = "binanceusdm"
