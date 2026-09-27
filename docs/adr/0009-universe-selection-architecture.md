@@ -472,3 +472,79 @@ historically persisted before UNIV-08, any snapshot ever backfilled
 only and never valid for a performance claim — its asset-class fields
 (if computed at all, retroactively) reflect today's classification read
 backward, not what was known at that historical T.
+
+## Merge 3: the observer reads the universe snapshot
+
+Every merge through UNIV-08 built the universe-selection machinery
+without ever wiring its output into what Tidemark actually watches — each
+addendum above explicitly re-verified that `tidemark run`,
+`tidemark observe run`, and `tidemark health check` still read only
+`settings.symbol_list()` (`TIDEMARK_SYMBOLS`), unaffected by any registry
+row, snapshot, or classification. Merge 3 is the explicit, separately
+reviewed decision the prior addenda kept deferring: those three now
+default to the SELECTED symbols of the latest valid universe snapshot for
+the configured venue, and `TIDEMARK_SYMBOLS` becomes the fallback rather
+than the source.
+
+**Resolution order (`data/symbol_source.py`, `resolve_symbols`), fixed
+and in this order:**
+
+1. **`EXPLICIT`** — an explicit `--symbols` flag always wins, unchanged
+   from every prior merge. An empty list (nothing passed) does not count
+   as an override; it falls through to step 2.
+2. **`SNAPSHOT`** — the latest `universe_snapshot` for the configured
+   venue, if one exists, its age is within the staleness threshold
+   (`TIDEMARK_UNIVERSE_STALENESS_HOURS`, default 48 hours), and it
+   selected at least one symbol. Selected symbols are returned in rank
+   order.
+3. **`TIDEMARK_SYMBOLS_FALLBACK`** — `settings.symbol_list()`, used when
+   no snapshot exists, the latest one is stale, or it selected nothing.
+   Every fallback logs a warning naming which of those three reasons
+   fired and, for staleness, the snapshot id and its age.
+
+`TIDEMARK_SYMBOLS` is explicitly **not deleted**, per this merge's own
+hard constraint and ADR 0009's original Merge 1 commitment — it is
+demoted from primary source to last-resort fallback, not removed. A
+missing or stale snapshot is never a crash: `resolve_symbols` always
+returns a usable symbol list, falling back rather than raising.
+
+**Traceability.** `runs.symbol_source`/`runs.symbol_source_snapshot_id`
+(nullable, added the same way UNIV-08 added its registry columns — a
+manual `ALTER TABLE` against the real database, since `runs` already held
+real rows by the time this merge landed) record which of the three
+sources a `tidemark run`/`tidemark observe run` execution actually used,
+and the snapshot id when one was used. Every `journal_entries`/
+`observations` row can be traced back, via its run, to the exact universe
+that produced it. Every other command (`backfill`, `update`, `discover`,
+`snapshot`) leaves both columns unset — they do not evaluate symbols
+against the rulebook, so the question does not apply to them.
+
+**Health check.** `check_universe_freshness` reports the latest
+snapshot's age for the configured venue directly: OK under 48 hours, WARN
+between 48 hours and 7 days (or when no snapshot exists at all), FAIL
+beyond 7 days. `check_symbol_source` reports what the last `tidemark run`
+actually used: OK for `EXPLICIT`/`SNAPSHOT` (or when no run has been
+recorded yet), WARN when `TIDEMARK_SYMBOLS_FALLBACK` fired for any
+reason. These are kept as two independent checks rather than one,
+because "the snapshot is stale" and "the last run fell back" are related
+but distinct facts — a stale snapshot with no run since is a real WARN
+even before anything downstream has consumed it.
+
+**Candle coverage (`tidemark universe sync`, `data/universe_sync.py`).**
+Backfills 1H/4H/1D/1W — every timeframe an observation cycle needs — for
+the currently SELECTED symbols only, reusing `data/ingest.py`'s existing
+chunked upsert (`run_backfill`) unmodified, the same reuse pattern Merge
+2A established for the 1D-only registry backfill. It never applies the
+staleness fallback itself: its job is preparing candles for whatever the
+latest snapshot currently says, not deciding whether that snapshot should
+be trusted — that decision belongs to `resolve_symbols` alone, at
+observation time.
+
+**What Merge 3 does not do.** No Section 1 or Section 2 rule, parameter,
+or threshold changed. The ranking methodology, N = 30, K = 50, and
+eligibility (UNIV-01 through UNIV-08) are untouched — Merge 3 only
+changes which of an already-computed snapshot's outputs the observer
+pipelines read, and only when no explicit override is given. Observations
+already journalled under `TIDEMARK_SYMBOLS` keep their rows untouched;
+nothing about this merge rewrites history, only what future runs default
+to.
