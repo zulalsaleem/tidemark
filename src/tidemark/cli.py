@@ -24,6 +24,8 @@ from tidemark.data.asset_class import (
     UNKNOWN_UNDERLYING_TYPE,
 )
 from tidemark.data.discover import DiscoveryOutcome, run_discovery
+from tidemark.data.evidence import build_evidence_report
+from tidemark.data.evidence_render import evidence_report_to_dict, render_evidence_report
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
@@ -272,6 +274,86 @@ def replay(
         days=days,
     )
     typer.echo(render_report(report))
+
+
+@app.command()
+def evidence(
+    symbol: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--symbol",
+        help="Symbols: repeat the flag or comma-separate; defaults to every observed symbol.",
+    ),
+    from_: str | None = typer.Option(
+        None, "--from", help="ISO date/timestamp (inclusive); defaults to the start of the archive."
+    ),
+    to: str | None = typer.Option(
+        None, "--to", help="ISO date/timestamp (inclusive); defaults to the end of the archive."
+    ),
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    allow_insufficient: bool = typer.Option(
+        False,
+        "--allow-insufficient",
+        help=(
+            "Print the full report even when the archive spans fewer than 14 days, "
+            "marked PRELIMINARY and not valid for Section 2 conclusions."
+        ),
+    ),
+) -> None:
+    """Query the persisted archive for evidence toward Section 2's open
+    questions (SEC2-01 through SEC2-04) — never a new simulation, never a
+    conclusion. See docs/adr/0010-evidence-command.md.
+
+    Refuses full output by default when the archive spans fewer than 14
+    days: only the coverage summary and sufficiency verdicts print, so a
+    single short regime is never mistaken for general evidence. Metric
+    definitions are frozen (documented here and in the ADR) so a run
+    today means the same thing as a run three months from now.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    symbols = _parse_csv(symbol)
+    since = _parse_evidence_bound(from_, end_of_day=False)
+    until = _parse_evidence_bound(to, end_of_day=True)
+
+    command = "tidemark evidence"
+    if symbols:
+        command += " --symbol " + ",".join(symbols)
+    if from_:
+        command += f" --from {from_}"
+    if to:
+        command += f" --to {to}"
+    if allow_insufficient:
+        command += " --allow-insufficient"
+
+    report = build_evidence_report(
+        store, command, dt.datetime.now(dt.UTC), symbols=symbols, since=since, until=until
+    )
+    full = allow_insufficient or not report.is_young_archive
+
+    if json:
+        typer.echo(json_module.dumps(evidence_report_to_dict(report, full=full), indent=2))
+    else:
+        _safe_echo(render_evidence_report(report, full=full))
+
+    if report.is_young_archive and not allow_insufficient:
+        raise typer.Exit(code=1)
+
+
+def _parse_evidence_bound(value: str | None, *, end_of_day: bool) -> dt.datetime | None:
+    """Parse a `--from`/`--to` bound. A bare date (no time component) is
+    widened to that whole UTC day - `--from` to its start, `--to` to its
+    end - so `--from 2026-09-01 --to 2026-09-01` covers the full day
+    rather than matching nothing.
+    """
+    if value is None:
+        return None
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    is_bare_date = "T" not in value and " " not in value.strip()
+    if is_bare_date and end_of_day:
+        parsed = parsed + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
+    return parsed
 
 
 def _parse_csv(values: list[str] | None) -> list[str] | None:
