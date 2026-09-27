@@ -523,10 +523,11 @@ actually sends:
 
 `NO_MATCH` never sends, under any circumstance — the rulebook defines no
 interpretation for those readings, so there's nothing true to alert on.
-BTC's structure section reads `context_records` read-only (never
-recomputed, never written to) and renders `UNAVAILABLE` if there's no
-record for BTC or the latest one is stale (see the ADR for the exact
-threshold) — it never falls back to computing structure itself.
+BTC's structure section reads `journal_entries` read-only (never
+recomputed, never written to — the table `tidemark run` actually writes
+Section 1 results to) and renders `UNAVAILABLE` if there's no result for
+BTC or the latest one is stale (see the ADR for the exact threshold) —
+it never falls back to computing structure itself.
 
 **Running it hourly (systemd timer example).** Same caveats as the bot
 example above — illustrative, not prescriptive:
@@ -554,7 +555,7 @@ Description=Run the Tidemark BTC briefing hourly
 # 5 minutes past the hour: gives the Section 1 4H-close evaluation and
 # the Section 2 hourly observer (see "Using the run pipeline" and "Using
 # Section 2 observation" above) a head start, so the briefing's
-# structure section reads a context_records row from THIS hour rather
+# structure section reads a journal_entries row from THIS hour rather
 # than racing it.
 OnCalendar=*-*-* *:05:00
 Persistent=true
@@ -777,7 +778,11 @@ CLAUDE.md's standing rule that strategy logic comes only from the
 rulebook. `tidemark intel briefing [--send] [--json]` classifies BTC's
 closed-1H reading against it and shows BTC's stored Section 1 structure
 alongside it, via a single narrow, explicitly-permitted exception to the
-isolation boundary: a read-only `context_records` lookup
+isolation boundary: a read-only `journal_entries` lookup — the table
+`tidemark run` actually writes Section 1 results to, not `context_records`
+(a table only the standalone `tidemark context evaluate` command writes;
+an earlier version of this read that table instead, until an audit of a
+live deployment found it was always empty — see the ADR) —
 (`context_read.py`) that imports only `tidemark.data.models` — never
 `tidemark.context`, never `tidemark.data.store` (whose transitive
 `tidemark.data.exchange` import the import-boundary test now closes off

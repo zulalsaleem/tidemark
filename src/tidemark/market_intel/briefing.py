@@ -28,7 +28,7 @@ from sqlalchemy import Engine
 from tidemark.market_intel.briefing_data import BTC_CCXT_SYMBOL, INTERVAL, fetch_classifier_inputs
 from tidemark.market_intel.clamping import closed_period
 from tidemark.market_intel.client import CoinalyzeClient
-from tidemark.market_intel.context_read import is_stale, read_latest_context_record
+from tidemark.market_intel.context_read import is_stale, read_latest_journal_entry
 from tidemark.market_intel.derivatives_classifier import NO_MATCH, ClassificationResult, classify
 from tidemark.market_intel.evaluation_store import (
     EvaluationRecord,
@@ -67,18 +67,18 @@ class BriefingResult:
 
 
 def _read_structure(database_url: str, now: dt.datetime) -> StructureSnapshot:
-    record = read_latest_context_record(database_url, BTC_CCXT_SYMBOL)
-    if record is None:
+    entry = read_latest_journal_entry(database_url, BTC_CCXT_SYMBOL)
+    if entry is None:
         return StructureSnapshot(available=False)
-    if is_stale(record, now):
+    if is_stale(entry, now):
         return StructureSnapshot(available=False, stale=True)
     return StructureSnapshot(
         available=True,
-        state=record.state,
-        watch=record.watch,
-        grade=record.grade,
-        rule_version=record.rule_version,
-        evaluated_at=record.evaluated_at,
+        state=entry.state,
+        watch=entry.watch,
+        grade=entry.grade,
+        rule_version=entry.rule_version,
+        evaluated_at=entry.evaluated_at,
     )
 
 

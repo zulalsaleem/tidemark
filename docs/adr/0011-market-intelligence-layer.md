@@ -293,13 +293,13 @@ that strategy logic comes only from the rulebook: the classifier reads
 but that module's own docstring states plainly that every value in it is
 copied from the rulebook document, not invented here.
 
-**The read-only `context_records` exception.** The briefing needs BTC's
+**The read-only `journal_entries` exception.** The briefing needs BTC's
 stored Section 1 result to show alongside derivatives context, but
 `market_intel` must never recompute Section 1 or import its logic. The
 exception (`context_read.py`) is narrow by construction, not just by
 convention:
-- it imports only `tidemark.data.models.ContextRecord`, a plain ORM
-  class with no imports of its own back into the research engine;
+- it imports only `tidemark.data.models.JournalEntry`, a plain ORM class
+  with no imports of its own back into the research engine;
 - it never imports `tidemark.data.store`, whose `TidemarkStore`
   transitively imports `tidemark.data.exchange` for a type hint - a gap
   a naive "just forbid `tidemark.data.exchange`" rule would have missed
@@ -318,17 +318,39 @@ convention:
   gap and any other one like it, present or future, rather than growing
   the blocklist reactively each time a new transitive path is found.
 
-  If no context record exists for BTC, or the latest one is more than
-  `CONTEXT_RECORD_STALE_AFTER` (8 hours - two missed 4H cycles of grace,
-  an operational judgment `market_intel` owns for its own display
-  purposes, not a Section 1 parameter) old, the briefing's structure
-  section renders `UNAVAILABLE` with a reason. It never falls back to
-  computing structure itself - there is no code path by which it could,
-  since Section 1's evaluation logic (`tidemark.context`) is never
-  imported here at all.
+  If no Section 1 result exists for BTC, or the latest one is more than
+  `SECTION1_STALE_AFTER` (8 hours - two missed 4H cycles of grace, an
+  operational judgment `market_intel` owns for its own display purposes,
+  not a Section 1 parameter) old, the briefing's structure section
+  renders `UNAVAILABLE` with a reason. It never falls back to computing
+  structure itself - there is no code path by which it could, since
+  Section 1's evaluation logic (`tidemark.context`) is never imported
+  here at all.
+
+  **Correction (post-launch):** this exception originally read
+  `ContextRecord`/`context_records` instead. An operator reported that on
+  a live deployment `context_records` was empty (never written to) while
+  `journal_entries` held 125 real rows including BTC's. Tracing the code
+  confirmed why: `context_records` is written only by the standalone
+  `tidemark context evaluate` command (`cli.py`); `tidemark run` - what's
+  actually scheduled in production - evaluates Section 1 via `htf.evaluate`
+  and persists the result only as a `JournalEntry` (`journal/pipeline.py`),
+  never as a `ContextRecord`. The briefing's structure section was
+  therefore always `UNAVAILABLE` on any deployment where only `tidemark
+  run` runs, and the structural-change alert trigger could never fire -
+  not because no Section 1 result existed, but because this module was
+  reading a table nothing in production writes to. Fixed to read
+  `journal_entries` instead (`read_latest_journal_entry`); the isolation
+  boundary is otherwise unchanged - still read-only, still
+  `tidemark.data.models` only, still no `tidemark.context`, still no
+  recomputation, still no write path. `context_records`/`ContextRecord`
+  is not removed by this correction - whether the standalone `context
+  evaluate`/`history`/`explain` trio (its only writer and readers) is
+  worth keeping is a separate decision, not a correctness question this
+  ADR resolves.
 
 **Derivatives data never flows back into Section 1.** There is no
-write path from `market_intel` into `context_records`, `journal_entries`,
+write path from `market_intel` into `journal_entries`, `context_records`,
 `candles`, or any other research table - verified the same way the
 import boundary is: statically, not by inspection. The information flow
 across this boundary is one-way and read-only.

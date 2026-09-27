@@ -1,6 +1,7 @@
 """evaluate_briefing: the full hourly cycle - classify, read BTC
-structure (real database, real context_records table), decide send,
-record every evaluation whether or not it sends, and never touch a
+structure (real database, real journal_entries table - the table
+`tidemark run` actually writes, per ADR 0011's Merge 3 addendum), decide
+send, record every evaluation whether or not it sends, and never touch a
 research table beyond the one permitted read.
 """
 
@@ -10,8 +11,9 @@ import datetime as dt
 
 from sqlalchemy import func, select
 
-from tidemark.data.models import ContextRecord
+from tidemark.data.models import ContextRecord, JournalEntry
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
+from tidemark.journal.records import build_journal_entry
 from tidemark.market_intel.briefing import (
     CLASSIFICATION_CHANGED,
     STRUCTURAL_CHANGE,
@@ -109,6 +111,13 @@ def _dbs(tmp_path):
 
 
 def _save_structure(research_engine, evaluated_at, **overrides) -> None:
+    """Writes a Section 1 result the way `tidemark run` actually does:
+    an in-memory `ContextRecord` from `htf.evaluate`, converted via
+    `build_journal_entry` and persisted with `save_journal_entry` - never
+    a direct `context_records` write, which `tidemark run` never performs
+    (see ADR 0011's Merge 3 addendum for the investigation that found
+    this).
+    """
     defaults = dict(
         asset=ASSET,
         evaluated_at=evaluated_at,
@@ -122,7 +131,9 @@ def _save_structure(research_engine, evaluated_at, **overrides) -> None:
         swings_used=[],
     )
     defaults.update(overrides)
-    TidemarkStore(research_engine).save_context_record(ContextRecord(**defaults))
+    record = ContextRecord(**defaults)
+    entry = build_journal_entry(record, recorded_at=evaluated_at)
+    TidemarkStore(research_engine).save_journal_entry(entry)
 
 
 # -- first evaluation ever: never sends, even for a real D-match -------------
@@ -287,10 +298,10 @@ def test_structure_ticking_between_two_unsent_evaluations_does_not_send(tmp_path
     assert result.should_send is False  # no prior SENT record to compare against
 
 
-# -- missing/stale context record: UNAVAILABLE, never recomputed ------------
+# -- missing/stale Section 1 result: UNAVAILABLE, never recomputed ----------
 
 
-def test_missing_context_record_renders_structure_unavailable(tmp_path) -> None:
+def test_missing_journal_entry_renders_structure_unavailable(tmp_path) -> None:
     database_url, research_engine, evaluation_engine = _dbs(tmp_path)
     client = _FakeClient()
 
@@ -303,7 +314,7 @@ def test_missing_context_record_renders_structure_unavailable(tmp_path) -> None:
     assert "UNAVAILABLE" in result.message
 
 
-def test_stale_context_record_renders_structure_unavailable(tmp_path) -> None:
+def test_stale_journal_entry_renders_structure_unavailable(tmp_path) -> None:
     database_url, research_engine, evaluation_engine = _dbs(tmp_path)
     client = _FakeClient()
     # Section 1 last ran 20 hours ago - well beyond the staleness grace window.
@@ -317,6 +328,39 @@ def test_stale_context_record_renders_structure_unavailable(tmp_path) -> None:
     assert result.structure.stale is True
 
 
+def test_a_real_stored_section1_result_renders_structure_instead_of_unavailable(tmp_path) -> None:
+    """The regression this fix addresses: a fresh, real journal_entries
+    row (written the way `tidemark run` actually writes one) must show up
+    as real BTC STRUCTURE content, not UNAVAILABLE. Before this fix,
+    briefing.py read `context_records` - a table `tidemark run` never
+    writes - so this exact scenario silently always showed UNAVAILABLE
+    even with a perfectly healthy, freshly-run Section 1 result on
+    record. See ADR 0011's Merge 3 addendum.
+    """
+    database_url, research_engine, evaluation_engine = _dbs(tmp_path)
+    client = _FakeClient()
+    _save_structure(
+        research_engine,
+        HOUR1 - dt.timedelta(hours=1),
+        state="BULLISH",
+        watch="LONG_WATCH",
+        grade="A",
+    )
+
+    result = evaluate_briefing(
+        client, _cache(client), evaluation_engine, database_url, VENUE, HOUR1
+    )
+
+    assert result.structure.available is True
+    assert result.structure.stale is False
+    assert result.structure.state == "BULLISH"
+    assert result.structure.watch == "LONG_WATCH"
+    assert result.structure.grade == "A"
+    assert "UNAVAILABLE" not in result.message
+    assert "BTC STRUCTURE" in result.message
+    assert "State: BULLISH / Watch: LONG_WATCH, grade A" in result.message
+
+
 # -- no research table is ever written ---------------------------------------
 
 
@@ -325,14 +369,24 @@ def test_evaluate_briefing_writes_no_research_table(tmp_path) -> None:
     _save_structure(research_engine, dt.datetime(2026, 9, 27, 16, 0, tzinfo=dt.UTC))
     client = _FakeClient()
 
-    with research_engine.connect() as conn:
-        before = conn.execute(select(func.count()).select_from(ContextRecord)).scalar()
+    def _counts():
+        with research_engine.connect() as conn:
+            return {
+                "journal_entries": conn.execute(
+                    select(func.count()).select_from(JournalEntry)
+                ).scalar(),
+                "context_records": conn.execute(
+                    select(func.count()).select_from(ContextRecord)
+                ).scalar(),
+            }
+
+    before = _counts()
+    assert before == {"journal_entries": 1, "context_records": 0}  # the one setup row only
 
     evaluate_briefing(client, _cache(client), evaluation_engine, database_url, VENUE, HOUR1)
 
-    with research_engine.connect() as conn:
-        after = conn.execute(select(func.count()).select_from(ContextRecord)).scalar()
-    assert before == after == 1  # unchanged: only the setup row, never a new one
+    after = _counts()
+    assert after == before  # unchanged: reading journal_entries never writes to it or anywhere else
 
 
 # -- unavailable classifier inputs: NO_MATCH, never a guess ------------------
