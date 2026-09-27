@@ -109,6 +109,16 @@ class Run(Base):
     COMPLETED, PARTIAL, or FAILED. A run that fetched nothing new because
     the data was already current is COMPLETED, not FAILED. `finished_at`
     is null while a run is still RUNNING.
+
+    `symbol_source`/`symbol_source_snapshot_id` (Phase 6, Merge 3) record
+    which symbol source a `tidemark run`/`tidemark observe run` execution
+    actually used (`EXPLICIT`/`SNAPSHOT`/`TIDEMARK_SYMBOLS_FALLBACK` — see
+    `data/symbol_source.py`), and the snapshot id when one was used, so a
+    journal entry can always be traced back to the universe that produced
+    it. Nullable and left unset by every other command (`backfill`,
+    `update`, `discover`, `snapshot`) — added via a manual `ALTER TABLE`
+    against the real database, since `runs` already held real rows by the
+    time Merge 3 landed, the same treatment as UNIV-08's registry columns.
     """
 
     __tablename__ = "runs"
@@ -119,6 +129,8 @@ class Run(Base):
     started_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
     finished_at: Mapped[dt.datetime | None] = mapped_column(UTCDateTime, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
+    symbol_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    symbol_source_snapshot_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class RunSymbolStat(Base):
