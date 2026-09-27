@@ -63,11 +63,17 @@ def run_observe_pipeline(
     venue: str,
     symbols: list[str],
     now: dt.datetime | None = None,
+    symbol_source: str | None = None,
+    symbol_source_snapshot_id: str | None = None,
 ) -> ObservePipelineRunOutcome:
-    """Evaluate Section 2 and journal every observation row, per symbol."""
+    """Evaluate Section 2 and journal every observation row, per symbol.
+
+    `symbol_source`/`symbol_source_snapshot_id` (Phase 6, Merge 3): see
+    `journal/pipeline.py::run_pipeline`.
+    """
     now = now or dt.datetime.now(dt.UTC)
     run_id = uuid.uuid4().hex
-    store.start_run(run_id, "observe", now)
+    store.start_run(run_id, "observe", now, symbol_source, symbol_source_snapshot_id)
 
     status = "FAILED"
     outcomes: list[SymbolObserveOutcome] = []

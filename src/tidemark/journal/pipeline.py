@@ -70,11 +70,18 @@ def run_pipeline(
     venue: str,
     symbols: list[str],
     now: dt.datetime | None = None,
+    symbol_source: str | None = None,
+    symbol_source_snapshot_id: str | None = None,
 ) -> PipelineRunOutcome:
-    """Evaluate, journal, detect changes, and notify for each symbol."""
+    """Evaluate, journal, detect changes, and notify for each symbol.
+
+    `symbol_source`/`symbol_source_snapshot_id` (Phase 6, Merge 3) record
+    which source (`data/symbol_source.py`) resolved `symbols`, so the run
+    record can always say which universe produced this evaluation.
+    """
     now = now or dt.datetime.now(dt.UTC)
     run_id = uuid.uuid4().hex
-    store.start_run(run_id, "run", now)
+    store.start_run(run_id, "run", now, symbol_source, symbol_source_snapshot_id)
 
     # If an exception escapes below, `status` stays FAILED and `finally`
     # still records that — a crash mid-run must never leave a RUNNING
