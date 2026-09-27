@@ -161,11 +161,15 @@ class ClassificationResult:
     rulebook_version: str = RULEBOOK_VERSION
 
 
-def _no_match(reason: str, price: PriceInput, oi: OpenInterestInput, funding: FundingInput) -> ClassificationResult:
+def _no_match(
+    reason: str, price: PriceInput, oi: OpenInterestInput, funding: FundingInput
+) -> ClassificationResult:
     return ClassificationResult(NO_MATCH, None, reason, price, oi, funding)
 
 
-def classify(price: PriceInput, oi: OpenInterestInput, funding: FundingInput) -> ClassificationResult:
+def classify(
+    price: PriceInput, oi: OpenInterestInput, funding: FundingInput
+) -> ClassificationResult:
     """Classify one closed-1H reading into D1-D6 or NO_MATCH.
 
     Never guesses: a missing/non-OK input, a funding reading of exactly

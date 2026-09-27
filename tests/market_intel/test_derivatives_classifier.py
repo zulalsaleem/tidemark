@@ -49,7 +49,15 @@ def _funding(value: float, previous_value: float | None = None) -> FundingInput:
 
 @pytest.mark.parametrize(
     ("change_pct", "expected"),
-    [(0.251, UP), (1.0, UP), (-0.251, DOWN), (-1.0, DOWN), (0.25, FLAT), (-0.25, FLAT), (0.0, FLAT)],
+    [
+        (0.251, UP),
+        (1.0, UP),
+        (-0.251, DOWN),
+        (-1.0, DOWN),
+        (0.25, FLAT),
+        (-0.25, FLAT),
+        (0.0, FLAT),
+    ],
 )
 def test_classify_price_thresholds(change_pct: float, expected: str) -> None:
     assert classify_price(change_pct) == expected
@@ -169,7 +177,9 @@ def test_flat_flat_falling_is_no_match() -> None:
 
 
 def test_price_boundary_values_are_flat_not_a_match() -> None:
-    assert classify(_price(0.25), _oi(1.0), _funding(0.01)).result == NO_MATCH  # price FLAT, no D-id
+    assert (
+        classify(_price(0.25), _oi(1.0), _funding(0.01)).result == NO_MATCH
+    )  # price FLAT, no D-id
     assert classify(_price(-0.25), _oi(1.0), _funding(-0.01)).result == NO_MATCH
 
 
