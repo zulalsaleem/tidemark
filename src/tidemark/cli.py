@@ -56,17 +56,23 @@ from tidemark.data.universe_sync import (
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
+from tidemark.market_intel.bot import run_forever, run_once
+from tidemark.market_intel.bot_state import BotStateStore
 from tidemark.market_intel.client import CoinalyzeClient
 from tidemark.market_intel.errors import (
     CoinalyzeConnectionError,
     CoinalyzeHttpError,
     MissingApiKeyError,
+    MissingBotTokenError,
     RateLimitedError,
+    TelegramConnectionError,
+    TelegramHttpError,
     UnsupportedVenueError,
 )
 from tidemark.market_intel.future_markets import FutureMarketsCache
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
+from tidemark.market_intel.telegram_client import TelegramBotClient
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 from tidemark.replay.render import render_report
 from tidemark.replay.report import build_replay_report
@@ -1555,6 +1561,87 @@ def intel_market(
 
     if snapshot.market_status != OK:
         raise typer.Exit(code=1)
+
+
+def _telegram_bot_client(settings: Settings) -> TelegramBotClient:
+    return TelegramBotClient(bot_token=settings.telegram_bot_token)
+
+
+@intel_app.command("bot")
+def intel_bot(
+    once: bool = typer.Option(
+        False, "--once", help="Process any pending updates once and exit (for testing)."
+    ),
+) -> None:
+    """Run the /coin Telegram long-polling bot.
+
+    Read-only: replies with Merge 1 market snapshots only - no Telegram
+    alert this bot could send resembles a trading recommendation. Any
+    chat other than TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID is silently
+    ignored (no reply, nothing that confirms the bot exists) and only
+    logged (chat id and timestamp, never the message text). See
+    docs/adr/0011-market-intelligence-layer.md.
+    """
+    settings = get_settings()
+
+    if settings.telegram_allowed_chat_id is None:
+        typer.echo("TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID is not set. See .env.example.")
+        raise typer.Exit(code=1)
+
+    try:
+        telegram = _telegram_bot_client(settings)
+    except MissingBotTokenError:
+        typer.echo("TIDEMARK_TELEGRAM_BOT_TOKEN is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    try:
+        coinalyze = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    cache = FutureMarketsCache(coinalyze)
+    state = BotStateStore(settings.telegram_bot_offset_file)
+
+    if once:
+        try:
+            outcome = run_once(
+                telegram,
+                coinalyze,
+                cache,
+                state,
+                settings.telegram_allowed_chat_id,
+                settings.venue,
+                dt.datetime.now(dt.UTC),
+                discard_backlog=True,
+                poll_timeout=0,
+            )
+        except TelegramHttpError as exc:
+            typer.echo(f"Telegram returned HTTP {exc.status_code}: {exc.detail}")
+            raise typer.Exit(code=1) from None
+        except TelegramConnectionError as exc:
+            typer.echo(
+                f"Could not reach Telegram: {exc.detail}. This is usually network "
+                "filtering or a firewall, not a bad bot token."
+            )
+            raise typer.Exit(code=1) from None
+
+        typer.echo(
+            f"updates_seen={outcome.updates_seen} processed={outcome.processed} "
+            f"discarded_stale={outcome.discarded_stale} unauthorized={outcome.unauthorized}"
+        )
+        return
+
+    typer.echo("Starting the /coin Telegram bot (long polling). Ctrl+C to stop.")
+    try:
+        run_forever(
+            telegram, coinalyze, cache, state, settings.telegram_allowed_chat_id, settings.venue
+        )
+    except KeyboardInterrupt:
+        typer.echo("Stopped.")
+    except TelegramHttpError as exc:
+        typer.echo(f"Telegram rejected the bot token (HTTP {exc.status_code}): {exc.detail}")
+        raise typer.Exit(code=1) from None
 
 
 def main() -> None:
