@@ -25,6 +25,14 @@ def test_secret_fields_never_render_in_repr() -> None:
 
 
 def test_no_exchange_credential_fields() -> None:
-    """Public market data only — no field may hold an exchange credential."""
+    """Public market data only — no field may hold an *exchange* trading
+    credential (`data/exchange.py`'s ccxt venue takes no `apiKey`/
+    `secret` at all — see ADR 0002). `coinalyze_api_key` is exempt: it's
+    a read-only third-party derivatives-data key for the strictly
+    separate `market_intel` layer (ADR 0011), never a venue with trading
+    permissions.
+    """
+    exempt = {"coinalyze_api_key"}
     field_names = Settings.model_fields.keys()
-    assert not any("api_key" in name or "api_secret" in name for name in field_names)
+    suspect = {name for name in field_names if "api_key" in name or "api_secret" in name} - exempt
+    assert not suspect
