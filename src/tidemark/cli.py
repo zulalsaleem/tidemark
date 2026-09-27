@@ -28,6 +28,13 @@ from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
+from tidemark.data.symbol_source import (
+    EXPLICIT,
+    SNAPSHOT,
+    TIDEMARK_SYMBOLS_FALLBACK,
+    ResolvedSymbols,
+    resolve_symbols,
+)
 from tidemark.data.timeframes import TIMEFRAMES
 from tidemark.data.universe_backfill import (
     DEFAULT_BACKFILL_DAYS,
@@ -37,6 +44,12 @@ from tidemark.data.universe_backfill import (
 )
 from tidemark.data.universe_eligibility import INSUFFICIENT_VOLUME_HISTORY, NOT_ASSESSED
 from tidemark.data.universe_snapshot import generate_universe_snapshot
+from tidemark.data.universe_sync import (
+    DEFAULT_SYNC_DAYS,
+    SYNC_TIMEFRAMES,
+    run_universe_sync,
+    selected_symbols,
+)
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
@@ -119,27 +132,71 @@ def _notifier(settings: Settings) -> TelegramNotifier:
     )
 
 
+def _resolve_and_report(
+    store: TidemarkStore,
+    settings: Settings,
+    symbols: list[str] | None,
+    now: dt.datetime,
+) -> ResolvedSymbols:
+    """Resolve symbols (Phase 6, Merge 3: explicit --symbols, else the
+    latest valid universe snapshot's selection, else TIDEMARK_SYMBOLS)
+    and print which source was used, so `tidemark run`/`tidemark observe
+    run` always say plainly where their symbol list came from.
+    """
+    resolved = resolve_symbols(
+        store,
+        settings.venue,
+        _parse_csv(symbols),
+        settings.symbol_list(),
+        now,
+        staleness_threshold=dt.timedelta(hours=settings.universe_staleness_hours),
+    )
+    if resolved.source == SNAPSHOT:
+        typer.echo(
+            f"symbol source: SNAPSHOT ({resolved.snapshot_id}), {len(resolved.symbols)} symbol(s)"
+        )
+    elif resolved.source == EXPLICIT:
+        typer.echo(f"symbol source: EXPLICIT, {len(resolved.symbols)} symbol(s)")
+    else:
+        typer.echo(f"symbol source: {TIDEMARK_SYMBOLS_FALLBACK}, {len(resolved.symbols)} symbol(s)")
+        if resolved.warning:
+            typer.echo(f"  WARNING: {resolved.warning}")
+    return resolved
+
+
 @app.command()
 def run(
     symbols: list[str] = typer.Option(  # noqa: B008
         None,
         "--symbols",
-        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
+        help="Symbols: repeat the flag or comma-separate; overrides the universe snapshot.",
     ),
 ) -> None:
     """Evaluate Section 1, journal every result, and alert on change.
 
-    For each symbol: evaluate against stored candles, write the journal
-    row (a no-op if this 4H candle was already journaled), run the
-    change detector, and send a Telegram alert if it returns a reason.
-    One symbol failing gives a PARTIAL run, not FAILED.
+    Symbol source (Phase 6, Merge 3): an explicit --symbols always wins;
+    otherwise the SELECTED symbols of the latest universe snapshot for
+    the venue, if one exists and isn't stale; otherwise TIDEMARK_SYMBOLS
+    as a last-resort fallback. For each symbol: evaluate against stored
+    candles, write the journal row (a no-op if this 4H candle was already
+    journaled), run the change detector, and send a Telegram alert if it
+    returns a reason. One symbol failing gives a PARTIAL run, not FAILED.
     """
     settings = get_settings()
     store = _store(settings)
     notifier = _notifier(settings)
-    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    now = dt.datetime.now(dt.UTC)
+    resolved = _resolve_and_report(store, settings, symbols, now)
 
-    outcome = run_pipeline(store, notifier, settings.venue, symbol_list)
+    outcome = run_pipeline(
+        store,
+        notifier,
+        settings.venue,
+        resolved.symbols,
+        now=now,
+        symbol_source=resolved.source,
+        symbol_source_snapshot_id=resolved.snapshot_id,
+    )
     _print_pipeline_outcome(outcome)
 
 
@@ -147,14 +204,14 @@ def _print_pipeline_outcome(outcome: PipelineRunOutcome) -> None:
     typer.echo(f"run {outcome.run_id}: {outcome.status}")
     for o in outcome.outcomes:
         if o.error is not None:
-            typer.echo(f"  {o.symbol:<16} FAILED: {o.error}")
+            _safe_echo(f"  {o.symbol:<16} FAILED: {o.error}")
         elif not o.journaled:
-            typer.echo(f"  {o.symbol:<16} repeat (already journaled, no alert)")
+            _safe_echo(f"  {o.symbol:<16} repeat (already journaled, no alert)")
         elif o.alert_reason is None:
-            typer.echo(f"  {o.symbol:<16} journaled, no alert")
+            _safe_echo(f"  {o.symbol:<16} journaled, no alert")
         else:
             sent = "sent" if o.alert_sent else "FAILED TO SEND"
-            typer.echo(f"  {o.symbol:<16} journaled, alert={o.alert_reason} ({sent})")
+            _safe_echo(f"  {o.symbol:<16} journaled, alert={o.alert_reason} ({sent})")
 
 
 @app.command()
@@ -661,19 +718,30 @@ def observe_run(
     symbols: list[str] = typer.Option(  # noqa: B008
         None,
         "--symbols",
-        help="Symbols: repeat the flag or comma-separate; defaults to TIDEMARK_SYMBOLS.",
+        help="Symbols: repeat the flag or comma-separate; overrides the universe snapshot.",
     ),
 ) -> None:
     """Evaluate Section 2 (1H) and journal every observation row.
 
-    Measurement only: no entries, stops, targets, R:R, 15M handoff, or
-    Telegram alert is ever produced here.
+    Symbol source (Phase 6, Merge 3): same resolution as `tidemark run` -
+    explicit --symbols, else the latest valid universe snapshot's
+    selection, else TIDEMARK_SYMBOLS. Measurement only: no entries,
+    stops, targets, R:R, 15M handoff, or Telegram alert is ever produced
+    here.
     """
     settings = get_settings()
     store = _store(settings)
-    symbol_list = _parse_csv(symbols) or settings.symbol_list()
+    now = dt.datetime.now(dt.UTC)
+    resolved = _resolve_and_report(store, settings, symbols, now)
 
-    outcome = run_observe_pipeline(store, settings.venue, symbol_list)
+    outcome = run_observe_pipeline(
+        store,
+        settings.venue,
+        resolved.symbols,
+        now=now,
+        symbol_source=resolved.source,
+        symbol_source_snapshot_id=resolved.snapshot_id,
+    )
     _print_observe_outcome(outcome)
 
 
@@ -681,9 +749,9 @@ def _print_observe_outcome(outcome: ObservePipelineRunOutcome) -> None:
     typer.echo(f"observe {outcome.run_id}: {outcome.status}")
     for o in outcome.outcomes:
         if o.error is not None:
-            typer.echo(f"  {o.symbol:<16} FAILED: {o.error}")
+            _safe_echo(f"  {o.symbol:<16} FAILED: {o.error}")
         else:
-            typer.echo(f"  {o.symbol:<16} evaluated={o.evaluated} inserted={o.inserted}")
+            _safe_echo(f"  {o.symbol:<16} evaluated={o.evaluated} inserted={o.inserted}")
 
 
 @observe_app.command("list")
@@ -801,11 +869,32 @@ def _build_health_report(settings: Settings) -> HealthReport:
     store = TidemarkStore(engine)
     notifier = _notifier(settings)
     now = dt.datetime.now(dt.UTC)
+
+    # Health checks candle freshness/gaps for whichever symbols tidemark
+    # run/observe run would actually process (Phase 6, Merge 3) - never
+    # an explicit override here, since there is no operator-given
+    # --symbols for a scheduled health check to honor. If the database
+    # itself is unreachable/uninitialized this raises before check_
+    # database gets a chance to report it properly; falling back to
+    # TIDEMARK_SYMBOLS here is always a safe list to check against, and
+    # the real failure still surfaces via the database check itself.
+    try:
+        resolved_symbols = resolve_symbols(
+            store,
+            settings.venue,
+            None,
+            settings.symbol_list(),
+            now,
+            staleness_threshold=dt.timedelta(hours=settings.universe_staleness_hours),
+        ).symbols
+    except Exception:
+        resolved_symbols = settings.symbol_list()
+
     return run_all_checks(
         store=store,
         engine=engine,
         venue=settings.venue,
-        symbols=settings.symbol_list(),
+        symbols=resolved_symbols,
         is_telegram_configured=notifier.is_configured,
         rule_version=htf.RULE_VERSION,
         now=now,
@@ -835,6 +924,8 @@ def _report_to_dict(report: HealthReport) -> dict:
         "last_run_status": report.last_run_status,
         "total_gaps": report.total_gaps,
         "journal_count": report.journal_count,
+        "last_run_symbol_source": report.last_run_symbol_source,
+        "last_run_symbol_source_snapshot_id": report.last_run_symbol_source_snapshot_id,
     }
 
 
@@ -856,7 +947,7 @@ def health_check(
         typer.echo(f"Overall: {report.status}")
         typer.echo("")
         for check in report.checks:
-            typer.echo(f"{check.name:<28} {check.status:<5} {check.detail}")
+            _safe_echo(f"{check.name:<28} {check.status:<5} {check.detail}")
 
     raise typer.Exit(code=EXIT_CODES[report.status])
 
@@ -1174,6 +1265,58 @@ def universe_coverage(
     typer.echo("By exclusion_reason:")
     for reason, count in sorted(snapshot.counts_by_exclusion_reason.items()):
         typer.echo(f"  {reason:<36} {count}")
+
+
+@universe_app.command("sync")
+def universe_sync_command(
+    days: int = typer.Option(
+        DEFAULT_SYNC_DAYS,
+        "--days",
+        help="Backfill depth in days for every synced timeframe.",
+    ),
+) -> None:
+    """Backfill 1H/4H/1D/1W for the SELECTED symbols of the latest
+    universe snapshot only (Phase 6, Merge 3).
+
+    Prepares full candle coverage for `tidemark run`/`tidemark observe
+    run` before they switch to reading the snapshot's selection. Reuses
+    the existing chunked-upsert backfill path unmodified (idempotent -
+    re-running with the same --days inserts zero new duplicates); never
+    fetches a symbol outside the selection.
+    """
+    settings = get_settings()
+    store = _store(settings)
+    exchange = ExchangeClient(venue=settings.venue)
+
+    symbols = selected_symbols(store, settings.venue)
+    if not symbols:
+        typer.echo(
+            "No universe snapshot with selected symbols found. "
+            "Run `tidemark universe snapshot` first."
+        )
+        return
+
+    typer.echo(
+        f"Syncing {len(symbols)} selected symbol(s) across "
+        f"{', '.join(SYNC_TIMEFRAMES)} ({days} days)..."
+    )
+
+    def _report_progress(outcome: SymbolTimeframeOutcome) -> None:
+        if outcome.error is not None:
+            _safe_echo(f"  {outcome.symbol:<16} {outcome.timeframe:<5} FAILED: {outcome.error}")
+        else:
+            r = outcome.result
+            _safe_echo(
+                f"  {outcome.symbol:<16} {outcome.timeframe:<5} fetched={r.fetched} "
+                f"inserted={r.inserted} duplicates={r.duplicates_skipped} rejected={r.rejected}"
+            )
+
+    outcome = run_universe_sync(
+        store, exchange, settings.venue, days=days, on_outcome=_report_progress
+    )
+
+    typer.echo("")
+    typer.echo(f"sync {outcome.run_id}: {outcome.status}")
 
 
 def main() -> None:

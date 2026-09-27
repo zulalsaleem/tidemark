@@ -12,7 +12,7 @@ from tidemark import cli as cli_module
 from tidemark.cli import _encode_for_display, _parse_csv, app
 from tidemark.context import htf, mtf
 from tidemark.data import asset_class as asset_class_module
-from tidemark.data.exchange import RawCandle
+from tidemark.data.exchange import ExchangeClient, RawCandle
 from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
@@ -411,6 +411,77 @@ def test_run_missing_credentials_does_not_crash(tmp_path, monkeypatch: pytest.Mo
     assert len(store.journal_history(SYMBOL)) == 1
 
 
+def test_run_explicit_symbols_records_explicit_source_on_the_run_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    """The run record (Phase 6, Merge 3) must trace back to which symbol
+    source produced it - an explicit --symbols override records EXPLICIT
+    with no snapshot id."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0
+    assert "symbol source: EXPLICIT" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    run = store.latest_runs_by_command()["run"]
+    assert run.symbol_source == "EXPLICIT"
+    assert run.symbol_source_snapshot_id is None
+
+
+def test_run_snapshot_source_records_snapshot_id_on_the_run_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    """When no --symbols override is given and a fresh snapshot exists,
+    the run record stores SNAPSHOT plus the snapshot id it used, so a
+    journal entry can always be traced back to the universe that
+    produced it."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_registry_row(url, SYMBOL)
+    _seed_snapshot_with_selection(
+        url, "snap-1", SYMBOL, dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+    )
+    _seed_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["run"])
+
+    assert result.exit_code == 0
+    assert "symbol source: SNAPSHOT (snap-1)" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    run = store.latest_runs_by_command()["run"]
+    assert run.symbol_source == "SNAPSHOT"
+    assert run.symbol_source_snapshot_id == "snap-1"
+
+
+def test_run_falls_back_to_tidemark_symbols_and_warns_when_no_snapshot_exists(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    """TIDEMARK_SYMBOLS regression check (ADR 0009): with no snapshot and
+    no --symbols override, TIDEMARK_SYMBOLS still works as the last-resort
+    fallback, and the CLI surfaces a clear warning naming the source."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
+    _seed_candles(url, SYMBOL, n=3)
+
+    result = runner.invoke(app, ["run"])
+
+    assert result.exit_code == 0
+    assert "symbol source: TIDEMARK_SYMBOLS_FALLBACK" in result.stdout
+    assert "WARNING" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    run = store.latest_runs_by_command()["run"]
+    assert run.symbol_source == "TIDEMARK_SYMBOLS_FALLBACK"
+    assert run.symbol_source_snapshot_id is None
+    assert len(store.journal_history(SYMBOL)) == 1
+
+
 def test_journal_list_shows_rows(tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier) -> None:
     url = _use_temp_db(tmp_path, monkeypatch)
     _seed_candles(url, SYMBOL, n=3)
@@ -549,8 +620,45 @@ def _healthy_setup(url: str, monkeypatch: pytest.MonkeyPatch, now: dt.datetime) 
             volume=1.0,
         )
         store.upsert_candles(VENUE, SYMBOL, timeframe, [candle], now)
-    store.start_run("r1", "run", now - dt.timedelta(minutes=10))
+    store.start_run(
+        "r1",
+        "run",
+        now - dt.timedelta(minutes=10),
+        symbol_source="SNAPSHOT",
+        symbol_source_snapshot_id="healthy-snap",
+    )
     store.finish_run("r1", now - dt.timedelta(minutes=5), "COMPLETED", {})
+
+    # A fresh universe snapshot (Phase 6, Merge 3) so check_universe_
+    # freshness and the symbol-source resolution _build_health_report now
+    # performs both report OK - "everything healthy" must include the
+    # universe dimension too.
+    store.save_universe_snapshot(
+        UniverseSnapshot(
+            snapshot_id="healthy-snap",
+            snapshot_at=now,
+            methodology_version="universe-v2",
+            venue=VENUE,
+            metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+            metric_window_days=30,
+            k=50,
+            n_selected=1,
+            provenance="FORWARD",
+            candle_hash="deadbeef",
+            counts_by_exclusion_reason={},
+        ),
+        [
+            UniverseSnapshotRow(
+                snapshot_id="healthy-snap",
+                symbol=SYMBOL,
+                rank=1,
+                metric_value=1000.0,
+                eligible=True,
+                selected=True,
+                exclusion_reason=None,
+            )
+        ],
+    )
 
     from tidemark.data.models import JournalEntry
 
@@ -648,6 +756,10 @@ def test_health_check_json_parses_and_contains_every_check(
     for check in payload["checks"]:
         assert check["status"] in ("OK", "WARN", "FAIL")
         assert isinstance(check["detail"], str)
+    assert any(n == "universe_freshness" for n in names)
+    assert any(n == "symbol_source" for n in names)
+    assert payload["last_run_symbol_source"] == "SNAPSHOT"
+    assert payload["last_run_symbol_source_snapshot_id"] == "healthy-snap"
 
 
 def test_health_heartbeat_writes_no_journal_row(
@@ -1258,27 +1370,113 @@ def test_universe_coverage_unknown_snapshot_id_errors(
     assert result.exit_code == 1
 
 
-def test_observer_symbol_source_unaffected_by_a_generated_snapshot(
+# -- universe sync (Phase 6, Merge 3) ------------------------------------------
+
+
+class _FakeSyncCcxtExchange:
+    apiKey = ""
+    secret = ""
+
+    def __init__(self, rows: list[list]) -> None:
+        self._rows = rows
+
+    def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None):  # noqa: ARG002
+        since = since or 0
+        rows = [r for r in self._rows if r[0] >= since]
+        return rows[:limit] if limit is not None else rows
+
+
+def test_universe_sync_reports_no_op_when_no_snapshot_exists(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The final Phase 6 hard-constraint regression check: a real,
-    generated snapshot (not just seeded registry/snapshot rows) must not
-    change which symbols `observe run` processes."""
+    _use_temp_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["universe", "sync"])
+
+    assert result.exit_code == 0
+    assert "No universe snapshot" in result.stdout
+
+
+def test_universe_sync_fetches_every_timeframe_for_the_selected_symbol_only(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backfills 1H/4H/1D/1W for the currently SELECTED symbols only."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_registry_row(url, SYMBOL)
+    _seed_snapshot_with_selection(url, "snap-1", SYMBOL, dt.datetime.now(dt.UTC))
+
+    open_time = dt.datetime.now(dt.UTC) - dt.timedelta(days=10)
+    row = [int(open_time.timestamp() * 1000), 100.0, 110.0, 90.0, 105.0, 10.0]
+    fake_ccxt = _FakeSyncCcxtExchange([row])
+    monkeypatch.setattr(
+        cli_module,
+        "ExchangeClient",
+        lambda venue: ExchangeClient(exchange=fake_ccxt, venue=venue),
+    )
+
+    result = runner.invoke(app, ["universe", "sync", "--days", "15"])
+
+    assert result.exit_code == 0
+    assert "Syncing 1 selected symbol" in result.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    for timeframe in ("1h", "4h", "1d", "1w"):
+        assert store.count_candles(VENUE, SYMBOL, timeframe) == 1
+
+
+def test_universe_sync_is_idempotent_across_two_invocations(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_registry_row(url, SYMBOL)
+    _seed_snapshot_with_selection(url, "snap-1", SYMBOL, dt.datetime.now(dt.UTC))
+
+    open_time = dt.datetime.now(dt.UTC) - dt.timedelta(days=10)
+    row = [int(open_time.timestamp() * 1000), 100.0, 110.0, 90.0, 105.0, 10.0]
+    fake_ccxt = _FakeSyncCcxtExchange([row])
+    monkeypatch.setattr(
+        cli_module,
+        "ExchangeClient",
+        lambda venue: ExchangeClient(exchange=fake_ccxt, venue=venue),
+    )
+
+    first = runner.invoke(app, ["universe", "sync", "--days", "15"])
+    second = runner.invoke(app, ["universe", "sync", "--days", "15"])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert "duplicates=1" in second.stdout
+
+    engine = create_store_engine(url)
+    store = TidemarkStore(engine)
+    assert store.count_candles(VENUE, SYMBOL, "4h") == 1
+
+
+def test_observer_uses_a_freshly_generated_snapshots_selection(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6, Merge 3: a real, freshly generated snapshot (not just
+    seeded registry/snapshot rows) takes priority over TIDEMARK_SYMBOLS -
+    `observe run` must process the snapshot's selected symbol, not the
+    TIDEMARK_SYMBOLS one, when no --symbols override is given."""
     url = _use_temp_db(tmp_path, monkeypatch)
     monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
-    as_of = dt.datetime(2026, 9, 25, tzinfo=dt.UTC)
+    as_of = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)  # fresh: well under 48h
     _seed_eligible_symbol(url, "ETH/USDT:USDT", as_of)  # a different, selected symbol
 
-    runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+    snapshot_result = runner.invoke(app, ["universe", "snapshot", "--as-of", as_of.isoformat()])
+    assert snapshot_result.exit_code == 0
 
-    _seed_section1_watch(url, SYMBOL, START)
-    _seed_1h_candles(url, SYMBOL, n=2)
+    _seed_section1_watch(url, "ETH/USDT:USDT", START)
+    _seed_1h_candles(url, "ETH/USDT:USDT", n=2)
 
     result = runner.invoke(app, ["observe", "run"])
 
     assert result.exit_code == 0
-    assert SYMBOL in result.stdout
-    assert "ETH/USDT:USDT" not in result.stdout
+    assert "symbol source: SNAPSHOT" in result.stdout
+    assert "ETH/USDT:USDT" in result.stdout
+    assert SYMBOL not in result.stdout
 
 
 def test_universe_commands_read_no_quote_volume_column(
@@ -1294,47 +1492,83 @@ def test_universe_commands_read_no_quote_volume_column(
     assert "quote_volume" not in columns
 
 
-# -- Phase 6 hard constraint: observer symbol source is unchanged -------------
+# -- Phase 6, Merge 3: observer's symbol-source resolution order --------------
 
 
-def test_observer_symbol_source_is_unaffected_by_universe_tables(
+def _seed_snapshot_with_selection(
+    url: str, snapshot_id: str, selected_symbol: str, snapshot_at: dt.datetime
+) -> None:
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.save_universe_snapshot(
+        UniverseSnapshot(
+            snapshot_id=snapshot_id,
+            snapshot_at=snapshot_at,
+            methodology_version="universe-v2",
+            venue=VENUE,
+            metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+            metric_window_days=30,
+            k=50,
+            n_selected=1,
+            provenance="FORWARD",
+            candle_hash="deadbeef",
+            counts_by_exclusion_reason={},
+        ),
+        [
+            UniverseSnapshotRow(
+                snapshot_id=snapshot_id,
+                symbol=selected_symbol,
+                rank=1,
+                metric_value=1_000_000.0,
+                eligible=True,
+                selected=True,
+                exclusion_reason=None,
+            )
+        ],
+    )
+
+
+def test_observer_prefers_a_fresh_snapshots_selection_over_tidemark_symbols(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """settings.symbol_list() (TIDEMARK_SYMBOLS) must remain the only
-    symbol source every pipeline reads - a populated market_registry /
-    universe_snapshot must not change which symbols `observe run`
-    processes when no --symbols flag is given.
+    """Per ADR 0009's resolution order, a fresh, valid universe snapshot
+    takes priority over TIDEMARK_SYMBOLS even when TIDEMARK_SYMBOLS names
+    a different symbol - TIDEMARK_SYMBOLS is a fallback only, used when no
+    snapshot exists or the latest one is stale.
     """
     url = _use_temp_db(tmp_path, monkeypatch)
     monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
 
-    # Seed universe tables for a DIFFERENT symbol only - if the pipeline
-    # read from them instead of settings.symbol_list(), that symbol (not
-    # SYMBOL) would be the one evaluated below.
+    # Seed a FRESH snapshot selecting a DIFFERENT symbol - it must be the
+    # one `observe run` evaluates below, not the TIDEMARK_SYMBOLS one.
     _seed_registry_row(url, "ETH/USDT:USDT")
-    _seed_snapshot(url, "snap-1")
+    _seed_snapshot_with_selection(
+        url, "snap-1", "ETH/USDT:USDT", dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+    )
 
-    _seed_section1_watch(url, SYMBOL, START)
-    _seed_1h_candles(url, SYMBOL, n=2)
+    _seed_section1_watch(url, "ETH/USDT:USDT", START)
+    _seed_1h_candles(url, "ETH/USDT:USDT", n=2)
 
-    result = runner.invoke(app, ["observe", "run"])  # no --symbols: reads TIDEMARK_SYMBOLS
+    result = runner.invoke(app, ["observe", "run"])  # no --symbols: reads the snapshot
 
     assert result.exit_code == 0
-    assert SYMBOL in result.stdout
-    assert "ETH/USDT:USDT" not in result.stdout
+    assert "symbol source: SNAPSHOT" in result.stdout
+    assert "ETH/USDT:USDT" in result.stdout
+    assert SYMBOL not in result.stdout
 
     engine = create_store_engine(url)
     store = TidemarkStore(engine)
-    assert len(store.observation_history(SYMBOL)) == 2
+    assert len(store.observation_history("ETH/USDT:USDT")) == 2
 
 
-def test_observer_symbol_source_unaffected_by_discovery_and_backfill_writes(
+def test_observer_falls_back_to_tidemark_symbols_when_no_snapshot_exists(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same guarantee as the test above, but populated through Merge 2A's
-    actual write paths (record_market_listing/record_candle_coverage)
-    rather than a hand-built MarketRegistry row - the observer must be
-    unaffected either way.
+    """Populated through Merge 2A's actual write paths
+    (record_market_listing/record_candle_coverage) rather than a
+    hand-built MarketRegistry row: registry rows alone are not a
+    snapshot, so the observer must still fall back to TIDEMARK_SYMBOLS.
     """
     url = _use_temp_db(tmp_path, monkeypatch)
     monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
@@ -1360,8 +1594,8 @@ def test_observer_symbol_source_unaffected_by_asset_class_classification(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """UNIV-08 regression check: classifying registry symbols (some of
-    them NON_CRYPTO) must not change which symbols `observe run`
-    processes - it still reads only settings.symbol_list()."""
+    them NON_CRYPTO) does not itself create a universe snapshot, so
+    `observe run` still falls back to TIDEMARK_SYMBOLS."""
     url = _use_temp_db(tmp_path, monkeypatch)
     monkeypatch.setenv("TIDEMARK_SYMBOLS", SYMBOL)
 
@@ -1514,3 +1748,56 @@ def test_universe_show_does_not_crash_on_a_non_ascii_symbol(
     result = runner.invoke(app, ["universe", "show", "--snapshot-id", "snap-cjk"])
 
     assert result.exit_code == 0
+
+
+def test_run_does_not_crash_on_a_non_ascii_symbol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _fake_notifier
+) -> None:
+    """Phase 6, Merge 3 regression: `run` can now default to a snapshot's
+    selection, which - unlike TIDEMARK_SYMBOLS - can name a non-ASCII
+    ticker (Merge 2A found live CJK-named meme-coin perpetuals on
+    binanceusdm). `_print_pipeline_outcome` must use `_safe_echo`, the
+    same as every universe inspection command."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, "哈基米/USDT:USDT", n=3)
+
+    result = runner.invoke(app, ["run", "--symbols", "哈基米/USDT:USDT"])
+
+    assert result.exit_code == 0
+
+
+def test_observe_run_does_not_crash_on_a_non_ascii_symbol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same regression as above, for `observe run`'s
+    `_print_observe_outcome`."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_section1_watch(url, "哈基米/USDT:USDT", START)
+    _seed_1h_candles(url, "哈基米/USDT:USDT", n=2)
+
+    result = runner.invoke(app, ["observe", "run", "--symbols", "哈基米/USDT:USDT"])
+
+    assert result.exit_code == 0
+
+
+def test_health_check_does_not_crash_on_a_non_ascii_symbol(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same regression, for `health check`'s human-readable per-check
+    line: TIDEMARK_SYMBOLS (and, since Merge 3, a snapshot) can now name a
+    non-ASCII ticker where `run`/`observe run` are concerned, and
+    `health check` builds its per-symbol checks from the same resolved
+    list."""
+    url = _use_temp_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("TIDEMARK_SYMBOLS", "哈基米/USDT:USDT")
+    _seed_candles(url, "哈基米/USDT:USDT", n=3, timeframe="1h")
+
+    result = runner.invoke(app, ["health", "check"])
+
+    # health check exits via typer.Exit(code=EXIT_CODES[status]) on every
+    # path - that raises SystemExit by design, not a crash. A genuine
+    # crash (e.g. the UnicodeEncodeError this regression guards against)
+    # would show up as some other exception type instead.
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert result.exit_code in (0, 1, 2)
+    assert "Overall:" in result.stdout
