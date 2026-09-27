@@ -10,20 +10,24 @@ import datetime as dt
 import pytest
 
 from tidemark.data.exchange import RawCandle
-from tidemark.data.models import JournalEntry, Run
+from tidemark.data.models import JournalEntry, Run, UniverseSnapshot, UniverseSnapshotRow
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.health.checks import (
     EXIT_CODES,
     FAIL,
     GAPS_WARN_MAX,
     OK,
+    UNIVERSE_FRESHNESS_FAIL_THRESHOLD,
+    UNIVERSE_FRESHNESS_WARN_THRESHOLD,
     WARN,
     check_candle_freshness,
     check_database,
     check_gaps,
     check_journal_activity,
     check_last_run,
+    check_symbol_source,
     check_telegram_config,
+    check_universe_freshness,
     run_all_checks,
     worst_status,
 )
@@ -275,6 +279,135 @@ def test_telegram_config_ok_when_configured() -> None:
 
 def test_telegram_config_warn_when_missing() -> None:
     assert check_telegram_config(False).status == WARN
+
+
+# --- check_universe_freshness (Phase 6, Merge 3) -----------------------------
+
+
+def _save_snapshot(store: TidemarkStore, snapshot_at: dt.datetime) -> None:
+    store.save_universe_snapshot(
+        UniverseSnapshot(
+            snapshot_id="snap-1",
+            snapshot_at=snapshot_at,
+            methodology_version="universe-v2",
+            venue=VENUE,
+            metric_name="MEDIAN_DAILY_DERIVED_QUOTE_VOLUME_30D",
+            metric_window_days=30,
+            k=50,
+            n_selected=1,
+            provenance="FORWARD",
+            candle_hash="deadbeef",
+            counts_by_exclusion_reason={},
+        ),
+        [
+            UniverseSnapshotRow(
+                snapshot_id="snap-1",
+                symbol=SYMBOL,
+                rank=1,
+                metric_value=1000.0,
+                eligible=True,
+                selected=True,
+                exclusion_reason=None,
+            )
+        ],
+    )
+
+
+def test_universe_freshness_warn_when_no_snapshot_exists(store: TidemarkStore) -> None:
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == WARN
+    assert "no universe snapshot" in result.detail.lower()
+
+
+def test_universe_freshness_ok_within_48_hours(store: TidemarkStore) -> None:
+    _save_snapshot(store, NOW - dt.timedelta(hours=10))
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == OK
+
+
+def test_universe_freshness_ok_exactly_at_warn_threshold(store: TidemarkStore) -> None:
+    _save_snapshot(store, NOW - UNIVERSE_FRESHNESS_WARN_THRESHOLD)
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == OK
+
+
+def test_universe_freshness_warn_between_48_hours_and_7_days(store: TidemarkStore) -> None:
+    _save_snapshot(store, NOW - dt.timedelta(hours=72))
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == WARN
+
+
+def test_universe_freshness_warn_exactly_at_fail_threshold(store: TidemarkStore) -> None:
+    _save_snapshot(store, NOW - UNIVERSE_FRESHNESS_FAIL_THRESHOLD)
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == WARN
+
+
+def test_universe_freshness_fail_beyond_7_days(store: TidemarkStore) -> None:
+    _save_snapshot(store, NOW - UNIVERSE_FRESHNESS_FAIL_THRESHOLD - dt.timedelta(hours=1))
+    result = check_universe_freshness(store, VENUE, NOW)
+    assert result.status == FAIL
+
+
+# --- check_symbol_source (Phase 6, Merge 3) ----------------------------------
+
+
+def test_symbol_source_ok_when_no_run_recorded() -> None:
+    result = check_symbol_source(None)
+    assert result.status == OK
+
+
+def test_symbol_source_ok_when_run_predates_merge_3() -> None:
+    """A Run row from before Merge 3 has symbol_source=None - reported as
+    OK, not a failure."""
+    run = _run("COMPLETED", NOW - dt.timedelta(hours=1), NOW - dt.timedelta(minutes=30))
+    result = check_symbol_source(run)
+    assert result.status == OK
+
+
+def test_symbol_source_ok_when_snapshot_was_used() -> None:
+    run = Run(
+        run_id="r1",
+        command="run",
+        started_at=NOW,
+        finished_at=NOW,
+        status="COMPLETED",
+        symbol_source="SNAPSHOT",
+        symbol_source_snapshot_id="snap-1",
+    )
+    result = check_symbol_source(run)
+    assert result.status == OK
+    assert "SNAPSHOT" in result.detail
+    assert "snap-1" in result.detail
+
+
+def test_symbol_source_ok_when_explicit_was_used() -> None:
+    run = Run(
+        run_id="r1",
+        command="run",
+        started_at=NOW,
+        finished_at=NOW,
+        status="COMPLETED",
+        symbol_source="EXPLICIT",
+        symbol_source_snapshot_id=None,
+    )
+    result = check_symbol_source(run)
+    assert result.status == OK
+
+
+def test_symbol_source_warn_when_fallback_was_used() -> None:
+    run = Run(
+        run_id="r1",
+        command="run",
+        started_at=NOW,
+        finished_at=NOW,
+        status="COMPLETED",
+        symbol_source="TIDEMARK_SYMBOLS_FALLBACK",
+        symbol_source_snapshot_id=None,
+    )
+    result = check_symbol_source(run)
+    assert result.status == WARN
+    assert "TIDEMARK_SYMBOLS_FALLBACK" in result.detail
 
 
 # --- run_all_checks (integration) ------------------------------------------

@@ -22,6 +22,7 @@ from sqlalchemy import Engine, inspect
 
 from tidemark.data.models import Base, Run
 from tidemark.data.store import RUNNING_STATUS, TidemarkStore
+from tidemark.data.symbol_source import TIDEMARK_SYMBOLS_FALLBACK
 from tidemark.data.timeframes import TIMEFRAME_DURATIONS
 
 # --- Status levels -----------------------------------------------------------
@@ -66,6 +67,12 @@ GAPS_WARN_MAX = 5
 # noise rather than a signal about whether Tidemark is healthy.
 HEALTH_TIMEFRAMES: tuple[str, ...] = ("4h", "1d", "1w")
 
+# Universe snapshot freshness (Phase 6, Merge 3) - matches data/
+# symbol_source.py's own default staleness threshold for the WARN edge;
+# a snapshot old enough to be actively dangerous (a week) is FAIL.
+UNIVERSE_FRESHNESS_WARN_THRESHOLD = dt.timedelta(hours=48)
+UNIVERSE_FRESHNESS_FAIL_THRESHOLD = dt.timedelta(days=7)
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -95,6 +102,8 @@ class HealthReport:
     last_run_status: str | None = None
     total_gaps: int = 0
     journal_count: int = 0
+    last_run_symbol_source: str | None = None
+    last_run_symbol_source_snapshot_id: str | None = None
 
     @property
     def exit_code(self) -> int:
@@ -243,6 +252,55 @@ def check_telegram_config(is_configured: bool) -> CheckResult:
     )
 
 
+def check_universe_freshness(store: TidemarkStore, venue: str, now: dt.datetime) -> CheckResult:
+    """Age of the latest universe snapshot for `venue` (Phase 6, Merge 3).
+
+    No snapshot at all is WARN, not FAIL - a fresh deployment or one that
+    simply hasn't run `tidemark universe snapshot` yet isn't broken, and
+    `tidemark run`/`tidemark observe run` fall back to TIDEMARK_SYMBOLS
+    rather than failing over this (see `data/symbol_source.py`). Beyond
+    `UNIVERSE_FRESHNESS_WARN_THRESHOLD` (48h) that fallback is already in
+    effect; beyond `UNIVERSE_FRESHNESS_FAIL_THRESHOLD` (7 days) the
+    universe has been silently stale long enough to treat as a real
+    failure.
+    """
+    snapshots = store.universe_snapshots(venue)
+    if not snapshots:
+        return CheckResult("universe_freshness", WARN, "no universe snapshot exists for this venue")
+
+    age = now - snapshots[0].snapshot_at
+    detail = f"latest snapshot {format_age(age)} old"
+    if age <= UNIVERSE_FRESHNESS_WARN_THRESHOLD:
+        return CheckResult("universe_freshness", OK, detail)
+    if age <= UNIVERSE_FRESHNESS_FAIL_THRESHOLD:
+        return CheckResult("universe_freshness", WARN, detail)
+    return CheckResult("universe_freshness", FAIL, detail)
+
+
+def check_symbol_source(latest_run_for_run_command: Run | None) -> CheckResult:
+    """Which symbol source the most recent `tidemark run` actually used
+    (Phase 6, Merge 3) - EXPLICIT/SNAPSHOT/TIDEMARK_SYMBOLS_FALLBACK, plus
+    the snapshot id when one was used. WARN when the fallback was used,
+    for whatever reason (missing snapshot, stale snapshot, or a snapshot
+    that selected nothing) - `check_universe_freshness` reports the
+    snapshot's own age independently, but this is the direct signal that
+    the observer isn't currently running on a universe-driven selection.
+    A run that never recorded a source (every command before Merge 3, or
+    no run yet) is OK, not a failure - there is nothing wrong to report.
+    """
+    if latest_run_for_run_command is None or latest_run_for_run_command.symbol_source is None:
+        return CheckResult("symbol_source", OK, "no run recorded yet")
+
+    source = latest_run_for_run_command.symbol_source
+    snapshot_id = latest_run_for_run_command.symbol_source_snapshot_id
+    detail = f"last run used {source}"
+    if snapshot_id is not None:
+        detail += f" ({snapshot_id})"
+
+    status = WARN if source == TIDEMARK_SYMBOLS_FALLBACK else OK
+    return CheckResult("symbol_source", status, detail)
+
+
 # --- Orchestration ------------------------------------------------------
 
 
@@ -289,6 +347,8 @@ def run_all_checks(
 
     checks.append(check_journal_activity(store, now))
     checks.append(check_telegram_config(is_telegram_configured))
+    checks.append(check_universe_freshness(store, venue, now))
+    checks.append(check_symbol_source(latest_runs.get("run")))
 
     overall = worst_status([c.status for c in checks])
 
@@ -313,6 +373,7 @@ def run_all_checks(
         for timeframe in HEALTH_TIMEFRAMES
     )
     latest_run = store.latest_run()
+    latest_run_command = latest_runs.get("run")
 
     return HealthReport(
         status=overall,
@@ -330,4 +391,10 @@ def run_all_checks(
         last_run_status=(latest_run.status if latest_run is not None else None),
         total_gaps=total_gaps,
         journal_count=store.count_journal_entries(),
+        last_run_symbol_source=(
+            latest_run_command.symbol_source if latest_run_command is not None else None
+        ),
+        last_run_symbol_source_snapshot_id=(
+            latest_run_command.symbol_source_snapshot_id if latest_run_command is not None else None
+        ),
     )
