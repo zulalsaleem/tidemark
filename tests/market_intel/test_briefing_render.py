@@ -96,14 +96,14 @@ def test_structure_with_no_grade_omits_the_grade_clause() -> None:
     assert "grade" not in message.split("DERIVATIVES CONTEXT")[0].lower()
 
 
-def test_missing_context_record_renders_unavailable() -> None:
+def test_missing_journal_entry_renders_unavailable() -> None:
     classification = classify(_price(), _oi(), _funding())
     message = render_briefing(StructureSnapshot(available=False), classification, NOW)
 
     assert "UNAVAILABLE (no stored Section 1 record for BTC)" in message
 
 
-def test_stale_context_record_renders_unavailable_with_a_different_reason() -> None:
+def test_stale_journal_entry_renders_unavailable_with_a_different_reason() -> None:
     classification = classify(_price(), _oi(), _funding())
     message = render_briefing(StructureSnapshot(available=False, stale=True), classification, NOW)
 

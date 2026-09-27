@@ -11,8 +11,11 @@ Two directions are checked:
 THE ONE EXCEPTION (Merge 3, see the ADR's "Addendum: Merge 3"):
 `tidemark.data.models` (a plain ORM data module with no imports of its
 own back into the research engine) may be imported, for exactly one
-purpose - a read-only lookup of BTC's stored Section 1 `ContextRecord`
-in `context_read.py`. Nothing else under `tidemark.data` is permitted,
+purpose - a read-only lookup of BTC's stored Section 1 result
+(`JournalEntry` - the table `tidemark run` actually writes; an earlier
+version of this read `ContextRecord`/`context_records`, a table nothing
+in production writes to, until an audit caught it) in `context_read.py`.
+Nothing else under `tidemark.data` is permitted,
 which is a deliberate TIGHTENING of the boundary versus a plain
 "tidemark.data.exchange is forbidden" rule: `tidemark.data.store`, for
 instance, is not named anywhere in CLAUDE.md's forbidden list, but its
