@@ -9,8 +9,9 @@ from typer.testing import CliRunner
 
 from tidemark import __version__
 from tidemark import cli as cli_module
-from tidemark.cli import _parse_csv, app
+from tidemark.cli import _encode_for_display, _parse_csv, app
 from tidemark.context import htf, mtf
+from tidemark.data import asset_class as asset_class_module
 from tidemark.data.exchange import RawCandle
 from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
@@ -169,6 +170,18 @@ def _raw_candle(open_time: dt.datetime, close: float = 100.0) -> RawCandle:
     return RawCandle(
         open_time=open_time,
         close_time=open_time + dt.timedelta(hours=4),
+        open=close,
+        high=close + 1,
+        low=close - 1,
+        close=close,
+        volume=1.0,
+    )
+
+
+def _raw_1d_candle(open_time: dt.datetime, close: float = 100.0) -> RawCandle:
+    return RawCandle(
+        open_time=open_time,
+        close_time=open_time + dt.timedelta(days=1),
         open=close,
         high=close + 1,
         low=close - 1,

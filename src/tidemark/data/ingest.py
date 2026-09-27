@@ -49,11 +49,20 @@ def run_backfill(
     timeframes: list[str],
     days: int,
     now: dt.datetime | None = None,
+    on_outcome: Callable[[SymbolTimeframeOutcome], None] | None = None,
 ) -> RunOutcome:
-    """Backfill `days` of closed candles for each symbol/timeframe."""
+    """Backfill `days` of closed candles for each symbol/timeframe.
+
+    `on_outcome`, if given, is called once per symbol/timeframe as each
+    one finishes (success or failure) — progress reporting for a caller
+    driving many symbols (e.g. `tidemark universe backfill`), never
+    required by existing callers.
+    """
     now = now or dt.datetime.now(dt.UTC)
     since = now - dt.timedelta(days=days)
-    return _execute(store, exchange, venue, symbols, timeframes, "backfill", lambda *_: since, now)
+    return _execute(
+        store, exchange, venue, symbols, timeframes, "backfill", lambda *_: since, now, on_outcome
+    )
 
 
 def run_update(
@@ -64,11 +73,13 @@ def run_update(
     timeframes: list[str],
     fallback_days: int = DEFAULT_UPDATE_FALLBACK_DAYS,
     now: dt.datetime | None = None,
+    on_outcome: Callable[[SymbolTimeframeOutcome], None] | None = None,
 ) -> RunOutcome:
     """Fetch from each symbol/timeframe's last stored candle up to now.
 
     If nothing is stored yet for a symbol/timeframe, falls back to
-    `fallback_days` of history, matching a plain backfill.
+    `fallback_days` of history, matching a plain backfill. `on_outcome`:
+    see `run_backfill`.
     """
     now = now or dt.datetime.now(dt.UTC)
 
@@ -78,7 +89,9 @@ def run_update(
             return latest.close_time
         return now - dt.timedelta(days=fallback_days)
 
-    return _execute(store, exchange, venue, symbols, timeframes, "update", since_fn, now)
+    return _execute(
+        store, exchange, venue, symbols, timeframes, "update", since_fn, now, on_outcome
+    )
 
 
 def _execute(
@@ -90,6 +103,7 @@ def _execute(
     command: str,
     since_fn: Callable[[str, str], dt.datetime],
     now: dt.datetime,
+    on_outcome: Callable[[SymbolTimeframeOutcome], None] | None = None,
 ) -> RunOutcome:
     run_id = uuid.uuid4().hex
     started_at = now
@@ -102,13 +116,15 @@ def _execute(
     outcomes: list[SymbolTimeframeOutcome] = []
     stats: dict[tuple[str, str], CandleUpsertResult] = {}
     try:
-        outcomes = [
-            _fetch_and_store(
-                store, exchange, venue, symbol, timeframe, since_fn(symbol, timeframe), now
-            )
-            for symbol in symbols
-            for timeframe in timeframes
-        ]
+        outcomes = []
+        for symbol in symbols:
+            for timeframe in timeframes:
+                outcome = _fetch_and_store(
+                    store, exchange, venue, symbol, timeframe, since_fn(symbol, timeframe), now
+                )
+                outcomes.append(outcome)
+                if on_outcome is not None:
+                    on_outcome(outcome)
 
         fail_count = sum(1 for o in outcomes if o.error is not None)
         success_count = len(outcomes) - fail_count

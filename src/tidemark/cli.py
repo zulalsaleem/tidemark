@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json as json_module
+import sys
 
 import pandas as pd
 import typer
@@ -17,11 +18,25 @@ from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
 from tidemark.context import htf, mtf
 from tidemark.core.atr import atr as compute_atr
+from tidemark.data.asset_class import (
+    NON_CRYPTO_UNDERLYING,
+    NON_ELIGIBLE_INDEX,
+    UNKNOWN_UNDERLYING_TYPE,
+)
+from tidemark.data.discover import DiscoveryOutcome, run_discovery
 from tidemark.data.exchange import ExchangeClient
-from tidemark.data.ingest import RunOutcome, run_backfill, run_update
+from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
 from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.data.universe_backfill import (
+    DEFAULT_BACKFILL_DAYS,
+    UniverseBackfillOutcome,
+    active_symbols,
+    run_universe_backfill,
+)
+from tidemark.data.universe_eligibility import INSUFFICIENT_VOLUME_HISTORY, NOT_ASSESSED
+from tidemark.data.universe_snapshot import generate_universe_snapshot
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
@@ -221,6 +236,30 @@ def _parse_csv(values: list[str] | None) -> list[str] | None:
         return None
     items = [item.strip() for value in values for item in value.split(",") if item.strip()]
     return items or None
+
+
+def _encode_for_display(text: str, encoding: str) -> str:
+    """Replace any character `encoding` can't represent with a
+    substitute, rather than letting a later write crash on it.
+    """
+    return text.encode(encoding, errors="replace").decode(encoding)
+
+
+def _safe_echo(text: str) -> None:
+    """Print `text`, substituting any character the terminal's stdout
+    encoding can't represent, instead of crashing.
+
+    `TIDEMARK_SYMBOLS`-derived output is always operator-chosen ASCII, so
+    every command before Phase 6 could assume plain `typer.echo` was
+    safe. `universe discover`/`backfill`/`registry`/`show` (Merge 2A)
+    print ticker symbols straight from the live venue listing instead,
+    and a real venue can and does list non-Latin-1 tickers (e.g. several
+    CJK-named meme-coin perpetuals on binanceusdm today) - those crash a
+    plain `echo` under a legacy Windows console codepage (cp1252) that
+    can't encode them. This never touches what's stored; only display.
+    """
+    encoding = sys.stdout.encoding or "utf-8"
+    typer.echo(_encode_for_display(text, encoding))
 
 
 def _store(settings: Settings) -> TidemarkStore:
