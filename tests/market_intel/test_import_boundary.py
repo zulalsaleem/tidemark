@@ -80,3 +80,16 @@ def test_market_intel_package_exists_and_is_nonempty() -> None:
     assert (SRC_ROOT / "data" / "exchange.py").is_file()
     for package in ("context", "journal", "replay"):
         assert (SRC_ROOT / package).is_dir()
+
+
+def test_the_telegram_bot_files_are_covered_by_the_boundary_scan() -> None:
+    # The two boundary tests above scan `market_intel/*.py` via rglob, so
+    # they already cover any new file added under the package - this
+    # test exists only to make that coverage claim concrete for the
+    # Merge 2 bot files specifically (per the merge's own instruction to
+    # "extend the existing import-boundary test to cover it"), so the
+    # claim can't silently go stale if one of these files is ever
+    # renamed or removed.
+    market_intel_dir = SRC_ROOT / "market_intel"
+    for filename in ("bot.py", "telegram_client.py", "telegram_render.py", "bot_state.py"):
+        assert (market_intel_dir / filename).is_file()
