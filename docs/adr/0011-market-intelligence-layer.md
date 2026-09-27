@@ -274,3 +274,115 @@ failure.
 - `docs/rulebook/derivatives-context-v0.1.md` remains unwired. Nothing
   in this bot reads it, classifies price/OI/funding combinations, or
   produces anything resembling a trade direction.
+
+## Addendum: Merge 3 — the hourly BTC briefing
+
+Merge 2 gave a human a command to ask on demand. Merge 3 is the first
+thing in `market_intel` that runs unattended and decides for itself
+whether to speak: an hourly evaluation that classifies BTC's closed-1H
+price/OI/funding reading against `docs/rulebook/derivatives-context-
+v0.1.md` and alerts only on a real change - never on a fixed schedule,
+never on every tick.
+
+**The rulebook was written before any classifier code, deliberately.**
+`derivatives-context-v0.1.md` was updated with the exact thresholds,
+D1-D6 identifiers, and the NO_MATCH definition in its own commit, ahead
+of `derivatives_classifier.py`. This mirrors CLAUDE.md's standing rule
+that strategy logic comes only from the rulebook: the classifier reads
+`PRICE_UP_THRESHOLD_PCT`/`OI_UP_THRESHOLD_PCT`/etc. from that module,
+but that module's own docstring states plainly that every value in it is
+copied from the rulebook document, not invented here.
+
+**The read-only `context_records` exception.** The briefing needs BTC's
+stored Section 1 result to show alongside derivatives context, but
+`market_intel` must never recompute Section 1 or import its logic. The
+exception (`context_read.py`) is narrow by construction, not just by
+convention:
+- it imports only `tidemark.data.models.ContextRecord`, a plain ORM
+  class with no imports of its own back into the research engine;
+- it never imports `tidemark.data.store`, whose `TidemarkStore`
+  transitively imports `tidemark.data.exchange` for a type hint - a gap
+  a naive "just forbid `tidemark.data.exchange`" rule would have missed
+  entirely, since `tidemark.data.store` was never itself on any
+  forbidden list;
+- it builds its own SQLAlchemy engine directly from a database URL
+  string and never calls `init_db`, so it can never provision the
+  research schema, only observe whatever is already there;
+- it never writes anything, anywhere - there is no write path in this
+  module at all.
+
+  The import-boundary test was tightened from "`tidemark.data.exchange`
+  is forbidden" to an allowlist - only `tidemark.data.models` may be
+  imported under `tidemark.data`, and a second test asserts that only
+  `context_read.py` actually does. This closes the `tidemark.data.store`
+  gap and any other one like it, present or future, rather than growing
+  the blocklist reactively each time a new transitive path is found.
+
+  If no context record exists for BTC, or the latest one is more than
+  `CONTEXT_RECORD_STALE_AFTER` (8 hours - two missed 4H cycles of grace,
+  an operational judgment `market_intel` owns for its own display
+  purposes, not a Section 1 parameter) old, the briefing's structure
+  section renders `UNAVAILABLE` with a reason. It never falls back to
+  computing structure itself - there is no code path by which it could,
+  since Section 1's evaluation logic (`tidemark.context`) is never
+  imported here at all.
+
+**Derivatives data never flows back into Section 1.** There is no
+write path from `market_intel` into `context_records`, `journal_entries`,
+`candles`, or any other research table - verified the same way the
+import boundary is: statically, not by inspection. The information flow
+across this boundary is one-way and read-only.
+
+**State-change alerting, not a fixed schedule.** Every hourly evaluation
+is recorded in `market_intel_evaluations` (`evaluation_store.py`) - its
+own table, its own declarative Base, never `journal_entries`,
+`observations`, or `context_records` - whether or not it triggers a
+send. Two independent triggers decide whether to actually alert:
+- the classification differs from the **immediately prior evaluation**
+  (sent or not) - mirroring `journal.changes`'s own "compare against the
+  previous recorded row" pattern, including its behavior on the very
+  first evaluation ever: with nothing to compare against, it never
+  alerts, exactly like a first Section 1 evaluation is journal-only;
+- BTC's stored (state, watch) differs from what the **last SENT
+  briefing** carried - a deliberately different baseline from the
+  classification check. The point of this trigger is "what you were
+  last actually told about structure is now stale," not "structure
+  ticked between two evaluations nobody saw" - comparing against the
+  last evaluation rather than the last sent one would make a transient,
+  unsent structure change on an otherwise-quiet hour retroactively
+  "count" against a future comparison it was never actually measured
+  against.
+
+**NO_MATCH never alerts, full stop - not "changed NO_MATCH", not
+"NO_MATCH after a real D-match either."** The rulebook document defines
+no interpretation for those cases; a briefing has nothing true to say
+about them beyond "no defined interpretation applies right now," so it
+says only that, and never sends it. This is stated in both the rulebook
+document and the classifier's own tests, not left implicit in the
+alerting code alone.
+
+**Idempotent per hour, with one narrow update exception.** A repeat
+`tidemark intel briefing` invocation within the same closed 1H window
+never recomputes or overwrites its classification/inputs/structure
+fields - mirroring `JournalEntry.alert_sent`/`alert_reason` exactly,
+`MarketIntelEvaluation.sent`/`send_reason` are the only fields a second
+write may change, letting a dry-run recorded as `sent=False` later be
+corrected to `sent=True` once the same hour's briefing is actually
+delivered via `--send`.
+
+### Consequences (Merge 3)
+
+- The hourly BTC briefing is provably one-directional: it can read one
+  specific, already-computed Section 1 fact, and it can never write to
+  or recompute anything the research engine owns. The import-boundary
+  test fails the build the moment either constraint is violated.
+- `market_intel_evaluations` is a complete, queryable history of every
+  hourly evaluation this system has ever made - sent or not - which is
+  what makes "did this actually change, and when" answerable later
+  without re-deriving it from Coinalyze's own (short) history retention.
+- `docs/rulebook/derivatives-context-v0.1.md` is now load-bearing: a
+  future threshold or interpretation change is a new rulebook version
+  with its own classifier change reviewed against it, never a quiet edit
+  of what a running system has been alerting on.
+- BTC dominance remains unavailable and out of scope; this briefing adds
+  no new sourcing for it.

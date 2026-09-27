@@ -94,16 +94,20 @@
                  +----------------------------+
                  |  market_intel/               |
                  |  Coinalyze derivatives data   |
-                 |  (Phase 8, Merge 1 + 2)       |
+                 |  (Phase 8, Merge 1 + 2 + 3)   |
                  |  no connection to anything    |
                  |  above - reads HTTP, writes   |
                  |  nothing, imports nothing     |
-                 |  from data/exchange.py,       |
-                 |  context/, journal/, replay/  |
+                 |  from context/journal/replay/ |
+                 |  data.exchange/data.store -   |
+                 |  ONE exception (Merge 3):     |
+                 |  context_read.py may read     |
+                 |  context_records read-only    |
                  |  -> `tidemark intel market`   |
                  |  -> `tidemark intel bot`      |
                  |     (own Telegram client,     |
                  |     never notify/telegram.py) |
+                 |  -> `tidemark intel briefing` |
                  +----------------------------+
 ```
 
@@ -168,12 +172,17 @@ discipline.
 | `market_intel/models.py` | (Phase 8, Merge 1) The normalized `MarketIntelSnapshot` and its per-metric dataclasses (`PointInTimeMetric`, `ClosedPeriodMetric`, `LongShortRatioMetric`, `LiquidationsMetric`). Every metric carries its own status, unit, and window (or point-in-time update timestamp); a missing value is always a non-`OK` status with `value=None`, never a rendered zero. |
 | `market_intel/service.py` | (Phase 8, Merge 1) `fetch_market_intel`: orchestrates symbol mapping, future-markets validation, closed-period clamping, and the per-metric calls into one `MarketIntelSnapshot`. Always passes `convert_to_usd=true` where Coinalyze supports it; fixes a single 1-hour window for every closed-period metric. |
 | `market_intel/telegram_client.py` | (Phase 8, Merge 2) `TelegramBotClient`: a second, independent Bot API client (`getUpdates`/`sendMessage` only) — deliberately not `notify/telegram.py`, which transitively imports `context`/`data.models`/`journal` to build Section 1/2 alert text. Bot token is `SecretStr`, passed only in the request URL (the Bot API's own auth shape), never logged. |
-| `market_intel/telegram_render.py` | (Phase 8, Merge 2) `render_snapshot`: Telegram-formatted rendering of a `MarketIntelSnapshot` for `/coin`, with its own footer disclaimer. A second, independent renderer from `cli.py`'s own — the same "duplicate rather than couple" tradeoff ADR 0010 made for `evidence.py` versus `replay/report.py`. |
+| `market_intel/telegram_render.py` | (Phase 8, Merge 2 + 3) `render_snapshot`: Telegram-formatted rendering of a `MarketIntelSnapshot` for `/coin`, with its own footer disclaimer. A second, independent renderer from `cli.py`'s own — the same "duplicate rather than couple" tradeoff ADR 0010 made for `evidence.py` versus `replay/report.py`. `render_briefing` (Merge 3) adds the two-section BTC STRUCTURE / DERIVATIVES CONTEXT message, reusing the same formatting helpers; a `NO_MATCH` classification renders only its reason, never a fabricated interpretation. |
 | `market_intel/bot_state.py` | (Phase 8, Merge 2) `BotStateStore`: persists the Telegram `getUpdates` offset to a flat JSON file (atomic write, temp file + rename) — no relationship to `tidemark.db` at all, so a restart never replays or skips a message. |
 | `market_intel/bot.py` | (Phase 8, Merge 2) `run_once`/`run_forever`: long-polling loop, chat-ID authorization (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID` only — unauthorized chats are silently ignored and only logged, chat id and timestamp, never message text), `/coin`/`/help`/`/start` command dispatch, `normalize_coin_input` (accepts `SOL`/`$SOL`/`sol`/`SOL/USDT:USDT`), a startup-backlog discard (a few minutes), and exponential backoff on a Telegram outage (immediate raise on an unrecoverable 401/403). Reuses `CoinalyzeClient.calls_in_last_minute` to throttle a `/coin` burst before it can exhaust the documented 40/minute budget. |
+| `market_intel/derivatives_classifier.py` | (Phase 8, Merge 3) `classify`: D1-D6/`NO_MATCH` against `docs/rulebook/derivatives-context-v0.1.md` - every threshold copied verbatim from that document, none defined here. Price/OI use strict-inequality thresholds (boundary values are FLAT); funding classifies by sign for D1-D4 and by trend (vs. the previous closed reading) for D5-D6. A funding reading of exactly 0.0, an UNCHANGED trend, any missing/non-`OK` input, or any of the other twelve of 18 possible combinations all yield `NO_MATCH` with a reason - pure function, no I/O. |
+| `market_intel/briefing_data.py` | (Phase 8, Merge 3) `fetch_classifier_inputs`: fetches BTC's closed-1H price % change, OI % change, and current+previous closed funding - independent from `service.py`'s `MarketIntelSnapshot`, a different, broader shape for `/coin`/`intel market` that was never meant to carry a price reading. |
+| `market_intel/context_read.py` | (Phase 8, Merge 3) The one narrow, explicitly-permitted exception to the isolation boundary: `read_latest_context_record` reads BTC's stored Section 1 result for the briefing's structure section. Imports only `tidemark.data.models.ContextRecord` - never `tidemark.context`, never `tidemark.data.store` (whose `TidemarkStore` transitively imports `tidemark.data.exchange`). Builds its own engine directly from a database URL, never calls `init_db`, and never writes anything. `is_stale` applies an 8h operational grace window (`CONTEXT_RECORD_STALE_AFTER`) `market_intel` owns for its own display, not a Section 1 parameter. |
+| `market_intel/evaluation_store.py` | (Phase 8, Merge 3) `market_intel`'s own table, `market_intel_evaluations`, in its own declarative `MarketIntelBase` - never `tidemark.data.models.Base`, never `journal_entries`/`observations`/`context_records`. Idempotent per `(asset, evaluated_at)` like `JournalEntry`, with the same narrow update exception (`sent`/`send_reason` only). Separate lookups for "the immediately prior evaluation" and "the last SENT evaluation" back the two different alerting comparisons `briefing.py` needs. |
+| `market_intel/briefing.py` | (Phase 8, Merge 3) `evaluate_briefing`: fetches the classifier's inputs, classifies, reads BTC's structure via `context_read.py`, decides whether to send (a classification change vs. the immediately prior evaluation, or a structural change vs. the last SENT one - `NO_MATCH` never sends), renders the message, and records every evaluation - sent or not. `mark_sent` updates an already-recorded evaluation's `sent`/`send_reason` after an actual Telegram delivery. |
 | `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
 | `health/checks.py` | Pure health checks reading only `data/store.py`: database reachability/schema, candle freshness, last run per command, journal activity, gap counts, Telegram config presence, universe freshness (Phase 6, Merge 3 — `check_universe_freshness`: OK <48h, WARN <7d or no snapshot, FAIL beyond), and which symbol source the last `run` used (`check_symbol_source`: WARN on `TIDEMARK_SYMBOLS_FALLBACK`). Never sends anything itself — see [ADR 0006](adr/0006-health-check-design.md). |
-| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` and `observe run` resolve their symbols via `data/symbol_source.py` (Phase 6, Merge 3 — explicit `--symbols`, else the latest valid universe snapshot, else `TIDEMARK_SYMBOLS`, printing which source fired) and drive the journal/observe pipelines; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL, now including universe freshness and symbol source) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `universe discover` (Merge 2A) refreshes `market_registry` from the venue's live listing, `universe backfill [--days]` backfills 1D candles for every ACTIVE registry symbol and prints per-symbol progress, `universe snapshot [--as-of]` (Merge 2B; UNIV-08 domain check) generates and persists a snapshot, `universe sync [--days]` (Merge 3) backfills 1H/4H/1D/1W for the currently SELECTED symbols only, `universe coverage [--snapshot-id]` (Merge 2B) reports symbols on venue/eligible/assessed/selected/data-available and counts by exclusion reason, and `universe registry`/`snapshots`/`show` are read-only inspection (`registry` shows candle coverage and stored row counts; `show` prints every ranked symbol including its `ASSET_CLASS` (UNIV-08), `eligible=NULL` rendered as `-`) - all report an empty database gracefully rather than erroring; `intel market --symbol <SYM> [--json]` (Phase 8, Merge 1) prints one symbol's normalized Coinalyze snapshot — reports `TIDEMARK_COINALYZE_API_KEY` missing as a clean message and exit rather than a traceback, and a symbol Coinalyze doesn't list as `MARKET_NOT_FOUND` with a non-zero exit — touches no store table at all; `intel bot [--once]` (Phase 8, Merge 2) runs the `/coin` Telegram long-polling bot in the foreground (`--once` processes any pending updates and exits, for testing) — reports a missing `TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`/`TIDEMARK_TELEGRAM_BOT_TOKEN`/`TIDEMARK_COINALYZE_API_KEY` as a clean message and exit, same as `intel market`. |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` and `observe run` resolve their symbols via `data/symbol_source.py` (Phase 6, Merge 3 — explicit `--symbols`, else the latest valid universe snapshot, else `TIDEMARK_SYMBOLS`, printing which source fired) and drive the journal/observe pipelines; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL, now including universe freshness and symbol source) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `universe discover` (Merge 2A) refreshes `market_registry` from the venue's live listing, `universe backfill [--days]` backfills 1D candles for every ACTIVE registry symbol and prints per-symbol progress, `universe snapshot [--as-of]` (Merge 2B; UNIV-08 domain check) generates and persists a snapshot, `universe sync [--days]` (Merge 3) backfills 1H/4H/1D/1W for the currently SELECTED symbols only, `universe coverage [--snapshot-id]` (Merge 2B) reports symbols on venue/eligible/assessed/selected/data-available and counts by exclusion reason, and `universe registry`/`snapshots`/`show` are read-only inspection (`registry` shows candle coverage and stored row counts; `show` prints every ranked symbol including its `ASSET_CLASS` (UNIV-08), `eligible=NULL` rendered as `-`) - all report an empty database gracefully rather than erroring; `intel market --symbol <SYM> [--json]` (Phase 8, Merge 1) prints one symbol's normalized Coinalyze snapshot — reports `TIDEMARK_COINALYZE_API_KEY` missing as a clean message and exit rather than a traceback, and a symbol Coinalyze doesn't list as `MARKET_NOT_FOUND` with a non-zero exit — touches no store table at all; `intel bot [--once]` (Phase 8, Merge 2) runs the `/coin` Telegram long-polling bot in the foreground (`--once` processes any pending updates and exits, for testing) — reports a missing `TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`/`TIDEMARK_TELEGRAM_BOT_TOKEN`/`TIDEMARK_COINALYZE_API_KEY` as a clean message and exit, same as `intel market`; `intel briefing [--send] [--json]` (Phase 8, Merge 3) evaluates and records the hourly BTC derivatives-context briefing unconditionally — `--send` only gates whether an evaluation that decided to send is actually delivered via Telegram, so repeated dry-run invocations are safe for testing. |
 
 ## Universe selection (Phase 6)
 
@@ -279,12 +288,19 @@ on.
 A live, read-only derivatives-data layer, strictly separate from
 everything above — see
 [ADR 0011](adr/0011-market-intelligence-layer.md) for the full
-rationale. `market_intel/` never imports `data/exchange.py`, `context/`,
-`journal/`, or `replay/`, is never imported by them, and never writes to
+rationale. `market_intel/` never imports `context/`, `journal/`, or
+`replay/`, is never imported by them, and never writes to
 `observations`, `journal_entries`, `context_records`, `candles`, or any
 other research table — enforced by
 `tests/market_intel/test_import_boundary.py`, a static-analysis test
 that fails the build the moment either side of the boundary is crossed.
+As of Merge 3, the same test enforces an allowlist for `tidemark.data`
+imports specifically: only `tidemark.data.models` may be imported
+(never `tidemark.data.exchange`, and never `tidemark.data.store`, whose
+`TidemarkStore` transitively imports `tidemark.data.exchange`), and only
+by `context_read.py` — the one narrow, explicitly-permitted exception
+that lets the hourly briefing read BTC's stored Section 1 result without
+recomputing it. See the ADR's Merge 3 addendum for the full reasoning.
 
 - **Merge 1** — the Coinalyze client, symbol mapping,
   future-markets cache/validation, closed-period clamping, and
@@ -294,7 +310,7 @@ that fails the build the moment either side of the boundary is crossed.
   `docs/rulebook/derivatives-context-v0.1.md` records six
   price/OI/funding interpretations as a `PROVISIONAL`, unwired
   document — no code reads it yet.
-- **Merge 2 (this one)** — `tidemark intel bot [--once]`: a `/coin`
+- **Merge 2** — `tidemark intel bot [--once]`: a `/coin`
   Telegram long-polling bot answering with the Merge 1 snapshot, for
   any Binance USDT-M perpetual. Chat-ID-only authorization
   (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`), silent ignore + minimal log for
@@ -303,6 +319,19 @@ that fails the build the moment either side of the boundary is crossed.
   `tidemark.db`, a discarded startup backlog, and exponential backoff on
   a Telegram outage. Still no hourly briefing, no scheduling beyond the
   bot's own poll loop, no BTC dominance, no trading recommendation.
+- **Merge 3 (this one)** — `tidemark intel briefing [--send] [--json]`:
+  the rulebook (`docs/rulebook/derivatives-context-v0.1.md`) gained exact
+  thresholds, D1-D6 identifiers, and a `NO_MATCH` definition in its own
+  commit before any classifier code; `derivatives_classifier.py` reads
+  them and defines none of its own. The one narrow, explicitly-permitted
+  exception to the isolation boundary (`context_read.py`, read-only
+  `context_records`) lets the briefing show BTC's stored Section 1
+  structure without ever recomputing it. Alerts only on a real
+  classification change (vs. the immediately prior evaluation) or a
+  meaningful structural change (vs. the last SENT briefing) — `NO_MATCH`
+  never alerts. Every evaluation, sent or not, is recorded in its own
+  table, `market_intel_evaluations` (`evaluation_store.py`), never a
+  research table. No BTC dominance, no trading recommendation.
 
 ## TODO
 
