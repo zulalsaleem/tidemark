@@ -7,6 +7,7 @@ exchange trading permissions.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json as json_module
 import sys
@@ -55,6 +56,17 @@ from tidemark.data.universe_sync import (
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
+from tidemark.market_intel.client import CoinalyzeClient
+from tidemark.market_intel.errors import (
+    CoinalyzeConnectionError,
+    CoinalyzeHttpError,
+    MissingApiKeyError,
+    RateLimitedError,
+    UnsupportedVenueError,
+)
+from tidemark.market_intel.future_markets import FutureMarketsCache
+from tidemark.market_intel.models import OK, MarketIntelSnapshot
+from tidemark.market_intel.service import fetch_market_intel
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 from tidemark.replay.render import render_report
 from tidemark.replay.report import build_replay_report
@@ -124,6 +136,18 @@ universe_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(universe_app, name="universe")
+
+intel_app = typer.Typer(
+    name="intel",
+    help=(
+        "Live market intelligence (Coinalyze derivatives data), strictly "
+        "separate from the research engine above. Raw data only - no "
+        "interpretation, no bias, no trading recommendation. See "
+        "docs/adr/0011-market-intelligence-layer.md."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(intel_app, name="intel")
 
 STALE_RUNNING_THRESHOLD = dt.timedelta(hours=2)
 
@@ -1399,6 +1423,138 @@ def universe_sync_command(
 
     typer.echo("")
     typer.echo(f"sync {outcome.run_id}: {outcome.status}")
+
+
+def _coinalyze_client(settings: Settings) -> CoinalyzeClient:
+    return CoinalyzeClient(api_key=settings.coinalyze_api_key)
+
+
+def _fmt_metric_line(name: str, metric) -> str:
+    if metric.status != OK:
+        return f"{name}: UNAVAILABLE ({metric.status}: {metric.reason})"
+    if getattr(metric, "is_point_in_time", False):
+        return (
+            f"{name}: {metric.value} {metric.unit}  (live, updated {metric.updated_at.isoformat()})"
+        )
+    return (
+        f"{name}: {metric.value} {metric.unit}  "
+        f"(period {metric.period_start.isoformat()} to {metric.period_close.isoformat()})"
+    )
+
+
+def _render_market_intel_snapshot(snapshot: MarketIntelSnapshot) -> str:
+    lines = [
+        f"{snapshot.symbol} ({snapshot.coinalyze_symbol})",
+        f"generated_at: {snapshot.generated_at.isoformat()}",
+        f"market_status: {snapshot.market_status}",
+        "",
+        _fmt_metric_line("Open interest", snapshot.open_interest),
+        _fmt_metric_line("Open interest change", snapshot.open_interest_change),
+        _fmt_metric_line("Funding rate", snapshot.funding_rate),
+        _fmt_metric_line("Predicted funding rate", snapshot.predicted_funding_rate),
+    ]
+
+    ls = snapshot.long_short_ratio
+    if ls.status != OK:
+        lines.append(f"Long/short ratio: UNAVAILABLE ({ls.status}: {ls.reason})")
+    else:
+        lines.append(
+            f"Long/short ratio: {ls.ratio}  "
+            f"(long {ls.long_pct}{ls.percent_unit} / short {ls.short_pct}{ls.percent_unit})  "
+            f"(period {ls.period_start.isoformat()} to {ls.period_close.isoformat()})"
+        )
+
+    liq = snapshot.liquidations
+    if liq.status != OK:
+        lines.append(f"Liquidations: UNAVAILABLE ({liq.status}: {liq.reason})")
+    else:
+        lines.append(
+            f"Liquidations: long={liq.long_usd} {liq.unit} / short={liq.short_usd} {liq.unit}  "
+            f"(period {liq.period_start.isoformat()} to {liq.period_close.isoformat()})"
+        )
+
+    lines.append(_fmt_metric_line("Futures volume", snapshot.futures_volume))
+    lines.append(_fmt_metric_line("Buy volume", snapshot.buy_volume))
+    lines.append(_fmt_metric_line("Sell volume", snapshot.sell_volume))
+    return "\n".join(lines)
+
+
+def _metric_to_dict(metric) -> dict:
+    payload = dataclasses.asdict(metric)
+    for key in ("updated_at", "period_start", "period_close"):
+        if key in payload and payload[key] is not None:
+            payload[key] = payload[key].isoformat()
+    return payload
+
+
+def _market_intel_snapshot_to_dict(snapshot: MarketIntelSnapshot) -> dict:
+    return {
+        "symbol": snapshot.symbol,
+        "coinalyze_symbol": snapshot.coinalyze_symbol,
+        "market_status": snapshot.market_status,
+        "generated_at": snapshot.generated_at.isoformat(),
+        "open_interest": _metric_to_dict(snapshot.open_interest),
+        "open_interest_change": _metric_to_dict(snapshot.open_interest_change),
+        "funding_rate": _metric_to_dict(snapshot.funding_rate),
+        "predicted_funding_rate": _metric_to_dict(snapshot.predicted_funding_rate),
+        "long_short_ratio": _metric_to_dict(snapshot.long_short_ratio),
+        "liquidations": _metric_to_dict(snapshot.liquidations),
+        "futures_volume": _metric_to_dict(snapshot.futures_volume),
+        "buy_volume": _metric_to_dict(snapshot.buy_volume),
+        "sell_volume": _metric_to_dict(snapshot.sell_volume),
+    }
+
+
+@intel_app.command("market")
+def intel_market(
+    symbol: str = typer.Option(
+        ..., "--symbol", help="ccxt unified perpetual symbol, e.g. BTC/USDT:USDT"
+    ),
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Print one symbol's normalized Coinalyze derivatives snapshot.
+
+    Raw data only: every metric with its value, unit, the period it
+    covers (or its own live-update timestamp for a point-in-time
+    reading), or UNAVAILABLE with the reason
+    (MARKET_NOT_FOUND/NO_DATA). No Telegram, no trading recommendation,
+    no bias output - see docs/adr/0011-market-intelligence-layer.md.
+    """
+    settings = get_settings()
+    try:
+        client = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    cache = FutureMarketsCache(client)
+    now = dt.datetime.now(dt.UTC)
+
+    try:
+        snapshot = fetch_market_intel(client, cache, symbol, settings.venue, now)
+    except UnsupportedVenueError as exc:
+        typer.echo(
+            f"No Coinalyze exchange-code mapping for venue {exc.venue!r}. "
+            "See docs/adr/0011-market-intelligence-layer.md."
+        )
+        raise typer.Exit(code=1) from None
+    except RateLimitedError as exc:
+        typer.echo(f"Coinalyze rate limited this request: {exc}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeHttpError as exc:
+        typer.echo(f"Coinalyze returned HTTP {exc.status_code}: {exc.detail}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeConnectionError as exc:
+        typer.echo(f"Could not reach Coinalyze: {exc.detail}")
+        raise typer.Exit(code=1) from None
+
+    if json:
+        typer.echo(json_module.dumps(_market_intel_snapshot_to_dict(snapshot), indent=2))
+    else:
+        _safe_echo(_render_market_intel_snapshot(snapshot))
+
+    if snapshot.market_status != OK:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:
