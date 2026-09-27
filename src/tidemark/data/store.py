@@ -643,6 +643,20 @@ class TidemarkStore:
             stmt = stmt.order_by(Observation.evaluated_at.desc())
             return list(session.scalars(stmt))
 
+    def all_journal_entries(self, since: dt.datetime | None = None) -> list[JournalEntry]:
+        """Fetch journal rows across every asset, newest first — mirrors
+        `all_observations`. Backs `tidemark evidence`'s REGIME PROXY
+        (Section 1 state distribution across observed symbols), which
+        needs every symbol's Section 1 history, not one asset's
+        (`journal_history`) or a total row count (`count_journal_entries`).
+        """
+        with self._session_factory() as session:
+            stmt = select(JournalEntry)
+            if since is not None:
+                stmt = stmt.where(JournalEntry.evaluated_at >= since)
+            stmt = stmt.order_by(JournalEntry.evaluated_at.desc())
+            return list(session.scalars(stmt))
+
     # -- market registry (Phase 6, Merge 1) ----------------------------------
 
     def upsert_market_registry_row(self, row: MarketRegistry) -> MarketRegistry:
