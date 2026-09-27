@@ -406,6 +406,86 @@ methodology. Raw data only: no interpretation, no bias, no trading
 recommendation, and BTC dominance is not available from this source at
 all (see the ADR for what sourcing it would require).
 
+### The /coin Telegram bot
+
+A long-polling bot that answers `/coin <SYMBOL>` with the same Merge 1
+snapshot, on demand, for any Binance USDT-M perpetual — not only the
+30-symbol research universe. Read-only in every sense: no orders, no
+exchange credentials, no signing. Reuses `TIDEMARK_TELEGRAM_BOT_TOKEN`
+(the same bot the Section 1/2 alert path uses, if configured) but is
+otherwise fully independent of it — its own client, its own message
+renderer, its own text.
+
+```bash
+# In addition to TIDEMARK_COINALYZE_API_KEY and TIDEMARK_TELEGRAM_BOT_TOKEN:
+# TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID=<your numeric chat id>   # get it from @userinfobot
+
+uv run tidemark intel bot          # long-running foreground process, Ctrl+C to stop
+uv run tidemark intel bot --once   # process any pending updates once and exit (for testing)
+```
+
+**Authorization is by numeric chat ID only** — never username or
+display name, both of which are attacker-controlled. Any chat other
+than `TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID` is silently ignored: no reply,
+nothing that confirms the bot exists, only a log line recording the
+chat id and timestamp (never the message text). See
+[docs/adr/0011](docs/adr/0011-market-intelligence-layer.md#addendum-merge-2--the-coin-telegram-bot)
+for the full reasoning, including why long polling was chosen over a
+webhook, and why a missing bot token or Coinalyze key exits cleanly
+rather than crashing.
+
+On startup, any backlog older than a few minutes is discarded (so a
+restart never answers a question asked hours ago), and the Telegram
+`getUpdates` offset is persisted to a small JSON file
+(`TIDEMARK_TELEGRAM_BOT_OFFSET_FILE`, unrelated to `tidemark.db`) so a
+restart never replays an already-answered message or skips a new one. A
+network failure or Telegram outage backs off and retries rather than
+exiting; an invalid bot token (HTTP 401/403) exits immediately instead
+of retrying forever against a guaranteed failure.
+
+**Running it unattended (systemd example).** This is illustrative, not
+prescriptive — it assumes nothing about your server beyond systemd
+being available, and you should adjust the user, paths, and Python
+invocation to match your actual deployment:
+
+```ini
+# /etc/systemd/system/tidemark-coin-bot.service
+[Unit]
+Description=Tidemark /coin Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tidemark
+WorkingDirectory=/opt/tidemark
+EnvironmentFile=/opt/tidemark/.env
+ExecStart=/opt/tidemark/.venv/bin/tidemark intel bot
+Restart=always
+RestartSec=5
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tidemark
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tidemark-coin-bot
+journalctl -u tidemark-coin-bot -f   # tail the logs
+```
+
+`Restart=always` covers the case this bot's own backoff loop can't:
+the process being killed outright (OOM, a host reboot, a manual stop).
+`EnvironmentFile` keeps every secret (`TIDEMARK_TELEGRAM_BOT_TOKEN`,
+`TIDEMARK_COINALYZE_API_KEY`, `TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`) out
+of the unit file itself and out of `systemctl status`/`ps` output.
+`MemoryMax` is a sane ceiling for a single long-polling HTTP client
+process, not a measured requirement — size it to your host.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -577,6 +657,24 @@ only: no Telegram, no scheduling, no bias, no trading recommendation.
 `docs/rulebook/derivatives-context-v0.1.md` records six price/OI/funding
 interpretations as a `PROVISIONAL`, unwired document only — see
 [docs/adr/0011-market-intelligence-layer.md](docs/adr/0011-market-intelligence-layer.md).
+
+**Phase 8, Merge 2 — the /coin Telegram bot.** A long-polling bot
+(`tidemark intel bot [--once]`) answering `/coin <SYMBOL>` with the
+Merge 1 snapshot, for any Binance USDT-M perpetual. Authorization is by
+numeric chat ID only (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`) — never
+username or display name; an unauthorized chat is silently ignored (no
+reply, only a logged chat id and timestamp, never the message text).
+Its own independent Telegram client and message renderer, not shared
+with `notify.telegram`'s Section 1/2 alert path, so a change to either
+can never silently affect the other. Persists its `getUpdates` offset
+to a flat JSON file (no relationship to `tidemark.db`) so a restart
+never replays or skips a message, and discards a startup backlog older
+than a few minutes. Reuses Merge 1's rate-limit tracking so a burst of
+`/coin` requests replies "rate limited" instead of failing silently.
+Survives a Telegram outage with exponential backoff; exits immediately
+on an invalid bot token rather than retrying forever. Still raw data
+only — see the
+[ADR's Merge 2 addendum](docs/adr/0011-market-intelligence-layer.md#addendum-merge-2--the-coin-telegram-bot).
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.

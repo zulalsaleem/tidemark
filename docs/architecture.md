@@ -94,13 +94,16 @@
                  +----------------------------+
                  |  market_intel/               |
                  |  Coinalyze derivatives data   |
-                 |  (Phase 8, Merge 1)           |
+                 |  (Phase 8, Merge 1 + 2)       |
                  |  no connection to anything    |
                  |  above - reads HTTP, writes   |
                  |  nothing, imports nothing     |
                  |  from data/exchange.py,       |
                  |  context/, journal/, replay/  |
                  |  -> `tidemark intel market`   |
+                 |  -> `tidemark intel bot`      |
+                 |     (own Telegram client,     |
+                 |     never notify/telegram.py) |
                  +----------------------------+
 ```
 
@@ -164,9 +167,13 @@ discipline.
 | `market_intel/future_markets.py` | (Phase 8, Merge 1) `FutureMarketsCache`: fetches and caches `/future-markets` (24h TTL) and is what lets the rest of the package distinguish `MARKET_NOT_FOUND` (not in the listing) from `NO_DATA` (listed, but the relevant `has_*_data` flag is false, or the live call comes back empty) from `OK`. |
 | `market_intel/models.py` | (Phase 8, Merge 1) The normalized `MarketIntelSnapshot` and its per-metric dataclasses (`PointInTimeMetric`, `ClosedPeriodMetric`, `LongShortRatioMetric`, `LiquidationsMetric`). Every metric carries its own status, unit, and window (or point-in-time update timestamp); a missing value is always a non-`OK` status with `value=None`, never a rendered zero. |
 | `market_intel/service.py` | (Phase 8, Merge 1) `fetch_market_intel`: orchestrates symbol mapping, future-markets validation, closed-period clamping, and the per-metric calls into one `MarketIntelSnapshot`. Always passes `convert_to_usd=true` where Coinalyze supports it; fixes a single 1-hour window for every closed-period metric. |
+| `market_intel/telegram_client.py` | (Phase 8, Merge 2) `TelegramBotClient`: a second, independent Bot API client (`getUpdates`/`sendMessage` only) — deliberately not `notify/telegram.py`, which transitively imports `context`/`data.models`/`journal` to build Section 1/2 alert text. Bot token is `SecretStr`, passed only in the request URL (the Bot API's own auth shape), never logged. |
+| `market_intel/telegram_render.py` | (Phase 8, Merge 2) `render_snapshot`: Telegram-formatted rendering of a `MarketIntelSnapshot` for `/coin`, with its own footer disclaimer. A second, independent renderer from `cli.py`'s own — the same "duplicate rather than couple" tradeoff ADR 0010 made for `evidence.py` versus `replay/report.py`. |
+| `market_intel/bot_state.py` | (Phase 8, Merge 2) `BotStateStore`: persists the Telegram `getUpdates` offset to a flat JSON file (atomic write, temp file + rename) — no relationship to `tidemark.db` at all, so a restart never replays or skips a message. |
+| `market_intel/bot.py` | (Phase 8, Merge 2) `run_once`/`run_forever`: long-polling loop, chat-ID authorization (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID` only — unauthorized chats are silently ignored and only logged, chat id and timestamp, never message text), `/coin`/`/help`/`/start` command dispatch, `normalize_coin_input` (accepts `SOL`/`$SOL`/`sol`/`SOL/USDT:USDT`), a startup-backlog discard (a few minutes), and exponential backoff on a Telegram outage (immediate raise on an unrecoverable 401/403). Reuses `CoinalyzeClient.calls_in_last_minute` to throttle a `/coin` burst before it can exhaust the documented 40/minute budget. |
 | `notify/telegram.py` | Sends read-only, send-only alerts to Telegram (no polling/webhook/commands). Builds the fixed alert message shape and the heartbeat summary shape (`build_heartbeat_message`), with bounded retry on transient network errors; a failure or missing credentials is logged and skipped, never raised. Classifies a failed send as a connection failure (never reached Telegram) vs an HTTP error response (`TelegramSendError`), so `notify test`/callers can report which. No order-placement code path exists anywhere in this project. |
 | `health/checks.py` | Pure health checks reading only `data/store.py`: database reachability/schema, candle freshness, last run per command, journal activity, gap counts, Telegram config presence, universe freshness (Phase 6, Merge 3 — `check_universe_freshness`: OK <48h, WARN <7d or no snapshot, FAIL beyond), and which symbol source the last `run` used (`check_symbol_source`: WARN on `TIDEMARK_SYMBOLS_FALLBACK`). Never sends anything itself — see [ADR 0006](adr/0006-health-check-design.md). |
-| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` and `observe run` resolve their symbols via `data/symbol_source.py` (Phase 6, Merge 3 — explicit `--symbols`, else the latest valid universe snapshot, else `TIDEMARK_SYMBOLS`, printing which source fired) and drive the journal/observe pipelines; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL, now including universe freshness and symbol source) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `universe discover` (Merge 2A) refreshes `market_registry` from the venue's live listing, `universe backfill [--days]` backfills 1D candles for every ACTIVE registry symbol and prints per-symbol progress, `universe snapshot [--as-of]` (Merge 2B; UNIV-08 domain check) generates and persists a snapshot, `universe sync [--days]` (Merge 3) backfills 1H/4H/1D/1W for the currently SELECTED symbols only, `universe coverage [--snapshot-id]` (Merge 2B) reports symbols on venue/eligible/assessed/selected/data-available and counts by exclusion reason, and `universe registry`/`snapshots`/`show` are read-only inspection (`registry` shows candle coverage and stored row counts; `show` prints every ranked symbol including its `ASSET_CLASS` (UNIV-08), `eligible=NULL` rendered as `-`) - all report an empty database gracefully rather than erroring; `intel market --symbol <SYM> [--json]` (Phase 8, Merge 1) prints one symbol's normalized Coinalyze snapshot — reports `TIDEMARK_COINALYZE_API_KEY` missing as a clean message and exit rather than a traceback, and a symbol Coinalyze doesn't list as `MARKET_NOT_FOUND` with a non-zero exit — touches no store table at all. |
+| `cli.py` | Typer entrypoint: `data backfill/update/gaps/status` manage market data; `context evaluate` (with optional `--as-of`)/`history`/`explain` drive Section 1 standalone; `run` and `observe run` resolve their symbols via `data/symbol_source.py` (Phase 6, Merge 3 — explicit `--symbols`, else the latest valid universe snapshot, else `TIDEMARK_SYMBOLS`, printing which source fired) and drive the journal/observe pipelines; `journal list`/`alerts` read the research record; `notify test` proves Telegram credentials work without touching the journal; `health check` (human-readable or `--json`, exit 0/1/2 for OK/WARN/FAIL, now including universe freshness and symbol source) and `health heartbeat` (the only `health` command that sends, and never journals) prove the unattended system is alive; `universe discover` (Merge 2A) refreshes `market_registry` from the venue's live listing, `universe backfill [--days]` backfills 1D candles for every ACTIVE registry symbol and prints per-symbol progress, `universe snapshot [--as-of]` (Merge 2B; UNIV-08 domain check) generates and persists a snapshot, `universe sync [--days]` (Merge 3) backfills 1H/4H/1D/1W for the currently SELECTED symbols only, `universe coverage [--snapshot-id]` (Merge 2B) reports symbols on venue/eligible/assessed/selected/data-available and counts by exclusion reason, and `universe registry`/`snapshots`/`show` are read-only inspection (`registry` shows candle coverage and stored row counts; `show` prints every ranked symbol including its `ASSET_CLASS` (UNIV-08), `eligible=NULL` rendered as `-`) - all report an empty database gracefully rather than erroring; `intel market --symbol <SYM> [--json]` (Phase 8, Merge 1) prints one symbol's normalized Coinalyze snapshot — reports `TIDEMARK_COINALYZE_API_KEY` missing as a clean message and exit rather than a traceback, and a symbol Coinalyze doesn't list as `MARKET_NOT_FOUND` with a non-zero exit — touches no store table at all; `intel bot [--once]` (Phase 8, Merge 2) runs the `/coin` Telegram long-polling bot in the foreground (`--once` processes any pending updates and exits, for testing) — reports a missing `TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`/`TIDEMARK_TELEGRAM_BOT_TOKEN`/`TIDEMARK_COINALYZE_API_KEY` as a clean message and exit, same as `intel market`. |
 
 ## Universe selection (Phase 6)
 
@@ -279,7 +286,7 @@ other research table — enforced by
 `tests/market_intel/test_import_boundary.py`, a static-analysis test
 that fails the build the moment either side of the boundary is crossed.
 
-- **Merge 1 (this one)** — the Coinalyze client, symbol mapping,
+- **Merge 1** — the Coinalyze client, symbol mapping,
   future-markets cache/validation, closed-period clamping, and
   `tidemark intel market [--json]`. No Telegram, no scheduling, no BTC
   dominance (unavailable from Coinalyze at all), no trading
@@ -287,6 +294,15 @@ that fails the build the moment either side of the boundary is crossed.
   `docs/rulebook/derivatives-context-v0.1.md` records six
   price/OI/funding interpretations as a `PROVISIONAL`, unwired
   document — no code reads it yet.
+- **Merge 2 (this one)** — `tidemark intel bot [--once]`: a `/coin`
+  Telegram long-polling bot answering with the Merge 1 snapshot, for
+  any Binance USDT-M perpetual. Chat-ID-only authorization
+  (`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`), silent ignore + minimal log for
+  any other chat, its own independent Telegram client and renderer (not
+  `notify/telegram.py`), a flat-JSON-file offset with no relationship to
+  `tidemark.db`, a discarded startup backlog, and exponential backoff on
+  a Telegram outage. Still no hourly briefing, no scheduling beyond the
+  bot's own poll loop, no BTC dominance, no trading recommendation.
 
 ## TODO
 

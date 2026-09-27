@@ -166,3 +166,111 @@ returns:
   operational question (is this key shared with something outside this
   environment?) that should be settled before `tidemark intel market` is
   run on any kind of schedule.
+
+## Addendum: Merge 2 — the /coin Telegram bot
+
+Merge 1 gave a human a command to run by hand. The natural next surface
+is a Telegram bot that answers `/coin <SYMBOL>` on demand, using exactly
+the Merge 1 snapshot — still no interpretation, no bias, no trading
+recommendation, and still no BTC dominance.
+
+**Long polling, not a webhook.** A webhook needs a publicly reachable
+HTTPS endpoint, TLS termination, and an inbound port — infrastructure
+this project has no server story for and shouldn't need one for a
+single-operator read-only bot. `getUpdates` long polling needs nothing
+but outbound HTTPS, which every other piece of Tidemark already assumes
+(ccxt, Coinalyze, the existing `notify.telegram` alert sender). The
+tradeoff is a long-running foreground process instead of a request
+handler — accepted, and addressed with `Restart=always` at the
+process-supervision layer (see the systemd unit below) rather than by
+building supervision into the bot itself.
+
+**Authorization is a single numeric chat ID, from
+`TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID`, checked against
+`update.message.chat.id` only.** Never a username, never a display
+name — Telegram lets any user set both to whatever they like, so
+neither identifies who is actually messaging the bot. A chat ID is
+assigned by Telegram itself and is not attacker-controlled. This merge
+supports exactly one allowed chat, matching the env var's singular name
+and this bot's single-operator scope; a future multi-chat allowlist
+would be its own, explicitly-scoped change, not a quiet extension of
+this one.
+
+**An unauthorized chat gets total silence, not an error.** No reply,
+no "you are not authorized" message, nothing that confirms a bot is
+listening on the other end at all. The only trace is a log line
+recording the chat ID and timestamp — never the message text, which
+could contain anything an anonymous stranger chose to send. The
+reasoning: a bot that replies "unauthorized" to a stranger has just
+confirmed (a) that something is listening at this bot username and (b)
+that it distinguishes callers, both of which are worth withholding for
+free. Silence costs nothing and reveals nothing.
+
+**Any Binance USDT-M perpetual is answerable, not only the 30-symbol
+research universe.** `/coin` is a general lookup tool for a human, not
+a Section 1/2 companion — restricting it to the research universe would
+turn a reasonable question ("what's SOL's funding rate?") into an
+arbitrary refusal for any symbol outside that list. The Merge 1
+`/future-markets` cache is still the sole gatekeeper and still
+distinguishes exactly the same three cases (`MARKET_NOT_FOUND`/
+`NO_DATA`/`OK`) it always did — this merge doesn't add a second
+symbol-validity notion, it just points the existing one at a wider set
+of inputs.
+
+**The bot never imports `notify.telegram`.** That module builds Section
+1 alert text and therefore imports `tidemark.context.htf`,
+`tidemark.data.models`, and `tidemark.journal.changes` — reusing it here
+would transitively pull the research engine into `market_intel` even
+though the import-boundary test only checks direct imports per file.
+`market_intel/telegram_client.py` is a second, independent
+implementation of just `getUpdates`/`sendMessage`, and
+`market_intel/telegram_render.py` is a second, independent renderer —
+the same "duplicate rather than couple" tradeoff ADR 0010 already made
+for `evidence.py` versus `replay/report.py`'s session grouping, for the
+same reason: a change made to the Section 1 alert format for Section
+1's own reasons must never be able to silently change what `/coin`
+renders, and vice versa.
+
+**Rate limiting reuses Merge 1's tracking rather than adding a second
+counter.** `CoinalyzeClient.calls_in_last_minute` is checked before
+dispatching a `/coin` lookup (estimated at up to 7 call-units — see
+`bot.py`), so a burst of requests replies "rate limited" instead of
+attempting a call that would fail anyway; the client's own bounded-retry
+`RateLimitedError` (Merge 1) is still caught as a fallback. Coinalyze's
+40-calls/minute budget is shared across every consumer of the key —
+`tidemark intel market` and this bot both draw from it — which matters
+more now that the bot can be asked about any symbol at any time, not
+just BTC/SOL by hand.
+
+**The update offset is a flat JSON file, not a database row.** It has
+no relationship to `tidemark.db` at all — a stronger form of "writes to
+no research table" than merely using a separate table in the same
+database would be. Written atomically (temp file + rename) so a crash
+mid-write can't corrupt the last known-good offset. On startup, any
+update older than a few minutes is discarded (offset still advances
+past it) so a restart after downtime never answers a `/coin` asked
+hours ago into a now-stale context.
+
+**A network failure backs off and retries; a bad token does not.** A
+connection failure or a Telegram 5xx is treated as transient and
+retried with exponential backoff (capped), so the bot survives a
+Telegram outage rather than exiting. A 401/403 means the configured bot
+token is simply wrong — retrying cannot fix that, so `run_forever`
+raises immediately rather than looping forever against a guaranteed
+failure.
+
+### Consequences (Merge 2)
+
+- `tidemark intel bot` is a long-running foreground process; operators
+  are expected to supervise it (see the systemd example in the README)
+  rather than the bot supervising itself.
+- Every `/coin` reply and every `/help`/`/start`/unknown-command reply is
+  produced by `market_intel`'s own renderer and text constants — none of
+  it is shared code with the Section 1/2 Telegram alert path, so a
+  future change to either can never silently affect the other.
+- An unauthorized user interacting with the bot leaves no trace visible
+  to them and only a minimal trace (chat ID, timestamp) in Tidemark's
+  own logs — by design, not by oversight.
+- `docs/rulebook/derivatives-context-v0.1.md` remains unwired. Nothing
+  in this bot reads it, classifies price/OI/funding combinations, or
+  produces anything resembling a trade direction.
