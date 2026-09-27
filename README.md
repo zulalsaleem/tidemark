@@ -288,6 +288,10 @@ uv run tidemark universe show --snapshot-id <id>
 # Coverage report: symbols on venue, eligible, assessed, selected, data
 # available, and counts by exclusion reason.
 uv run tidemark universe coverage
+
+# Backfill 1H/4H/1D/1W - every timeframe the observer needs - for the
+# currently SELECTED symbols only. Idempotent; safe to re-run.
+uv run tidemark universe sync --days 180
 ```
 
 Discovery uses ccxt's unified `load_markets` — a second, separate,
@@ -295,10 +299,21 @@ venue-agnostic read-only call alongside candle fetching (never a
 venue-specific raw endpoint); both backfill commands reuse the existing
 `data backfill` ingest path unmodified. All read-only commands report an
 empty database gracefully ("No ... found yet.") rather than erroring.
-**`TIDEMARK_SYMBOLS` / `settings.symbol_list()` remains the only symbol
-source every pipeline reads** — `tidemark run`, `tidemark observe run`,
-and `tidemark health check` are unaffected by any of this, even after a
-real snapshot has been generated.
+
+**Symbol source resolution (Phase 6, Merge 3).** `tidemark run`,
+`tidemark observe run`, and `tidemark health check` now default to the
+SELECTED symbols of the latest valid universe snapshot for the configured
+venue, in this order: an explicit `--symbols` flag always wins; else the
+latest snapshot, if one exists and is less than
+`TIDEMARK_UNIVERSE_STALENESS_HOURS` (default 48) old; else
+`TIDEMARK_SYMBOLS` as a last-resort fallback, with a warning printed
+naming which source was used. `TIDEMARK_SYMBOLS` is not deleted — it
+remains available as a manual/development override. Every run records
+which source it used (and the snapshot id, when one was used) on its
+`runs` row, so a journal entry can always be traced back to the universe
+that produced it. See
+[docs/adr/0009-universe-selection-architecture.md](docs/adr/0009-universe-selection-architecture.md)'s
+Merge 3 section for the full design.
 
 **UNIV-08 — asset-class domain constraint.** The first real snapshot
 selected 14 of 30 symbols (47%) from outside cryptocurrency: tokenised
@@ -320,9 +335,6 @@ pre-UNIV-08 snapshot (`methodology_version="universe-v1"`) is untouched,
 append-only, and kept as engineering data only; every snapshot from this
 point on is tagged `"universe-v2"`. Ranking, N, and K are unchanged —
 this is a domain eligibility correction, not a ranking change.
-
-Merge 3 (the daily refresh schedule and, as its own separate decision,
-wiring selection into the pipelines) follows later.
 
 ## Project status
 
@@ -441,6 +453,29 @@ forever); `data/universe_snapshot.py`'s methodology version moved to
 `"universe-v2"` so the two are trivially distinguishable. See
 [docs/adr/0009](docs/adr/0009-universe-selection-architecture.md)'s
 UNIV-08 section for the full inspection evidence and design.
+
+**Phase 6, Merge 3 — the observer reads the universe snapshot.**
+`tidemark run`, `tidemark observe run`, and `tidemark health check` now
+default to the SELECTED symbols of the latest valid universe snapshot for
+the configured venue instead of `TIDEMARK_SYMBOLS`
+(`data/symbol_source.py`, `resolve_symbols`): explicit `--symbols` still
+wins outright, and `TIDEMARK_SYMBOLS` remains as a last-resort fallback
+when no snapshot exists, the latest one is older than
+`TIDEMARK_UNIVERSE_STALENESS_HOURS` (default 48), or it selected nothing
+— each case logs a warning naming the reason. A missing or stale snapshot
+is never a crash. Every `tidemark run`/`tidemark observe run` execution
+records which source it used, and the snapshot id when one was used, on
+its `runs` row (`symbol_source`/`symbol_source_snapshot_id`, added via a
+manual `ALTER TABLE` against the real database, the same treatment
+UNIV-08 gave its registry columns) — every journal entry is traceable
+back to the universe that produced it. `tidemark health check` gained
+`universe_freshness` (OK/WARN/FAIL on the snapshot's age) and
+`symbol_source` (WARN when the last run fell back to `TIDEMARK_SYMBOLS`)
+checks. `tidemark universe sync --days N` backfills 1H/4H/1D/1W for the
+selected symbols only, reusing the existing chunked upsert, idempotent.
+No Section 1/2 rule, the ranking methodology, N, or K changed — see
+[docs/adr/0009](docs/adr/0009-universe-selection-architecture.md)'s
+Merge 3 section for the full resolution order and fallback rule.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
