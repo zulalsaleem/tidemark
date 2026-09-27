@@ -3,9 +3,23 @@ import statements, so it holds by construction rather than by
 discipline - see docs/adr/0011-market-intelligence-layer.md.
 
 Two directions are checked:
-- `market_intel/*.py` never imports `tidemark.data.exchange`,
-  `tidemark.context`, `tidemark.journal`, or `tidemark.replay`.
+- `market_intel/*.py` never imports `tidemark.context`, `tidemark.journal`,
+  or `tidemark.replay`, and - with exactly ONE explicit exception -
+  never anything under `tidemark.data` either.
 - Those same modules never import `tidemark.market_intel`.
+
+THE ONE EXCEPTION (Merge 3, see the ADR's "Addendum: Merge 3"):
+`tidemark.data.models` (a plain ORM data module with no imports of its
+own back into the research engine) may be imported, for exactly one
+purpose - a read-only lookup of BTC's stored Section 1 `ContextRecord`
+in `context_read.py`. Nothing else under `tidemark.data` is permitted,
+which is a deliberate TIGHTENING of the boundary versus a plain
+"tidemark.data.exchange is forbidden" rule: `tidemark.data.store`, for
+instance, is not named anywhere in CLAUDE.md's forbidden list, but its
+`TidemarkStore` transitively imports `tidemark.data.exchange` to type-
+hint candle fetching - importing it here would smuggle a forbidden
+import in through the back door. An allowlist of exactly one submodule
+closes that gap and any other one like it, present or future.
 """
 
 from __future__ import annotations
@@ -15,12 +29,12 @@ from pathlib import Path
 
 SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "tidemark"
 
-FORBIDDEN_FOR_MARKET_INTEL = (
-    "tidemark.data.exchange",
+FORBIDDEN_MODULE_PREFIXES = (
     "tidemark.context",
     "tidemark.journal",
     "tidemark.replay",
 )
+ALLOWED_DATA_SUBMODULE = "tidemark.data.models"
 
 
 def _imported_module_names(path: Path) -> set[str]:
@@ -35,11 +49,16 @@ def _imported_module_names(path: Path) -> set[str]:
     return names
 
 
-def _matches_any(name: str, prefixes: tuple[str, ...]) -> str | None:
-    for prefix in prefixes:
-        if name == prefix or name.startswith(prefix + "."):
-            return prefix
-    return None
+def _is_allowed_data_import(name: str) -> bool:
+    return name == ALLOWED_DATA_SUBMODULE or name.startswith(ALLOWED_DATA_SUBMODULE + ".")
+
+
+def _boundary_violation(name: str) -> bool:
+    if name == "tidemark.data" or name.startswith("tidemark.data."):
+        return not _is_allowed_data_import(name)
+    return any(
+        name == prefix or name.startswith(prefix + ".") for prefix in FORBIDDEN_MODULE_PREFIXES
+    )
 
 
 def _research_engine_files() -> list[Path]:
@@ -56,11 +75,28 @@ def test_market_intel_never_imports_the_research_engine() -> None:
     violations = []
     for path in market_intel_files:
         for name in _imported_module_names(path):
-            forbidden = _matches_any(name, FORBIDDEN_FOR_MARKET_INTEL)
-            if forbidden is not None:
+            if _boundary_violation(name):
                 violations.append(f"{path.relative_to(SRC_ROOT)} imports {name!r}")
 
     assert not violations, "market_intel isolation boundary violated:\n" + "\n".join(violations)
+
+
+def test_only_context_read_imports_the_one_permitted_data_module() -> None:
+    """The allowlist above permits `tidemark.data.models` package-wide,
+    but in practice exactly one file should ever need it - this test
+    keeps that true rather than merely possible.
+    """
+    market_intel_files = sorted((SRC_ROOT / "market_intel").rglob("*.py"))
+
+    importers = [
+        path.name
+        for path in market_intel_files
+        if any(_is_allowed_data_import(name) for name in _imported_module_names(path))
+    ]
+
+    assert importers == ["context_read.py"], (
+        f"expected only context_read.py to import {ALLOWED_DATA_SUBMODULE!r}, found: {importers}"
+    )
 
 
 def test_research_engine_never_imports_market_intel() -> None:
@@ -83,13 +119,30 @@ def test_market_intel_package_exists_and_is_nonempty() -> None:
 
 
 def test_the_telegram_bot_files_are_covered_by_the_boundary_scan() -> None:
-    # The two boundary tests above scan `market_intel/*.py` via rglob, so
+    # The boundary tests above scan `market_intel/*.py` via rglob, so
     # they already cover any new file added under the package - this
     # test exists only to make that coverage claim concrete for the
-    # Merge 2 bot files specifically (per the merge's own instruction to
-    # "extend the existing import-boundary test to cover it"), so the
+    # Merge 2 bot files specifically (per that merge's own instruction
+    # to "extend the existing import-boundary test to cover it"), so the
     # claim can't silently go stale if one of these files is ever
     # renamed or removed.
     market_intel_dir = SRC_ROOT / "market_intel"
     for filename in ("bot.py", "telegram_client.py", "telegram_render.py", "bot_state.py"):
         assert (market_intel_dir / filename).is_file()
+
+
+def test_the_context_read_exception_file_exists_and_never_imports_tidemark_context() -> None:
+    # Same purpose as the test above, for the Merge 3 boundary exception
+    # specifically: names the one file the exception applies to, and
+    # double-checks (redundantly with the general scan, deliberately)
+    # that it never imports the evaluation logic it's reading a stored
+    # result of.
+    path = SRC_ROOT / "market_intel" / "context_read.py"
+    assert path.is_file()
+    names = _imported_module_names(path)
+    assert not any(
+        name == "tidemark.context" or name.startswith("tidemark.context.") for name in names
+    )
+    assert not any(
+        name == "tidemark.data.store" or name.startswith("tidemark.data.store.") for name in names
+    )
