@@ -486,6 +486,98 @@ of the unit file itself and out of `systemctl status`/`ps` output.
 `MemoryMax` is a sane ceiling for a single long-polling HTTP client
 process, not a measured requirement — size it to your host.
 
+### Hourly BTC briefing
+
+Classifies BTC's latest closed-1H price/OI/funding reading against
+[docs/rulebook/derivatives-context-v0.1.md](docs/rulebook/derivatives-context-v0.1.md)
+(one of six defined combinations, D1-D6, or `NO_MATCH`) and shows it
+alongside BTC's stored Section 1 structure — two independent sections,
+two independent sources. Alerts only on a real change, never on a fixed
+schedule: see the
+[ADR's Merge 3 addendum](docs/adr/0011-market-intelligence-layer.md#addendum-merge-3--the-hourly-btc-briefing)
+for exactly what counts as a change.
+
+```bash
+uv run tidemark intel briefing            # evaluate, print, record - never sends
+uv run tidemark intel briefing --json     # machine-readable output
+uv run tidemark intel briefing --send     # also deliver via Telegram if the evaluation decides to
+```
+
+Without `--send`, nothing is ever delivered to Telegram — the
+evaluation still runs and is still recorded in `market_intel`'s own
+table, so repeated dry runs are safe for testing. `--send` only gates
+delivery: the evaluation itself, and the decision of whether it's worth
+sending, happen unconditionally either way.
+
+Every evaluation is recorded, sent or not, in `market_intel_evaluations`
+— its own table, never `journal_entries`, `observations`, or
+`context_records`. Two independent triggers decide whether an evaluation
+actually sends:
+
+- the classification differs from the **immediately prior evaluation**
+  (sent or not);
+- BTC's stored Section 1 `(state, watch)` differs from what the **last
+  SENT briefing** carried — a different baseline on purpose, since the
+  point is "what you were last told is now stale," not "something
+  changed between two evaluations nobody saw."
+
+`NO_MATCH` never sends, under any circumstance — the rulebook defines no
+interpretation for those readings, so there's nothing true to alert on.
+BTC's structure section reads `context_records` read-only (never
+recomputed, never written to) and renders `UNAVAILABLE` if there's no
+record for BTC or the latest one is stale (see the ADR for the exact
+threshold) — it never falls back to computing structure itself.
+
+**Running it hourly (systemd timer example).** Same caveats as the bot
+example above — illustrative, not prescriptive:
+
+```ini
+# /etc/systemd/system/tidemark-briefing.service
+[Unit]
+Description=Tidemark hourly BTC briefing
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=tidemark
+WorkingDirectory=/opt/tidemark
+EnvironmentFile=/opt/tidemark/.env
+ExecStart=/opt/tidemark/.venv/bin/tidemark intel briefing --send
+```
+
+```ini
+# /etc/systemd/system/tidemark-briefing.timer
+[Unit]
+Description=Run the Tidemark BTC briefing hourly
+
+[Timer]
+# 5 minutes past the hour: gives the Section 1 4H-close evaluation and
+# the Section 2 hourly observer (see "Using the run pipeline" and "Using
+# Section 2 observation" above) a head start, so the briefing's
+# structure section reads a context_records row from THIS hour rather
+# than racing it.
+OnCalendar=*-*-* *:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tidemark-briefing.timer
+systemctl list-timers tidemark-briefing.timer   # confirm the schedule
+journalctl -u tidemark-briefing -f              # tail the logs
+```
+
+`Type=oneshot` (not a long-running process, unlike the bot) matches
+`tidemark intel briefing`'s own shape: it evaluates once and exits.
+`Persistent=true` catches up on a missed run after downtime rather than
+silently skipping an hour. The `:05` offset is a suggestion, not a
+requirement — it only matters if you also run `tidemark run`/
+`tidemark observe run` on their own schedules and want the briefing to
+read a fresh Section 1 record rather than an hour-old one.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
@@ -675,6 +767,29 @@ Survives a Telegram outage with exponential backoff; exits immediately
 on an invalid bot token rather than retrying forever. Still raw data
 only — see the
 [ADR's Merge 2 addendum](docs/adr/0011-market-intelligence-layer.md#addendum-merge-2--the-coin-telegram-bot).
+
+**Phase 8, Merge 3 — the hourly BTC briefing.** The rulebook
+(`docs/rulebook/derivatives-context-v0.1.md`) was updated with exact
+price/OI/funding thresholds, six stable identifiers (D1-D6), and a
+`NO_MATCH` definition for the other twelve of eighteen possible
+combinations — in its own commit, before any classifier code, per
+CLAUDE.md's standing rule that strategy logic comes only from the
+rulebook. `tidemark intel briefing [--send] [--json]` classifies BTC's
+closed-1H reading against it and shows BTC's stored Section 1 structure
+alongside it, via a single narrow, explicitly-permitted exception to the
+isolation boundary: a read-only `context_records` lookup
+(`context_read.py`) that imports only `tidemark.data.models` — never
+`tidemark.context`, never `tidemark.data.store` (whose transitive
+`tidemark.data.exchange` import the import-boundary test now closes off
+by allowlist rather than blocklist), and never writes anything. Alerts
+only on a real classification change (compared against the immediately
+prior evaluation) or a meaningful Section 1 structural change (compared
+against the last SENT briefing specifically) — `NO_MATCH` never alerts.
+Every hourly evaluation, sent or not, is recorded in its own table,
+`market_intel_evaluations`, idempotent per hour with the same narrow
+`sent`/`send_reason`-only update exception `JournalEntry` already uses.
+See the
+[ADR's Merge 3 addendum](docs/adr/0011-market-intelligence-layer.md#addendum-merge-3--the-hourly-btc-briefing).
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.
