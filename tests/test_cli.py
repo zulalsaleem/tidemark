@@ -13,7 +13,13 @@ from tidemark.cli import _encode_for_display, _parse_csv, app
 from tidemark.context import htf, mtf
 from tidemark.data import asset_class as asset_class_module
 from tidemark.data.exchange import ExchangeClient, RawCandle
-from tidemark.data.models import JournalEntry, MarketRegistry, UniverseSnapshot, UniverseSnapshotRow
+from tidemark.data.models import (
+    JournalEntry,
+    MarketRegistry,
+    Observation,
+    UniverseSnapshot,
+    UniverseSnapshotRow,
+)
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
 from tidemark.notify.telegram import build_message
@@ -1801,3 +1807,91 @@ def test_health_check_does_not_crash_on_a_non_ascii_symbol(
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert result.exit_code in (0, 1, 2)
     assert "Overall:" in result.stdout
+
+
+# -- tidemark evidence ---------------------------------------------------------
+
+
+def _seed_observation(url: str, evaluated_at: dt.datetime, state: str) -> None:
+    engine = create_store_engine(url)
+    init_db(engine)
+    store = TidemarkStore(engine)
+    store.save_observation(
+        Observation(
+            asset=SYMBOL,
+            evaluated_at=evaluated_at,
+            rule_version=mtf.RULE_VERSION_V2,
+            section_1_state=htf.BULLISH,
+            section_1_watch=htf.LONG_WATCH,
+            section_1_grade="B",
+            section_1_level_price=100.0,
+            session_started_at=evaluated_at,
+            grade_at_start="B",
+            grade_history=[],
+            interaction_detected=False,
+            reaction_tier=None,
+            reaction_condition_matched=None,
+            reaction_started_at=None,
+            structure_reference_price=None,
+            structure_reference_confirmed_at=None,
+            structure_change=None,
+            failure=None,
+            expiry=False,
+            state=state,
+            reason_code=state,
+            swings_used=[],
+        )
+    )
+
+
+def test_evidence_refuses_full_report_on_a_young_archive(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_observation(url, START, mtf.NO_INTERACTION)
+
+    result = runner.invoke(app, ["evidence"])
+
+    assert result.exit_code == 1
+    assert "too young" in result.stdout or "fewer than 14 days" in result.stdout
+    assert "Data sufficiency verdicts" in result.stdout
+    # The refusal never prints the full per-session tables.
+    assert "Section 2 sessions" not in result.stdout
+
+
+def test_evidence_allow_insufficient_prints_the_full_preliminary_report(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_observation(url, START, mtf.NO_INTERACTION)
+
+    result = runner.invoke(app, ["evidence", "--allow-insufficient"])
+
+    assert result.exit_code == 0
+    assert "PRELIMINARY" in result.stdout
+    assert "Section 2 sessions" in result.stdout
+
+
+def test_evidence_on_an_empty_archive_reports_gracefully(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    engine = create_store_engine(url)
+    init_db(engine)
+
+    result = runner.invoke(app, ["evidence"])
+
+    assert result.exit_code == 1
+    assert "Archive coverage" in result.stdout
+
+
+def test_evidence_json_output_is_valid_json(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_observation(url, START, mtf.NO_INTERACTION)
+
+    result = runner.invoke(app, ["evidence", "--json", "--allow-insufficient"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["full_report"] is True
+    assert payload["is_young_archive"] is True
