@@ -58,6 +58,7 @@ from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_obs
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
 from tidemark.market_intel.bot import run_forever, run_once
 from tidemark.market_intel.bot_state import BotStateStore
+from tidemark.market_intel.briefing import BriefingResult, evaluate_briefing, mark_sent
 from tidemark.market_intel.client import CoinalyzeClient
 from tidemark.market_intel.errors import (
     CoinalyzeConnectionError,
@@ -69,6 +70,8 @@ from tidemark.market_intel.errors import (
     TelegramHttpError,
     UnsupportedVenueError,
 )
+from tidemark.market_intel.evaluation_store import init_evaluation_store
+from tidemark.market_intel.evaluation_store import make_engine as make_evaluation_engine
 from tidemark.market_intel.future_markets import FutureMarketsCache
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
@@ -1642,6 +1645,129 @@ def intel_bot(
     except TelegramHttpError as exc:
         typer.echo(f"Telegram rejected the bot token (HTTP {exc.status_code}): {exc.detail}")
         raise typer.Exit(code=1) from None
+
+
+def _input_to_dict(inp) -> dict:
+    payload = dataclasses.asdict(inp)
+    for key in ("period_start", "period_close"):
+        if key in payload and payload[key] is not None:
+            payload[key] = payload[key].isoformat()
+    return payload
+
+
+def _briefing_result_to_dict(result: BriefingResult, sent: bool) -> dict:
+    cr = result.classification
+    structure = result.structure
+    return {
+        "evaluated_at": result.evaluated_at.isoformat(),
+        "classification": {
+            "result": cr.result,
+            "interpretation": cr.interpretation,
+            "reason": cr.reason,
+            "rulebook_version": cr.rulebook_version,
+            "price": _input_to_dict(cr.price),
+            "open_interest": _input_to_dict(cr.open_interest),
+            "funding": _input_to_dict(cr.funding),
+        },
+        "structure": {
+            "available": structure.available,
+            "stale": structure.stale,
+            "state": structure.state,
+            "watch": structure.watch,
+            "grade": structure.grade,
+            "rule_version": structure.rule_version,
+            "evaluated_at": (
+                structure.evaluated_at.isoformat() if structure.evaluated_at is not None else None
+            ),
+        },
+        "should_send": result.should_send,
+        "send_reason": result.send_reason,
+        "sent": sent,
+        "message": result.message,
+    }
+
+
+@intel_app.command("briefing")
+def intel_briefing(
+    send: bool = typer.Option(
+        False, "--send", help="Actually deliver via Telegram if this evaluation decides to send."
+    ),
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Evaluate the hourly BTC derivatives-context briefing.
+
+    Classifies the latest closed-1H price/OI/funding reading against
+    docs/rulebook/derivatives-context-v0.1.md (D1-D6 or NO_MATCH), shows
+    BTC's stored Section 1 structure alongside it (read-only, never
+    recomputed - UNAVAILABLE if there is no record or it's stale), and
+    records the evaluation - sent or not - in market_intel's own table.
+    Without --send, nothing is ever delivered to Telegram; the
+    evaluation still runs and is still recorded, for testing. Raw data
+    only: no trade direction, no bias line, no BTC dominance. See
+    docs/adr/0011-market-intelligence-layer.md.
+    """
+    settings = get_settings()
+    try:
+        coinalyze = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    cache = FutureMarketsCache(coinalyze)
+    evaluation_engine = make_evaluation_engine(settings.database_url)
+    init_evaluation_store(evaluation_engine)
+    now = dt.datetime.now(dt.UTC)
+
+    try:
+        result = evaluate_briefing(
+            coinalyze, cache, evaluation_engine, settings.database_url, settings.venue, now
+        )
+    except UnsupportedVenueError as exc:
+        typer.echo(
+            f"No Coinalyze exchange-code mapping for venue {exc.venue!r}. "
+            "See docs/adr/0011-market-intelligence-layer.md."
+        )
+        raise typer.Exit(code=1) from None
+    except RateLimitedError as exc:
+        typer.echo(f"Coinalyze rate limited this request: {exc}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeHttpError as exc:
+        typer.echo(f"Coinalyze returned HTTP {exc.status_code}: {exc.detail}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeConnectionError as exc:
+        typer.echo(f"Could not reach Coinalyze: {exc.detail}")
+        raise typer.Exit(code=1) from None
+
+    sent = False
+    if send and result.should_send:
+        if settings.telegram_allowed_chat_id is None:
+            typer.echo("TIDEMARK_TELEGRAM_ALLOWED_CHAT_ID is not set. See .env.example.")
+            raise typer.Exit(code=1)
+        try:
+            telegram = _telegram_bot_client(settings)
+        except MissingBotTokenError:
+            typer.echo("TIDEMARK_TELEGRAM_BOT_TOKEN is not set. See .env.example.")
+            raise typer.Exit(code=1) from None
+        try:
+            telegram.send_message(settings.telegram_allowed_chat_id, result.message)
+            sent = True
+            mark_sent(evaluation_engine, result, dt.datetime.now(dt.UTC))
+        except TelegramHttpError as exc:
+            typer.echo(f"Telegram returned HTTP {exc.status_code}: {exc.detail}")
+            raise typer.Exit(code=1) from None
+        except TelegramConnectionError as exc:
+            typer.echo(
+                f"Could not reach Telegram: {exc.detail}. This is usually network "
+                "filtering or a firewall, not a bad bot token."
+            )
+            raise typer.Exit(code=1) from None
+
+    if json:
+        typer.echo(json_module.dumps(_briefing_result_to_dict(result, sent), indent=2))
+    else:
+        _safe_echo(result.message)
+        typer.echo("")
+        typer.echo(f"should_send={result.should_send} reason={result.send_reason} sent={sent}")
 
 
 def main() -> None:
