@@ -12,13 +12,11 @@ import datetime as dt
 import json as json_module
 import sys
 
-import pandas as pd
 import typer
 
 from tidemark import __version__
 from tidemark.config.settings import Settings, get_settings
 from tidemark.context import htf, mtf
-from tidemark.core.atr import atr as compute_atr
 from tidemark.data.asset_class import (
     NON_CRYPTO_UNDERLYING,
     NON_ELIGIBLE_INDEX,
@@ -29,7 +27,6 @@ from tidemark.data.evidence import build_evidence_report
 from tidemark.data.evidence_render import evidence_report_to_dict, render_evidence_report
 from tidemark.data.exchange import ExchangeClient
 from tidemark.data.ingest import RunOutcome, SymbolTimeframeOutcome, run_backfill, run_update
-from tidemark.data.models import Candle, ContextRecord
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.symbol_source import (
     EXPLICIT,
@@ -105,7 +102,13 @@ app.add_typer(data_app, name="data")
 
 context_app = typer.Typer(
     name="context",
-    help="Section 1 HTF context: evaluate, history, explain.",
+    help=(
+        "Section 1 HTF context: history, explain. Read-only inspection of "
+        "journal_entries, the table `tidemark run` actually writes Section 1 "
+        "results to - there is no standalone evaluate/persist command; use "
+        "`tidemark run` (production) or `tidemark replay` (point-in-time, "
+        "no side effects)."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(context_app, name="context")
@@ -620,21 +623,6 @@ def data_status(
             typer.echo(f"{symbol:<16} {timeframe:<9} {row_count:<6} {latest_close}")
 
 
-def _candles_to_frame(candles: list[Candle]) -> pd.DataFrame:
-    """Adapt stored `Candle` rows into the DataFrame shape core/context expect."""
-    return pd.DataFrame(
-        {
-            "open_time": [c.open_time for c in candles],
-            "close_time": [c.close_time for c in candles],
-            "open": [c.open for c in candles],
-            "high": [c.high for c in candles],
-            "low": [c.low for c in candles],
-            "close": [c.close for c in candles],
-            "volume": [c.volume for c in candles],
-        }
-    )
-
-
 def _parse_as_of(value: str | None) -> dt.datetime | None:
     if value is None:
         return None
@@ -644,78 +632,21 @@ def _parse_as_of(value: str | None) -> dt.datetime | None:
     return parsed
 
 
-def _load_context_candles(
-    store: TidemarkStore, venue: str, symbol: str, as_of: dt.datetime | None
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Fetch closed 4H/1D/1W candles for `symbol`, truncated to `as_of`.
-
-    Fetches the full stored history per timeframe and filters on
-    `close_time <= as_of` in Python — this is what lets `--as-of`
-    reproduce exactly what was known at that moment, per the rulebook's
-    look-ahead guard.
-    """
-    frames = []
-    for timeframe in ("4h", "1d", "1w"):
-        candles = store.get_candles(venue, symbol, timeframe)
-        if as_of is not None:
-            candles = [c for c in candles if c.close_time <= as_of]
-        frames.append(_candles_to_frame(candles))
-    return tuple(frames)  # type: ignore[return-value]
-
-
-def _evaluate_symbol(
-    store: TidemarkStore, venue: str, symbol: str, as_of: dt.datetime | None
-) -> ContextRecord:
-    candles_4h, candles_1d, candles_1w = _load_context_candles(store, venue, symbol, as_of)
-    if len(candles_4h) == 0:
-        typer.echo(f"No 4H candles for {symbol}. Run `tidemark data backfill` first.")
-        raise typer.Exit(code=1)
-
-    atr_series = compute_atr(candles_4h)
-    atr_value = atr_series.iloc[-1]
-
-    return htf.evaluate(
-        symbol,
-        candles_4h,
-        atr_value,
-        candles_1d=candles_1d if len(candles_1d) > 0 else None,
-        candles_1w=candles_1w if len(candles_1w) > 0 else None,
-    )
-
-
-@context_app.command("evaluate")
-def context_evaluate(
-    symbol: str = typer.Option(..., "--symbol"),
-    as_of: str | None = typer.Option(
-        None, "--as-of", help="ISO timestamp; reproduces output as of that moment"
-    ),
-) -> None:
-    """Evaluate Section 1's decision matrix and persist the result."""
-    settings = get_settings()
-    store = _store(settings)
-    record = _evaluate_symbol(store, settings.venue, symbol, _parse_as_of(as_of))
-    store.save_context_record(record)
-
-    grade = record.grade or "-"
-    typer.echo(
-        f"{symbol} @ {record.evaluated_at.isoformat()}  "
-        f"state={record.state}  watch={record.watch}  grade={grade}  "
-        f"reason={record.reason_code}"
-    )
-    if record.watch == htf.WAIT:
-        typer.echo("No setups found.")
-
-
 @context_app.command("history")
 def context_history(
     symbol: str = typer.Option(..., "--symbol"),
     days: int = typer.Option(30, "--days"),
 ) -> None:
-    """List past Section 1 evaluations for a symbol, newest first."""
+    """List past Section 1 evaluations for a symbol, newest first.
+
+    Reads `journal_entries` - the table `tidemark run` actually writes
+    Section 1 results to (see docs/adr/0011-market-intelligence-layer.md's
+    "Addendum: removing context_records").
+    """
     settings = get_settings()
     store = _store(settings)
     since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
-    records = store.context_history(symbol, since=since)
+    records = store.journal_history(symbol, since=since)
 
     if not records:
         typer.echo("No setups found.")
@@ -731,15 +662,18 @@ def context_history(
 
 @context_app.command("explain")
 def context_explain(symbol: str = typer.Option(..., "--symbol")) -> None:
-    """Print a human-readable explanation of the latest Section 1 evaluation."""
+    """Print a human-readable explanation of the latest Section 1 evaluation.
+
+    Reads `journal_entries` - the table `tidemark run` actually writes
+    Section 1 results to (see docs/adr/0011-market-intelligence-layer.md's
+    "Addendum: removing context_records").
+    """
     settings = get_settings()
     store = _store(settings)
-    record = store.latest_context_record(symbol)
+    entries = store.journal_history(symbol)
+    record = entries[0] if entries else None
     if record is None:
-        typer.echo(
-            f"No context record for {symbol} yet. "
-            f"Run `tidemark context evaluate --symbol {symbol}` first."
-        )
+        typer.echo(f"No Section 1 result recorded for {symbol} yet. Run `tidemark run` first.")
         raise typer.Exit(code=1)
 
     grade = record.grade or "-"

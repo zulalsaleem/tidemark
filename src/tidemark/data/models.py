@@ -7,13 +7,22 @@ to compute them.
 Standing rules encoded here:
   - Every structural point (`Swing`) stores `formed_at` and `confirmed_at`
     separately, since a swing is usable only some time after it forms.
-  - Every emitted record (`ContextRecord`) stores the `rule_version` that
-    produced it.
+  - Every emitted record (`ContextRecord`/`JournalEntry`) stores the
+    `rule_version` that produced it.
+
+`ContextRecord` is NOT a persisted table (see below, and
+docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+context_records"): it is `htf.evaluate`'s in-memory Section 1 OUTPUT
+RECORD shape, consumed by `journal.records.build_journal_entry`,
+`journal.changes.detect_change`, `notify.telegram`, and `replay.report` -
+none of which ever persist it directly. `JournalEntry` is the only
+persisted form of a Section 1 evaluation.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass, field
 
 from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -200,29 +209,41 @@ class Level(Base):
     formed_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False)
 
 
-class ContextRecord(Base):
-    """An emitted rulebook evaluation output (Section 1 OUTPUT RECORD).
+@dataclass
+class ContextRecord:
+    """`htf.evaluate`'s in-memory Section 1 evaluation output (Section 1
+    OUTPUT RECORD) - NOT a persisted table.
 
-    Recalculated at every 4H close and consumed by Section 2. Always tagged
-    with the `rule_version` that produced it, per the standing rules.
+    Recalculated at every 4H close and consumed by Section 2, but never
+    stored as its own row: `journal.records.build_journal_entry` converts
+    it into a `JournalEntry` (the actual persisted form) before
+    `tidemark run` writes anything. This used to be a second, separately
+    persisted `context_records` table with its own `save_context_record`/
+    `latest_context_record`/`context_history` writer and readers, whose
+    only writer (the standalone `tidemark context evaluate` command) never
+    ran in production - `context_records` stayed empty on a real
+    deployment while `journal_entries` held the real history, and code
+    that queried `context_records` by name (`market_intel`'s hourly
+    briefing) silently found nothing for days. See
+    docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+    context_records" for the full account. Plain dataclass, not an ORM
+    model, precisely so this class can never again be queried as if it
+    were a table.
     """
 
-    __tablename__ = "context_records"
+    asset: str
+    evaluated_at: dt.datetime
+    rule_version: str
+    state: str
+    watch: str
+    reason_code: str
+    grade: str | None = None
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    asset: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    evaluated_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, nullable=False, index=True)
-    rule_version: Mapped[str] = mapped_column(String, nullable=False)
-    state: Mapped[str] = mapped_column(String, nullable=False)
-    watch: Mapped[str] = mapped_column(String, nullable=False)
-    grade: Mapped[str | None] = mapped_column(String, nullable=True)
-    reason_code: Mapped[str] = mapped_column(String, nullable=False)
-
-    # Structured sub-records stored as JSON: active_levels[], fib{...},
+    # Structured sub-records: active_levels[], fib{...},
     # swings_used[]{formed_at, confirmed_at} — see Section 1 OUTPUT RECORD.
-    active_levels: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    fib: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    swings_used: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    active_levels: list = field(default_factory=list)
+    fib: dict = field(default_factory=dict)
+    swings_used: list = field(default_factory=list)
 
 
 class JournalEntry(Base):

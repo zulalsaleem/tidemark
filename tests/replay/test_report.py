@@ -497,7 +497,6 @@ def test_build_replay_report_never_writes_to_the_store(tmp_path, monkeypatch) ->
     def _boom(*args, **kwargs):
         raise AssertionError("replay must never write to the store")
 
-    monkeypatch.setattr(TidemarkStore, "save_context_record", _boom)
     monkeypatch.setattr(TidemarkStore, "save_journal_entry", _boom)
     monkeypatch.setattr(TidemarkStore, "save_observation", _boom)
 
@@ -510,7 +509,6 @@ def test_replay_writes_nothing_row_counts_unchanged(tmp_path) -> None:
     store = _seed_store(tmp_path)
     before = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
 
@@ -520,10 +518,9 @@ def test_replay_writes_nothing_row_counts_unchanged(tmp_path) -> None:
 
     after = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
-    assert before == after == (0, 0, 0)
+    assert before == after == (0, 0)
 
 
 # -- look-ahead guard, applied to this module's own efficient truncation -----
@@ -544,8 +541,12 @@ def _section1_fields(record) -> dict:
 def test_replay_section1_look_ahead_guard(tmp_path) -> None:
     """`replay_section1`'s slice-based truncation must produce exactly the
     same result, for every candle, as truncating the database itself to
-    that candle and replaying from scratch - the same property `tests/
-    context/test_look_ahead_guard.py` already proves for `_evaluate_symbol`.
+    that candle and replaying from scratch. `replay_section1` is the only
+    point-in-time Section 1 evaluation path left in the codebase - the
+    standalone `context evaluate`/`_evaluate_symbol` this test once shared
+    the same guard with was removed as redundant with `tidemark replay`
+    (see docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+    context_records").
     """
     fetched_at = dt.datetime.now(dt.UTC)
     all_candles = [

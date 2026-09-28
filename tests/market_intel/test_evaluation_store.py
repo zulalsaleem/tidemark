@@ -13,8 +13,9 @@ import datetime as dt
 from sqlalchemy import inspect
 from sqlalchemy.orm import sessionmaker
 
-from tidemark.data.models import ContextRecord
+from tidemark.data.models import ContextRecord, JournalEntry
 from tidemark.data.store import TidemarkStore, create_store_engine, get_session_factory, init_db
+from tidemark.journal.records import build_journal_entry
 from tidemark.market_intel.evaluation_store import (
     EvaluationRecord,
     MarketIntelEvaluation,
@@ -93,28 +94,27 @@ def test_writing_an_evaluation_never_touches_the_research_tables(tmp_path) -> No
     research_engine = create_store_engine(database_url)
     init_db(research_engine)
     store = TidemarkStore(research_engine)
-    store.save_context_record(
-        ContextRecord(
-            asset=ASSET,
-            evaluated_at=T1,
-            rule_version="section-01-v1.1",
-            state="BULLISH",
-            watch="LONG_WATCH",
-            grade="A",
-            reason_code="X",
-            active_levels=[],
-            fib={},
-            swings_used=[],
-        )
+    context_record = ContextRecord(
+        asset=ASSET,
+        evaluated_at=T1,
+        rule_version="section-01-v1.1",
+        state="BULLISH",
+        watch="LONG_WATCH",
+        grade="A",
+        reason_code="X",
+        active_levels=[],
+        fib={},
+        swings_used=[],
     )
+    store.save_journal_entry(build_journal_entry(context_record, recorded_at=T1))
 
     market_intel_engine = make_engine(database_url)
     init_evaluation_store(market_intel_engine)
     record_evaluation(market_intel_engine, _record(T2))
 
-    # The one context_records row from before is still exactly one row.
+    # The one journal_entries row from before is still exactly one row.
     with get_session_factory(research_engine)() as session:
-        remaining = session.query(ContextRecord).count()
+        remaining = session.query(JournalEntry).count()
     assert remaining == 1
 
 

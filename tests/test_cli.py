@@ -14,6 +14,7 @@ from tidemark.context import htf, mtf
 from tidemark.data import asset_class as asset_class_module
 from tidemark.data.exchange import ExchangeClient, RawCandle
 from tidemark.data.models import (
+    ContextRecord,
     JournalEntry,
     MarketRegistry,
     Observation,
@@ -22,6 +23,7 @@ from tidemark.data.models import (
 )
 from tidemark.data.store import TidemarkStore, create_store_engine, init_db
 from tidemark.data.timeframes import TIMEFRAMES
+from tidemark.journal.records import build_journal_entry
 from tidemark.notify.telegram import build_message
 
 runner = CliRunner()
@@ -204,42 +206,34 @@ def _seed_candles(url: str, symbol: str, n: int, timeframe: str = "4h") -> None:
     store.upsert_candles(VENUE, symbol, timeframe, candles, dt.datetime.now(dt.UTC))
 
 
-def test_context_evaluate_prints_state_and_persists(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    url = _use_temp_db(tmp_path, monkeypatch)
-    _seed_candles(url, SYMBOL, n=3)
-
-    result = runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
-
-    assert result.exit_code == 0
-    assert "state=INSUFFICIENT_STRUCTURE" in result.stdout
-    assert "No setups found." in result.stdout
-
+def _seed_journal_entry(url: str, symbol: str, evaluated_at: dt.datetime, **overrides) -> None:
+    """Seeds `journal_entries` the way `tidemark run` actually does: an
+    in-memory `ContextRecord` -> `build_journal_entry` -> `save_journal_
+    entry` - never a bespoke row insert, and never the removed `context
+    evaluate`/`save_context_record` path. A bespoke insert is exactly what
+    let `context_read.py` read the wrong (removed) `context_records` table
+    for months undetected - see
+    docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+    context_records".
+    """
     engine = create_store_engine(url)
+    init_db(engine)
     store = TidemarkStore(engine)
-    assert store.latest_context_record(SYMBOL) is not None
-
-
-def test_context_evaluate_twice_writes_one_row(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    url = _use_temp_db(tmp_path, monkeypatch)
-    _seed_candles(url, SYMBOL, n=3)
-
-    runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
-    runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
-
-    engine = create_store_engine(url)
-    store = TidemarkStore(engine)
-    assert len(store.context_history(SYMBOL)) == 1
-
-
-def test_context_evaluate_missing_candles_errors(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_temp_db(tmp_path, monkeypatch)
-
-    result = runner.invoke(app, ["context", "evaluate", "--symbol", "NOPE/USDT:USDT"])
-
-    assert result.exit_code != 0
-    assert "No 4H candles" in result.stdout
+    defaults = dict(
+        asset=symbol,
+        evaluated_at=evaluated_at,
+        rule_version=htf.RULE_VERSION,
+        state="INSUFFICIENT_STRUCTURE",
+        watch=htf.WAIT,
+        grade=None,
+        reason_code="NOT_ENOUGH_SWINGS",
+        active_levels=[],
+        fib={},
+        swings_used=[],
+    )
+    defaults.update(overrides)
+    record = ContextRecord(**defaults)
+    store.save_journal_entry(build_journal_entry(record, recorded_at=evaluated_at))
 
 
 def test_context_history_reports_no_setups_when_empty(
@@ -253,18 +247,21 @@ def test_context_history_reports_no_setups_when_empty(
     assert "No setups found." in result.stdout
 
 
-def test_context_history_shows_candle_close_time(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_context_history_shows_data_written_by_the_production_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     url = _use_temp_db(tmp_path, monkeypatch)
-    _seed_candles(url, SYMBOL, n=3)
-    runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
+    evaluated_at = START + dt.timedelta(hours=4 * 3)
+    _seed_journal_entry(url, SYMBOL, evaluated_at, state="BULLISH", watch="LONG_WATCH", grade="A")
 
-    # A large --days window, since the fixture's fixed candle timestamps
-    # (2026-01-01) are far in the past relative to the real clock.
+    # A large --days window, since the fixture's fixed timestamp
+    # (2026-01-01) is far in the past relative to the real clock.
     result = runner.invoke(app, ["context", "history", "--symbol", SYMBOL, "--days", "36500"])
 
     assert result.exit_code == 0
-    expected_close = (START + dt.timedelta(hours=4 * 3)).isoformat()
-    assert expected_close in result.stdout
+    assert evaluated_at.isoformat() in result.stdout
+    assert "BULLISH" in result.stdout
+    assert "LONG_WATCH" in result.stdout
 
 
 def test_context_explain_without_prior_evaluation_errors(
@@ -275,13 +272,14 @@ def test_context_explain_without_prior_evaluation_errors(
     result = runner.invoke(app, ["context", "explain", "--symbol", SYMBOL])
 
     assert result.exit_code != 0
-    assert "No context record" in result.stdout
+    assert "No Section 1 result recorded" in result.stdout
 
 
-def test_context_explain_shows_state_and_swings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_context_explain_shows_data_written_by_the_production_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     url = _use_temp_db(tmp_path, monkeypatch)
-    _seed_candles(url, SYMBOL, n=3)
-    runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
+    _seed_journal_entry(url, SYMBOL, START + dt.timedelta(hours=4 * 3))
 
     result = runner.invoke(app, ["context", "explain", "--symbol", SYMBOL])
 
@@ -289,33 +287,6 @@ def test_context_explain_shows_state_and_swings(tmp_path, monkeypatch: pytest.Mo
     assert "State:  INSUFFICIENT_STRUCTURE" in result.stdout
     assert "Swings used:" in result.stdout
     assert "Active levels:" in result.stdout
-
-
-def test_context_evaluate_as_of_matches_truncated_database(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """--as-of against the full history must match evaluating a database
-    that only ever had candles up to that point (the look-ahead guard,
-    exercised through the CLI's own candle-loading path)."""
-    full_url = _use_temp_db(tmp_path, monkeypatch)
-    _seed_candles(full_url, SYMBOL, n=20)
-    as_of = (START + dt.timedelta(hours=4 * 9)).isoformat()
-
-    result_full = runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL, "--as-of", as_of])
-    assert result_full.exit_code == 0
-
-    truncated_url = f"sqlite:///{tmp_path / 'truncated.db'}"
-    monkeypatch.setenv("TIDEMARK_DATABASE_URL", truncated_url)
-    _seed_candles(truncated_url, SYMBOL, n=10)  # candles 0..9, closing at +4*9h
-
-    result_truncated = runner.invoke(app, ["context", "evaluate", "--symbol", SYMBOL])
-    assert result_truncated.exit_code == 0
-
-    # Same state/watch/grade/reason line modulo the DB it came from.
-    assert (
-        result_full.stdout.split("\n")[0].split("  ", 1)[1]
-        == (result_truncated.stdout.split("\n")[0].split("  ", 1)[1])
-    )
 
 
 # -- run / journal / notify (Phase 3) -----------------------------------------
@@ -1014,7 +985,6 @@ def test_replay_accepts_v0_2_rule_version(tmp_path, monkeypatch: pytest.MonkeyPa
     store = TidemarkStore(engine)
     before = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
 
@@ -1024,12 +994,11 @@ def test_replay_accepts_v0_2_rule_version(tmp_path, monkeypatch: pytest.MonkeyPa
 
     after = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
 
     assert result.exit_code == 0
-    assert before == after == (0, 0, 0)
+    assert before == after == (0, 0)
     assert "## Table 2" in result.stdout
     assert "Grade at start" in result.stdout
     assert "**sum**" in result.stdout
@@ -1046,7 +1015,6 @@ def test_replay_writes_nothing_and_prints_all_three_tables(
     store = TidemarkStore(engine)
     before = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
 
@@ -1056,12 +1024,11 @@ def test_replay_writes_nothing_and_prints_all_three_tables(
 
     after = (
         store.count_journal_entries(),
-        len(store.context_history(SYMBOL)),
         len(store.observation_history(SYMBOL)),
     )
 
     assert result.exit_code == 0
-    assert before == after == (0, 0, 0)
+    assert before == after == (0, 0)
     assert "## Data snapshot" in result.stdout
     assert "## Table 1" in result.stdout
     assert "## Table 2" in result.stdout

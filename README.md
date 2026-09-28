@@ -129,13 +129,13 @@ uv run tidemark data gaps
 # for public OHLCV on the default exchange).
 uv run tidemark data backfill --symbols BTC/USDT:USDT --timeframes 4h,1d,1w --days 180
 
-# Evaluate Section 1's decision matrix against the latest closed 4H candle
-# and persist the result.
-uv run tidemark context evaluate --symbol BTC/USDT:USDT
-
-# Reproduce exactly what Section 1 would have output as of an earlier 4H
-# close, using only data available at that moment.
-uv run tidemark context evaluate --symbol BTC/USDT:USDT --as-of 2026-06-01T00:00:00+00:00
+# Evaluate Section 1 and journal the result - see "Using the run pipeline"
+# below. `context history`/`explain` are read-only inspection of what that
+# journaled: there is no standalone evaluate/persist command (removed as
+# redundant with `tidemark replay`'s point-in-time reproduction - see
+# docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+# context_records").
+uv run tidemark run --symbols BTC/USDT:USDT
 
 # Past evaluations, and a human-readable breakdown of the latest one.
 uv run tidemark context history --symbol BTC/USDT:USDT
@@ -629,8 +629,11 @@ record, one row per evaluation, including every WAIT) -> a pure change
 detector -> a filtered, read-only Telegram alert on change only.
 `tidemark health check/heartbeat` proves the unattended system is
 actually alive, independent of whether anything alert-worthy has
-happened. `tidemark context evaluate/history/explain` still drive the
+happened. `tidemark context evaluate/history/explain` still drove the
 engine standalone, including `--as-of` for point-in-time reproduction.
+(`context evaluate` was later removed as redundant with `tidemark
+replay`'s point-in-time reproduction - see "Removing context_records"
+below.)
 
 **Phase 5 — Section 2 (1H behavior), observation-only.** Implemented as
 a measurement layer (rulebook status `PROVISIONAL — OBSERVATION ONLY`,
@@ -827,6 +830,21 @@ Every hourly evaluation, sent or not, is recorded in its own table,
 `sent`/`send_reason`-only update exception `JournalEntry` already uses.
 See the
 [ADR's Merge 3 addendum](docs/adr/0011-market-intelligence-layer.md#addendum-merge-3--the-hourly-btc-briefing).
+
+**Removing `context_records`.** The `context_records` table and its
+`ContextRecord` ORM model are gone entirely - not merely unread.
+`ContextRecord` is now a plain `@dataclass` (`htf.evaluate`'s in-memory
+Section 1 output shape; unchanged everywhere it's used - only its
+persistence is gone). `tidemark context evaluate` (its only writer, and
+by then already unused in production) is removed as redundant with
+`tidemark replay`'s existing point-in-time, side-effect-free inspection;
+`context history`/`explain` are kept, repointed at `journal_entries` -
+same output format, only the source changed. The lesson: a table that
+exists but receives no writes is a trap for anything that queries it by
+name. See the
+[ADR's "Addendum: removing context_records"](docs/adr/0011-market-intelligence-layer.md#addendum-removing-context_records)
+for the full report and the documented (manual, one-time) migration
+procedure for dropping the table from an existing database.
 
 See [docs/architecture.md](docs/architecture.md) for module responsibilities
 and [docs/adr/](docs/adr/) for architecture decision records.

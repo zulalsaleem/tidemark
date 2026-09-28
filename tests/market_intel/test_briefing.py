@@ -369,23 +369,16 @@ def test_evaluate_briefing_writes_no_research_table(tmp_path) -> None:
     _save_structure(research_engine, dt.datetime(2026, 9, 27, 16, 0, tzinfo=dt.UTC))
     client = _FakeClient()
 
-    def _counts():
+    def _journal_count():
         with research_engine.connect() as conn:
-            return {
-                "journal_entries": conn.execute(
-                    select(func.count()).select_from(JournalEntry)
-                ).scalar(),
-                "context_records": conn.execute(
-                    select(func.count()).select_from(ContextRecord)
-                ).scalar(),
-            }
+            return conn.execute(select(func.count()).select_from(JournalEntry)).scalar()
 
-    before = _counts()
-    assert before == {"journal_entries": 1, "context_records": 0}  # the one setup row only
+    before = _journal_count()
+    assert before == 1  # the one setup row only
 
     evaluate_briefing(client, _cache(client), evaluation_engine, database_url, VENUE, HOUR1)
 
-    after = _counts()
+    after = _journal_count()
     assert after == before  # unchanged: reading journal_entries never writes to it or anywhere else
 
 
