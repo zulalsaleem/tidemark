@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     # fall back to TIDEMARK_SYMBOLS instead (see data/symbol_source.py).
     universe_staleness_hours: int = 48
 
+    # /coin universe context: how old the latest `universe_context_cache`
+    # row may be before /coin still shows it but states its age plainly.
+    # Default 12h covers one missed run of a 4x-daily refresh-context
+    # schedule without /coin ever falling silent about staleness - see
+    # docs/adr/0011-market-intelligence-layer.md.
+    universe_context_stale_after_hours: int = 12
+
     # Storage
     database_url: str = "sqlite:///tidemark.db"
 
