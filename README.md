@@ -611,6 +611,72 @@ After` on a 429. If the budget runs out mid-run, it reports which
 symbols were not fetched rather than failing the whole run, and always
 reports how long it took.
 
+### Universe context for /coin
+
+`/coin` can show each metric's current value beside the universe's own
+median and p75 — strictly numbers, no labels, no comparison words
+("elevated", "above", etc.) — read from a small cache
+(`universe_context_cache`) rather than ever running a live ~189-second
+universe scan inside a chat reply.
+
+```bash
+uv run tidemark intel refresh-context   # runs the distributions measurement, writes one cache row
+```
+
+`refresh-context` is the only writer of that cache; `intel distributions`
+itself stays fully read-only and unchanged. Run it on a schedule (4x
+daily is the suggested default — see the ADR's addendum for why hourly
+isn't worth it: a cross-sectional median across ~30 symbols moves slowly,
+and a refresh costs the same ~120 Coinalyze call-units `intel
+distributions` costs). `/coin` reads only the most recently cached row —
+a fast local read, never a live fetch of the whole universe. If that row
+is older than `TIDEMARK_UNIVERSE_CONTEXT_STALE_AFTER_HOURS` (default 12),
+`/coin` still shows it, with its age stated plainly (e.g. "14h old") —
+never silently hidden. If the cache has never been refreshed at all,
+`/coin` omits the universe lines entirely and renders exactly as it
+always did — a missing cache must never break the bot.
+
+**Running it on a schedule (systemd timer example):**
+
+```ini
+# /etc/systemd/system/tidemark-refresh-context.service
+[Unit]
+Description=Tidemark /coin universe context refresh
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=tidemark
+WorkingDirectory=/opt/tidemark
+EnvironmentFile=/opt/tidemark/.env
+ExecStart=/opt/tidemark/.venv/bin/tidemark intel refresh-context
+```
+
+```ini
+# /etc/systemd/system/tidemark-refresh-context.timer
+[Unit]
+Description=Refresh Tidemark's /coin universe context cache 4x daily
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tidemark-refresh-context.timer
+systemctl list-timers tidemark-refresh-context.timer   # confirm the schedule
+journalctl -u tidemark-refresh-context -f              # tail the logs
+```
+
+Same `Type=oneshot`/`Persistent=true` reasoning as the hourly briefing
+timer above: it runs once and exits, and a missed run is caught up on
+rather than silently skipped. The `:15` offset just avoids the top of
+the hour if other scheduled jobs also land there — not a requirement.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the

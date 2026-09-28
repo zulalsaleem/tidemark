@@ -539,3 +539,192 @@ database; the `market_intel` isolation tests independently confirm
 - Every future consumer of a Section 1 result - inside `market_intel` or
   anywhere else - has exactly one table to query:
   `journal_entries`.
+
+## Addendum: /coin formatting and universe context
+
+### Phase 1 — the formatting-pass gap
+
+An operator reported that live `/coin` output on the server still showed
+raw floats (`2410227.0534883 USD`, `"base asset units"`) despite the
+formatting pass (`$1.04B`, `597,404 SOL`, three-decimal percentages)
+having been built and merged. Investigated before changing anything:
+
+- **The formatter is correctly wired.** `bot.py`'s `_handle_coin` calls
+  `telegram_render.render_snapshot`, and that function has always
+  contained the full formatting pass - confirmed by reading the current
+  source, not assumed. There is no second code path in `bot.py` that
+  bypasses it.
+- **There is a second renderer, but the bot never uses it.**
+  `cli.py`'s `_render_market_intel_snapshot` is a deliberately separate,
+  unformatted-by-design renderer for `tidemark intel market` (a terminal
+  audience, not a chat) - see this ADR's own "duplicate rather than
+  couple" reasoning above. It was checked and ruled out as the cause.
+- **The actual gap is test coverage, not wiring.**
+  `test_telegram_render.py` calls `render_snapshot` directly and
+  thoroughly verifies formatting; `test_bot.py`'s existing `/coin` tests
+  went through the real `run_once` -> `_handle_message` -> `_handle_coin`
+  path but never asserted on a formatted substring - only that a symbol
+  string or a fixed constant appeared. A hypothetical future regression
+  in the wiring (someone swapping which render function `bot.py` calls)
+  would not have been caught by the bot's own tests. Fixed by adding
+  `test_coin_reply_through_the_real_bot_path_is_formatted_not_raw`,
+  which reproduces the reported symptom exactly (a large open-interest
+  value) and asserts the abbreviated form appears and the raw float does
+  not - going through the real dispatch path, not `render_snapshot`
+  directly.
+- **This means the code in this repository was never the cause of what
+  was observed on the server.** The most consistent explanation,
+  supported by there being no CI/CD or deployment automation in this
+  project (`ci.yml` runs lint/tests only, on push/PR to `main` - it has
+  no deploy step, and no Dockerfile or deployment script exists
+  anywhere in the repo), is that the running bot process on the server
+  predates the formatting-pass commit and was never restarted against
+  it. That is an operational fact about that specific deployment, not
+  something this merge's code changes: merging to `main` has never been
+  synonymous with "running in production" for this project, and this is
+  the first time that gap actually mattered.
+
+### Phase 2 — the universe context cache
+
+`/coin` compares one symbol's current long/short ratio, funding rate, OI
+1H % change, and buy/sell volume ratio against the universe's own
+distribution - median and p75 - without ever computing that distribution
+inline. A live `intel distributions` run costs ~189s and ~120 Coinalyze
+call-units; a single-threaded, sequentially-processing bot (`run_once`'s
+`for update in updates` loop, see the Merge 2 addendum above) would be
+unresponsive to every chat, not just the requester, for the entire
+duration of one such reply. So the distribution is computed on its own
+schedule and cached; `/coin` only ever does a fast local read.
+
+**`universe_context_cache`, a fourth market_intel table, own Base.**
+Following `evaluation_store.py`'s own precedent exactly: a brand-new
+declarative Base (`UniverseContextBase`), its own duplicated
+`_UTCDateTime`, never `tidemark.data.models.Base`. Deliberately its own
+Base rather than sharing `evaluation_store.MarketIntelBase` too, so each
+market_intel storage module stays as independently self-contained as the
+last - this is consistent with the codebase's repeated choice to
+duplicate a small amount of code across differently-scoped consumers
+rather than couple them (the same reasoning behind `telegram_render.py`
+vs. `cli.py`'s renderer, and `briefing_data.py` vs. `service.py`).
+Append-only, unlike `market_intel_evaluations`: `tidemark intel
+refresh-context` is the only writer, always inserts, never updates or
+de-duplicates - a refresh that runs twice in the same hour simply
+produces two rows, and nothing about `/coin`'s read path depends on
+there being only one row per period.
+
+**Why the refresh is 4x daily by default, not hourly.** A cross-sectional
+median/p75 across ~30 symbols moves slowly compared to any single
+symbol's own minute-to-minute reading - it reflects the whole universe's
+positioning, not one coin's latest tick, so refreshing it as often as
+the hourly BTC briefing refreshes BTC's own structure would spend
+Coinalyze budget (~120 call-units per refresh, the same measurement
+`intel distributions` performs) without the comparison value changing
+meaningfully between runs. Four refreshes a day (~480 call-units/day,
+against 40/minute = up to 57,600/day) keeps the comparison recent enough
+that a 12-hour default staleness threshold (`TIDEMARK_
+UNIVERSE_CONTEXT_STALE_AFTER_HOURS`) comfortably covers one missed
+scheduled run without `/coin` ever silently going stale.
+
+**Why `universe_snapshot_id` is recorded, never joined.** Universe
+membership changes daily (`tidemark universe snapshot`'s own selection
+can add or drop symbols), so a median computed from one day's cohort is
+not necessarily the same comparison a reader would get from a fresher
+one. Recording the id as a plain string (not a foreign key back to
+`universe_snapshot`) lets a cached row always be traced to exactly the
+cohort it was computed from, while keeping `universe_context_store.py`
+free of any dependency on `tidemark.data` at all - unlike
+`universe_read.py`, this table needs no boundary exception, since it
+never reads the research engine's own snapshot tables, only records the
+id string `intel distributions`/`universe_read.py` already produced.
+
+**Why /coin shows numbers, not a comparison.** "STRICTLY NUMBERS. No
+labels, no colours, no comparison words" is enforced the same way the
+rest of `market_intel`'s no-interpretation constraint is: a fixed
+forbidden-word list checked against every rendered message in tests
+(now extended with `elevated`, `crowded`, `high`, `low`, `above`,
+`below`, `bullish`, `bearish`, `avoid`, `strong`, `weak`, `setup`). The
+reasoning is the same as everywhere else in this ADR: Tidemark's whole
+premise is that a human makes every trading decision, and a tool that
+says "2.07 is above the median of 1.74" has already made half of that
+judgment for the reader, even without ever saying "elevated." Showing
+both numbers, unlabeled, side by side, leaves the comparison entirely to
+the person reading it.
+
+**OI 1H % change is fetched independently, not reused from
+`open_interest_change`.** `MarketIntelSnapshot.open_interest_change`
+(the value `/coin` has always shown) is an absolute USD difference, not
+a percentage - a different quantity from what `intel distributions`
+measures and the cache stores, not just a different format. Pairing a
+USD "current" value with a percentage median/p75 under near-identical
+labels would silently invite exactly the kind of misreading "numbers
+only, no comparison words" is trying to avoid a different way - two
+numbers that look comparable but aren't. `coin_universe_context.py`
+fetches its own `open_interest_history` bucket and computes the
+percentage directly instead, at a cost of one extra Coinalyze call per
+`/coin` lookup (`ESTIMATED_CALL_COST_PER_COIN_LOOKUP` moved from 7 to
+8) - not the ~120-call universe scan, a single extra call, matching
+`service.py`'s own budget-consciousness rather than expanding it.
+
+**Funding rate reuses the snapshot's existing LIVE value, a deliberate,
+documented exception to that same reasoning.** Unlike OI, funding's
+"current" and cached values share the same unit (`%`), so there is no
+unit-mismatch risk - but they are still measured differently: `/coin`'s
+`funding_rate` is Coinalyze's live point-in-time reading (no closed-
+period concept exists for it on that endpoint - see this ADR's original
+Merge 1 context), while the cache's `funding_rate` summary is the closed
+1H reading `intel distributions` measures, the same choice
+`briefing_data.py` made for the classifier. Fetching a second, closed-
+period funding reading just for this one comparison would add yet
+another Coinalyze call for a live-updating value that already changes
+every few seconds regardless. This is recorded here as a conscious
+tradeoff, not an oversight: the two numbers are both real, both
+correctly labeled with their own timestamps (the live reading's own
+"live, updated HH:MM" and the cache's own "As of HH:MM"), and never
+conflated as the same instant.
+
+**Long/short ratio and buy/sell ratio need no extra fetch at all.**
+Long/short ratio is already the same closed-period quantity on both
+sides (`/coin`'s existing `long_short_ratio.ratio` and the cache's
+`long_short_ratio` summary both come from `/long-short-ratio-history`'s
+`r` field). Buy/sell ratio is computed from the two volume values
+`fetch_market_intel` already fetches for `/coin`'s existing "Buy
+volume"/"Sell volume" lines (`buy_volume.value / sell_volume.value`) -
+zero additional Coinalyze calls for either metric.
+
+**A missing cache entirely omits every universe line; a missing current
+value for one metric omits only that metric's lines.** These are two
+different kinds of "nothing to show," handled at two different levels:
+`gather_coin_universe_context` returns `None` outright if
+`universe_context_cache` has never been refreshed (so `/coin` renders
+exactly as it did before this addendum, with no universe content at
+all), and returns `None` for one specific metric's `MetricContext` when
+this particular symbol has no current value for it (e.g. a market
+without `has_long_short_ratio_data`) even though the cache itself has
+real data for the universe as a whole - never a fabricated current value
+paired with a real median/p75, and never a median/p75 rendered as if
+computed from zero symbols when the truth is "this symbol has none."
+
+### Consequences (/coin formatting and universe context)
+
+- Every claim in Phase 1's investigation was checked against the actual
+  current source before any test was written - the formatter was never
+  broken in this repository; the gap was coverage and, most likely,
+  deployment lag on one specific server.
+- `render_snapshot`'s signature gained one optional, defaulted parameter
+  (`universe_context: CoinUniverseContext | None = None`); every
+  existing caller and test that doesn't pass it renders byte-for-byte
+  what it always rendered - verified by
+  `test_none_universe_context_renders_exactly_as_before`.
+- `ESTIMATED_CALL_COST_PER_COIN_LOOKUP` is now 8, not 7 - the one honest
+  accounting change this addendum makes to `/coin`'s own Coinalyze
+  budget, documented at its definition in `bot.py`.
+- `universe_context_cache` has no relationship to `journal_entries`,
+  `observations`, `context_records` (removed), `market_intel_
+  evaluations`, or `universe_snapshot`/`universe_snapshot_row` beyond
+  recording the latter's id as a plain string - verified the same way
+  every other market_intel table boundary is verified in this project:
+  a test asserting the table list a fresh engine produces.
+- No rulebook exists for coin-context thresholds and this addendum adds
+  none - `intel distributions`/`refresh-context`/`/coin`'s new lines
+  measure and display only; choosing what counts as "elevated" for any
+  of these four metrics remains a future, separate rulebook decision.
