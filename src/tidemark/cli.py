@@ -60,6 +60,12 @@ from tidemark.market_intel.bot import run_forever, run_once
 from tidemark.market_intel.bot_state import BotStateStore
 from tidemark.market_intel.briefing import BriefingResult, evaluate_briefing, mark_sent
 from tidemark.market_intel.client import CoinalyzeClient
+from tidemark.market_intel.distributions import (
+    DistributionsMeasurement,
+    MetricSummary,
+    SymbolMetrics,
+    measure_distributions,
+)
 from tidemark.market_intel.errors import (
     CoinalyzeConnectionError,
     CoinalyzeHttpError,
@@ -76,6 +82,7 @@ from tidemark.market_intel.future_markets import FutureMarketsCache
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
+from tidemark.market_intel.universe_read import read_latest_selected_symbols
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 from tidemark.replay.render import render_report
 from tidemark.replay.report import build_replay_report
@@ -1768,6 +1775,164 @@ def intel_briefing(
         _safe_echo(result.message)
         typer.echo("")
         typer.echo(f"should_send={result.should_send} reason={result.send_reason} sent={sent}")
+
+
+def _metric_cell(metric) -> str:
+    if metric.status != OK:
+        return "UNAVAILABLE"
+    return f"{metric.value:.6g}"
+
+
+def _render_distributions(measurement: DistributionsMeasurement) -> str:
+    lines = [
+        f"universe snapshot: {measurement.snapshot_id or 'N/A'}",
+        f"source: {measurement.source}",
+        f"period: {measurement.period.start.isoformat()} to {measurement.period.close.isoformat()}",
+        f"generated_at: {measurement.generated_at.isoformat()}",
+        f"elapsed: {measurement.elapsed_seconds:.1f}s",
+        "",
+        f"{'rank':>4}  {'symbol':<20}  {'l/s ratio':>12}  {'funding %':>12}  "
+        f"{'oi 1h chg %':>12}  {'buy/sell ratio':>15}",
+    ]
+    for row in measurement.rows:
+        lines.append(
+            f"{row.rank:>4}  {row.ccxt_symbol:<20}  {_metric_cell(row.long_short_ratio):>12}  "
+            f"{_metric_cell(row.funding_rate):>12}  {_metric_cell(row.oi_change_pct):>12}  "
+            f"{_metric_cell(row.buy_sell_ratio):>15}"
+        )
+
+    lines.append("")
+    lines.append("summary:")
+    for summary in measurement.summaries:
+        if summary.n == 0:
+            lines.append(f"  {summary.name}: n=0 unavailable={summary.unavailable_count}")
+        else:
+            lines.append(
+                f"  {summary.name}: n={summary.n} min={summary.min:.6g} p25={summary.p25:.6g} "
+                f"median={summary.median:.6g} p75={summary.p75:.6g} max={summary.max:.6g} "
+                f"unavailable={summary.unavailable_count}"
+            )
+
+    if measurement.skipped_symbols:
+        lines.append("")
+        lines.append(f"not fetched ({len(measurement.skipped_symbols)}, budget exhausted):")
+        lines.append("  " + ", ".join(measurement.skipped_symbols))
+
+    return "\n".join(lines)
+
+
+def _closed_period_metric_to_dict(metric) -> dict:
+    return {
+        "status": metric.status,
+        "value": metric.value,
+        "unit": metric.unit,
+        "period_start": metric.period_start.isoformat() if metric.period_start else None,
+        "period_close": metric.period_close.isoformat() if metric.period_close else None,
+        "reason": metric.reason,
+    }
+
+
+def _symbol_metrics_to_dict(row: SymbolMetrics) -> dict:
+    return {
+        "rank": row.rank,
+        "ccxt_symbol": row.ccxt_symbol,
+        "coinalyze_symbol": row.coinalyze_symbol,
+        "long_short_ratio": _closed_period_metric_to_dict(row.long_short_ratio),
+        "funding_rate": _closed_period_metric_to_dict(row.funding_rate),
+        "oi_change_pct": _closed_period_metric_to_dict(row.oi_change_pct),
+        "buy_sell_ratio": _closed_period_metric_to_dict(row.buy_sell_ratio),
+    }
+
+
+def _metric_summary_to_dict(summary: MetricSummary) -> dict:
+    return {
+        "name": summary.name,
+        "n": summary.n,
+        "min": summary.min,
+        "p25": summary.p25,
+        "median": summary.median,
+        "p75": summary.p75,
+        "max": summary.max,
+        "unavailable_count": summary.unavailable_count,
+    }
+
+
+def _distributions_to_dict(measurement: DistributionsMeasurement) -> dict:
+    return {
+        "generated_at": measurement.generated_at.isoformat(),
+        "period_start": measurement.period.start.isoformat(),
+        "period_close": measurement.period.close.isoformat(),
+        "source": measurement.source,
+        "snapshot_id": measurement.snapshot_id,
+        "elapsed_seconds": measurement.elapsed_seconds,
+        "rows": [_symbol_metrics_to_dict(row) for row in measurement.rows],
+        "summaries": [_metric_summary_to_dict(s) for s in measurement.summaries],
+        "skipped_symbols": measurement.skipped_symbols,
+    }
+
+
+@intel_app.command("distributions")
+def intel_distributions(
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    symbols: str | None = typer.Option(
+        None,
+        "--symbols",
+        help="Comma-separated ccxt unified perpetual symbols; overrides the universe snapshot.",
+    ),
+) -> None:
+    """Measure long/short ratio, funding rate, 1H open-interest change,
+    and buy/sell volume ratio across the universe - a per-symbol table
+    plus n/min/p25/median/p75/max per metric. Read-only measurement
+    only: no interpretation, no labels, no trading recommendation - see
+    docs/adr/0011-market-intelligence-layer.md.
+    """
+    settings = get_settings()
+    try:
+        client = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    if symbols:
+        ccxt_symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+        source = "EXPLICIT"
+        snapshot_id = None
+    else:
+        snapshot_id, ccxt_symbols = read_latest_selected_symbols(
+            settings.database_url, settings.venue
+        )
+        source = "SNAPSHOT"
+        if not ccxt_symbols:
+            typer.echo(
+                f"No universe snapshot with selected symbols exists for venue={settings.venue!r}. "
+                "Run `tidemark universe snapshot` first, or pass --symbols."
+            )
+            raise typer.Exit(code=1)
+
+    cache = FutureMarketsCache(client)
+    now = dt.datetime.now(dt.UTC)
+
+    try:
+        measurement = measure_distributions(
+            client, cache, ccxt_symbols, settings.venue, now, source, snapshot_id
+        )
+    except UnsupportedVenueError as exc:
+        typer.echo(
+            f"No Coinalyze exchange-code mapping for venue {exc.venue!r}. "
+            "See docs/adr/0011-market-intelligence-layer.md."
+        )
+        raise typer.Exit(code=1) from None
+    except CoinalyzeHttpError as exc:
+        typer.echo(f"Coinalyze returned HTTP {exc.status_code}: {exc.detail}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeConnectionError as exc:
+        typer.echo(f"Could not reach Coinalyze: {exc.detail}")
+        raise typer.Exit(code=1) from None
+
+    if json:
+        typer.echo(json_module.dumps(_distributions_to_dict(measurement), indent=2))
+    else:
+        _safe_echo(_render_distributions(measurement))
 
 
 def main() -> None:

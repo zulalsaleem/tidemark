@@ -8,20 +8,24 @@ Two directions are checked:
   never anything under `tidemark.data` either.
 - Those same modules never import `tidemark.market_intel`.
 
-THE ONE EXCEPTION (Merge 3, see the ADR's "Addendum: Merge 3"):
+THE EXCEPTIONS (Merge 3, see the ADR's "Addendum: Merge 3"; extended for
+"intel distributions", see "Addendum: intel distributions"):
 `tidemark.data.models` (a plain ORM data module with no imports of its
-own back into the research engine) may be imported, for exactly one
-purpose - a read-only lookup of BTC's stored Section 1 result
+own back into the research engine) may be imported, for exactly two
+read-only purposes: a lookup of BTC's stored Section 1 result
 (`JournalEntry` - the table `tidemark run` actually writes; an earlier
 version of this read `ContextRecord`/`context_records`, a table nothing
-in production writes to, until an audit caught it) in `context_read.py`.
-Nothing else under `tidemark.data` is permitted,
-which is a deliberate TIGHTENING of the boundary versus a plain
-"tidemark.data.exchange is forbidden" rule: `tidemark.data.store`, for
-instance, is not named anywhere in CLAUDE.md's forbidden list, but its
-`TidemarkStore` transitively imports `tidemark.data.exchange` to type-
-hint candle fetching - importing it here would smuggle a forbidden
-import in through the back door. An allowlist of exactly one submodule
+in production writes to, until an audit caught it) in `context_read.py`,
+and a lookup of the latest universe snapshot's selected symbols
+(`UniverseSnapshot`/`UniverseSnapshotRow`) in `universe_read.py`.
+Nothing else under `tidemark.data` is permitted, and no other file may
+import even `tidemark.data.models`, which is a deliberate TIGHTENING of
+the boundary versus a plain "tidemark.data.exchange is forbidden" rule:
+`tidemark.data.store`, for instance, is not named anywhere in CLAUDE.md's
+forbidden list, but its `TidemarkStore` transitively imports
+`tidemark.data.exchange` to type-hint candle fetching - importing it
+here would smuggle a forbidden import in through the back door. An
+allowlist of exactly one submodule, read by exactly two named files,
 closes that gap and any other one like it, present or future.
 """
 
@@ -84,21 +88,25 @@ def test_market_intel_never_imports_the_research_engine() -> None:
     assert not violations, "market_intel isolation boundary violated:\n" + "\n".join(violations)
 
 
-def test_only_context_read_imports_the_one_permitted_data_module() -> None:
+ALLOWED_DATA_IMPORTERS = {"context_read.py", "universe_read.py"}
+
+
+def test_only_the_two_named_files_import_the_one_permitted_data_module() -> None:
     """The allowlist above permits `tidemark.data.models` package-wide,
-    but in practice exactly one file should ever need it - this test
-    keeps that true rather than merely possible.
+    but in practice only `context_read.py` and `universe_read.py` should
+    ever need it - this test keeps that true rather than merely possible.
     """
     market_intel_files = sorted((SRC_ROOT / "market_intel").rglob("*.py"))
 
-    importers = [
+    importers = {
         path.name
         for path in market_intel_files
         if any(_is_allowed_data_import(name) for name in _imported_module_names(path))
-    ]
+    }
 
-    assert importers == ["context_read.py"], (
-        f"expected only context_read.py to import {ALLOWED_DATA_SUBMODULE!r}, found: {importers}"
+    assert importers == ALLOWED_DATA_IMPORTERS, (
+        f"expected only {ALLOWED_DATA_IMPORTERS} to import {ALLOWED_DATA_SUBMODULE!r}, "
+        f"found: {importers}"
     )
 
 
@@ -149,3 +157,29 @@ def test_the_context_read_exception_file_exists_and_never_imports_tidemark_conte
     assert not any(
         name == "tidemark.data.store" or name.startswith("tidemark.data.store.") for name in names
     )
+
+
+def test_the_universe_read_exception_file_exists_and_never_imports_symbol_source() -> None:
+    # Same purpose as the test above, for the "intel distributions"
+    # boundary exception: names the file, and double-checks it never
+    # imports `data.symbol_source` or `data.store` - it must read the
+    # snapshot itself, never the TIDEMARK_SYMBOLS-fallback resolution
+    # logic those modules carry.
+    path = SRC_ROOT / "market_intel" / "universe_read.py"
+    assert path.is_file()
+    names = _imported_module_names(path)
+    assert not any(
+        name == "tidemark.data.store" or name.startswith("tidemark.data.store.") for name in names
+    )
+    assert not any(
+        name == "tidemark.data.symbol_source" or name.startswith("tidemark.data.symbol_source.")
+        for name in names
+    )
+
+
+def test_the_distributions_file_is_covered_by_the_boundary_scan() -> None:
+    # Same purpose as the telegram-bot-files test above, for the "intel
+    # distributions" files specifically.
+    market_intel_dir = SRC_ROOT / "market_intel"
+    for filename in ("distributions.py", "universe_read.py"):
+        assert (market_intel_dir / filename).is_file()
