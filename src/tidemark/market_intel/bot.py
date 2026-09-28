@@ -21,8 +21,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from sqlalchemy import Engine
+
 from tidemark.market_intel.bot_state import BotStateStore
 from tidemark.market_intel.client import RATE_LIMIT_PER_MINUTE, CoinalyzeClient
+from tidemark.market_intel.coin_universe_context import gather_coin_universe_context
 from tidemark.market_intel.errors import (
     RateLimitedError,
     TelegramConnectionError,
@@ -36,14 +39,21 @@ from tidemark.market_intel.telegram_render import render_snapshot
 
 logger = logging.getLogger(__name__)
 
-# A /coin lookup can hit up to 7 Coinalyze endpoints for one symbol
+# A /coin lookup can hit up to 8 Coinalyze endpoints for one symbol
 # (open interest, funding rate, predicted funding rate, open-interest
 # history, long/short ratio history, liquidation history, ohlcv
-# history) - see service.py. Checked before dispatching so a single
-# burst of /coin requests can't blow the documented 40/minute budget;
-# RateLimitedError from the client itself (see client.py) is still
-# caught as a fallback in case this estimate undercounts.
-ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 7
+# history - see service.py - plus one more open-interest-history call
+# for the universe-context OI percentage - see coin_universe_context.py).
+# Checked before dispatching so a single burst of /coin requests can't
+# blow the documented 40/minute budget; RateLimitedError from the client
+# itself (see client.py) is still caught as a fallback in case this
+# estimate undercounts.
+ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 8
+
+# Default when a caller doesn't pass its own (e.g. `settings.
+# universe_context_stale_after_hours` from the CLI) - a row older than
+# this is still shown, with its age stated plainly, rather than hidden.
+DEFAULT_CONTEXT_STALE_AFTER = dt.timedelta(hours=12)
 
 STARTUP_BACKLOG_MAX_AGE = dt.timedelta(minutes=5)
 LONG_POLL_TIMEOUT_SECONDS = 30
@@ -108,6 +118,8 @@ def _handle_coin(
     argument: str,
     venue: str,
     now: dt.datetime,
+    context_engine: Engine | None = None,
+    context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
 ) -> None:
     if not argument:
         telegram.send_message(chat_id, COIN_USAGE_TEXT)
@@ -127,7 +139,13 @@ def _handle_coin(
         telegram.send_message(chat_id, f"No Coinalyze mapping for venue {exc.venue!r}.")
         return
 
-    telegram.send_message(chat_id, render_snapshot(snapshot))
+    universe_context = None
+    if context_engine is not None:
+        universe_context = gather_coin_universe_context(
+            coinalyze, context_engine, snapshot, now, context_stale_after
+        )
+
+    telegram.send_message(chat_id, render_snapshot(snapshot, universe_context))
 
 
 def _handle_message(
@@ -138,6 +156,8 @@ def _handle_message(
     text: str,
     venue: str,
     now: dt.datetime,
+    context_engine: Engine | None = None,
+    context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
 ) -> None:
     parsed = _parse_command(text)
     if parsed is None:
@@ -146,7 +166,17 @@ def _handle_message(
 
     command, argument = parsed
     if command == "/coin":
-        _handle_coin(telegram, coinalyze, cache, chat_id, argument, venue, now)
+        _handle_coin(
+            telegram,
+            coinalyze,
+            cache,
+            chat_id,
+            argument,
+            venue,
+            now,
+            context_engine,
+            context_stale_after,
+        )
     elif command in ("/help", "/start"):
         telegram.send_message(chat_id, HELP_TEXT)
     else:
@@ -172,6 +202,8 @@ def run_once(
     discard_backlog: bool = True,
     poll_timeout: int = 0,
     backlog_max_age: dt.timedelta = STARTUP_BACKLOG_MAX_AGE,
+    context_engine: Engine | None = None,
+    context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
 ) -> RunOnceOutcome:
     """Fetch whatever updates are pending, dispatch each, and persist the
     offset after every single one - so a crash mid-batch reprocesses at
@@ -202,7 +234,17 @@ def run_once(
             state.save_offset(update_id + 1)
             continue
 
-        _handle_message(telegram, coinalyze, cache, chat_id, message.get("text", ""), venue, now)
+        _handle_message(
+            telegram,
+            coinalyze,
+            cache,
+            chat_id,
+            message.get("text", ""),
+            venue,
+            now,
+            context_engine,
+            context_stale_after,
+        )
         processed += 1
         state.save_offset(update_id + 1)
 
@@ -225,6 +267,8 @@ def run_forever(
     sleep_fn: Callable[[float], None] = time.sleep,
     clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     max_iterations: int | None = None,
+    context_engine: Engine | None = None,
+    context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
 ) -> None:
     """Poll forever. The first pass discards a stale startup backlog;
     every pass after that does not. A network failure (or a Telegram
@@ -251,6 +295,8 @@ def run_forever(
                 clock(),
                 discard_backlog=first_pass,
                 poll_timeout=poll_timeout,
+                context_engine=context_engine,
+                context_stale_after=context_stale_after,
             )
             first_pass = False
             backoff = INITIAL_BACKOFF_SECONDS
