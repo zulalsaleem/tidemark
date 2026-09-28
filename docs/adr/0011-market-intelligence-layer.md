@@ -408,3 +408,75 @@ delivered via `--send`.
   of what a running system has been alerting on.
 - BTC dominance remains unavailable and out of scope; this briefing adds
   no new sourcing for it.
+
+## Addendum: intel distributions
+
+Before any coin-context rulebook (long/short ratio, funding, OI change,
+buy/sell imbalance thresholds) can be written, someone has to look at
+what those metrics actually look like across the universe - otherwise a
+threshold like "elevated" or "crowded" is a guess, not a measurement.
+`tidemark intel distributions` exists to answer exactly that question,
+and nothing else: it fetches the same four closed-period metrics for
+every symbol in the currently selected universe and prints raw values
+plus n/min/p25/median/p75/max per metric. It produces no interpretation
+of its own - no label, no flag, no bias - and it does not write a
+rulebook; it is the measurement step that has to happen before one can
+be written honestly.
+
+**A second, narrow boundary exception, alongside `context_read.py`.**
+Loading "the currently selected symbols from the latest universe
+snapshot" means reading `UniverseSnapshot`/`UniverseSnapshotRow` -
+tables the research engine's universe-selection pipeline
+(`data/universe_snapshot.py`) writes. `universe_read.py` is the second
+(and, by the same import-boundary test that now checks for exactly two
+named files, still deliberately singular per concern) file permitted to
+import `tidemark.data.models`, for this one read-only purpose. It
+never imports `data.symbol_source` or `data.store`, and it never
+reproduces `resolve_symbols`'s `TIDEMARK_SYMBOLS` fallback: a missing or
+empty snapshot is returned as `(None, [])` for the caller to report
+plainly, never silently substituted with a different universe than the
+one requested.
+
+**Funding here is the closed-period reading, not the live one.** `/coin`
+and `intel market`'s funding metric is deliberately a live,
+point-in-time value (Coinalyze has no closed-period funding "current"
+concept in that sense). `intel distributions` instead reads
+`funding_rate_history`'s closed 1H bucket, the same choice
+`briefing_data.py` already made for the classifier - CLAUDE.md's "closed
+candles only" rule applies to a measurement exactly as much as to a rule
+evaluation, and a distribution built from a live value would describe a
+different instant for every symbol depending on when the run happened
+to reach it.
+
+**Pacing is additive to the client's own reactive 429 handling.**
+`CoinalyzeClient` already retries a 429 with bounded backoff honoring
+`Retry-After`, but deliberately never preempts a call on its own
+tracked call rate (see `calls_in_last_minute`'s docstring). A
+distributions run is large enough (~30 symbols x up to 4 call-units =
+up to 120, against the 40/minute budget) that relying on reactive
+retries alone would mean routinely eating several 429s per run. `intel
+distributions` adds its own proactive wait before each symbol's calls
+when the tracked rate is within the reserved cost of that symbol's
+worst case (4 call-units, even though a symbol missing long/short-ratio
+or buy/sell data actually costs less) - a deliberately conservative,
+never-under-reserving estimate that keeps the pre-call check simple.
+
+**A rate-limit budget exhaustion is a partial result, never a crash.**
+If the client's own bounded retries are exhausted mid-run
+(`RateLimitedError`), every symbol not yet fetched is reported in
+`skipped_symbols` and the run still returns its summary over whatever it
+did fetch - "no setups found" is a successful run per CLAUDE.md, and the
+same spirit applies here: an incomplete measurement, honestly reported
+as incomplete, is still useful; a crash is not.
+
+### Consequences (intel distributions)
+
+- The import-boundary test now names exactly two files
+  (`context_read.py`, `universe_read.py`) as the only permitted
+  importers of `tidemark.data.models` - the allowlist stays as narrow as
+  the number of genuine read-only needs `market_intel` actually has, not
+  a general-purpose door into `tidemark.data`.
+- This command informs threshold selection for a future coin-context
+  rulebook version; it is not itself part of any rulebook and makes no
+  claim about what a threshold should be. Choosing one from its output
+  is a separate, deliberate step with its own rulebook change.
