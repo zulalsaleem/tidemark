@@ -2,9 +2,14 @@
 
 Candle ingestion (Part C/D of Phase 1): idempotent upserts, per-candle
 sanity checks, rejected-candle recording, gap detection, and run
-bookkeeping. Section 1 context-record persistence (Phase 2): idempotent
-upsert keyed on (asset, evaluated_at, rule_version), so re-evaluating the
-same 4H close overwrites rather than duplicates.
+bookkeeping. Journal persistence (Phase 3, the live source of Section 1
+results): append-only, keyed on (asset, evaluated_at, rule_version), so
+re-evaluating the same 4H close is a no-op rather than a duplicate.
+
+No `ContextRecord` persistence lives here - it was removed along with the
+`context_records` table it backed; see
+docs/adr/0011-market-intelligence-layer.md's "Addendum: removing
+context_records" for why.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from tidemark.data.exchange import RawCandle
 from tidemark.data.models import (
     Base,
     Candle,
-    ContextRecord,
     JournalEntry,
     MarketRegistry,
     Observation,
@@ -403,75 +407,10 @@ class TidemarkStore:
             latest.setdefault(row.command, row)
         return latest
 
-    # -- context records (Section 1) -----------------------------------------
-
-    def save_context_record(self, record: ContextRecord) -> None:
-        """Persist a Section 1 output record.
-
-        Idempotent: re-evaluating the same (asset, evaluated_at,
-        rule_version) overwrites the existing row rather than duplicating
-        it. Query-then-write rather than a DB-level upsert, since
-        `ContextRecord` (unlike `Candle`) carries no unique constraint for
-        that key — this only ever runs from a single CLI invocation, so
-        there is no concurrent-writer race to guard against.
-        """
-        with self._session_factory() as session:
-            existing = session.scalars(
-                select(ContextRecord).where(
-                    ContextRecord.asset == record.asset,
-                    ContextRecord.evaluated_at == record.evaluated_at,
-                    ContextRecord.rule_version == record.rule_version,
-                )
-            ).one_or_none()
-            if existing is not None:
-                existing.state = record.state
-                existing.watch = record.watch
-                existing.grade = record.grade
-                existing.reason_code = record.reason_code
-                existing.active_levels = record.active_levels
-                existing.fib = record.fib
-                existing.swings_used = record.swings_used
-            else:
-                session.add(
-                    ContextRecord(
-                        asset=record.asset,
-                        evaluated_at=record.evaluated_at,
-                        rule_version=record.rule_version,
-                        state=record.state,
-                        watch=record.watch,
-                        grade=record.grade,
-                        reason_code=record.reason_code,
-                        active_levels=record.active_levels,
-                        fib=record.fib,
-                        swings_used=record.swings_used,
-                    )
-                )
-            session.commit()
-
-    def latest_context_record(self, asset: str) -> ContextRecord | None:
-        """Fetch the most recent context record for an asset, if any."""
-        with self._session_factory() as session:
-            stmt = (
-                select(ContextRecord)
-                .where(ContextRecord.asset == asset)
-                .order_by(ContextRecord.evaluated_at.desc())
-                .limit(1)
-            )
-            return session.scalars(stmt).first()
-
-    def context_history(self, asset: str, since: dt.datetime | None = None) -> list[ContextRecord]:
-        """Fetch context records for an asset, newest first."""
-        with self._session_factory() as session:
-            stmt = select(ContextRecord).where(ContextRecord.asset == asset)
-            if since is not None:
-                stmt = stmt.where(ContextRecord.evaluated_at >= since)
-            stmt = stmt.order_by(ContextRecord.evaluated_at.desc())
-            return list(session.scalars(stmt))
-
     # -- journal (Phase 3) ----------------------------------------------------
 
     def save_journal_entry(self, entry: JournalEntry) -> JournalWriteResult:
-        """Append one journal row. Append-only: unlike `save_context_record`,
+        """Append one journal row. Append-only: unlike a one-off overwrite,
         an existing (asset, evaluated_at, rule_version) row is never
         overwritten — re-evaluating the same candle is a no-op that
         returns the existing row, not a second row and not an update.

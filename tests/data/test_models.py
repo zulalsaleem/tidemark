@@ -104,18 +104,8 @@ def test_every_model_datetime_round_trips_utc_aware() -> None:
             source="swing_low_cluster",
             formed_at=now,
         )
-        context_record = ContextRecord(
-            asset="BTCUSDT",
-            evaluated_at=now,
-            rule_version="1.0",
-            state="BULLISH",
-            watch="LONG_WATCH",
-            grade="A",
-            reason_code="OK",
-        )
-        session.add_all([candle, rejected, run, swing, level, context_record])
+        session.add_all([candle, rejected, run, swing, level])
         session.commit()
-        session.refresh(context_record)
 
         journal_entry = JournalEntry(
             asset="BTCUSDT",
@@ -141,7 +131,6 @@ def test_every_model_datetime_round_trips_utc_aware() -> None:
         stored_run = session.query(Run).one()
         stored_swing = session.query(Swing).one()
         stored_level = session.query(Level).one()
-        stored_context = session.query(ContextRecord).one()
         stored_journal = session.query(JournalEntry).one()
 
     stored_datetimes = [
@@ -156,7 +145,6 @@ def test_every_model_datetime_round_trips_utc_aware() -> None:
         stored_swing.formed_at,
         stored_swing.confirmed_at,
         stored_level.formed_at,
-        stored_context.evaluated_at,
         stored_journal.evaluated_at,
         stored_journal.recorded_at,
     ]

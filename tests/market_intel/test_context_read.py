@@ -93,31 +93,16 @@ def test_returns_the_latest_entry_for_the_asset(tmp_path) -> None:
     assert result.evaluated_at == newer
 
 
-def test_reads_what_tidemark_run_actually_writes_not_context_records(tmp_path) -> None:
-    """The regression this module exists to fix: `tidemark run` writes
-    only `journal_entries` (never `context_records` - see ADR 0011's
-    Merge 3 addendum). A row in `context_records` alone must NOT be
-    visible here.
-    """
-    db_path = (tmp_path / "tidemark.db").as_posix()
-    database_url = f"sqlite:///{db_path}"
-    engine = create_store_engine(database_url)
-    init_db(engine)
-    store = TidemarkStore(engine)
-
-    # Only the standalone `tidemark context evaluate` path writes this -
-    # simulated directly here since that's the only real writer.
-    store.save_context_record(_context_record(dt.datetime(2026, 1, 1, tzinfo=dt.UTC)))
-
-    assert read_latest_journal_entry(database_url, ASSET) is None
-
-    # Once `tidemark run`'s real write path adds a journal_entries row,
-    # it becomes visible.
-    _journal(store, dt.datetime(2026, 1, 2, tzinfo=dt.UTC), state="BEARISH")
-
-    result = read_latest_journal_entry(database_url, ASSET)
-    assert result is not None
-    assert result.state == "BEARISH"
+# The regression this module was fixed for (see docs/adr/0011's
+# "Addendum: Merge 3" and its follow-up "Addendum: removing
+# context_records") was that `context_read.py` used to query
+# `context_records`, a table `tidemark run` never wrote to. That table -
+# and its only writer, `save_context_record` - no longer exist at all, so
+# the specific "a context_records-only row must stay invisible" scenario
+# this test used to prove is now categorically impossible to construct,
+# not merely untested. `test_returns_the_latest_entry_for_the_asset`
+# above already proves the positive case: a real journal_entries row,
+# written the real way, is found.
 
 
 def test_never_writes_anything(tmp_path) -> None:
