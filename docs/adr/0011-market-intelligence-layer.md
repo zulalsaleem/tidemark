@@ -408,3 +408,134 @@ delivered via `--send`.
   of what a running system has been alerting on.
 - BTC dominance remains unavailable and out of scope; this briefing adds
   no new sourcing for it.
+
+## Addendum: removing `context_records`
+
+The prior addendum's "Correction (post-launch)" fixed `context_read.py`
+to read `journal_entries` instead of `context_records`. This addendum
+removes `context_records` and its `ContextRecord` ORM model entirely -
+structural cleanup only; no Section 1/2 rule, parameter, threshold, or
+engine logic changes.
+
+**What was actually there, confirmed from the code before changing
+anything:**
+- The only writer of `context_records` was ever the standalone
+  `tidemark context evaluate` command (`cli.py`). `tidemark run` - what
+  actually runs in production - evaluates Section 1 via `htf.evaluate`
+  and persists the result only as a `JournalEntry`
+  (`journal.records.build_journal_entry` + `TidemarkStore.
+  save_journal_entry`), never as a `ContextRecord` row.
+- Every other consumer of the `ContextRecord` type
+  (`context/htf.py`'s own construction, `journal/changes.py`'s
+  `detect_change`, `journal/records.py`'s `build_journal_entry`,
+  `notify/telegram.py`'s rendering, `replay/report.py`'s entire
+  in-memory replay) used it purely as `htf.evaluate`'s in-memory return
+  shape - never touching the table.
+- Readers of the table: `context history`/`context explain` (the CLI's
+  own read-only pair) and `market_intel`'s hourly briefing (fixed in the
+  prior addendum). `context_records` was empty on the live deployment
+  this was found on; `journal_entries` held the real history.
+
+**Decision on `tidemark context evaluate`: removed, not converted to
+write `JournalEntry`.** `tidemark replay` (ADR 0008) already provides
+point-in-time, side-effect-free Section 1 inspection for any symbol -
+`context evaluate`'s standalone-evaluate-and-persist function was
+redundant with it. Teaching it to write into `journal_entries` instead
+would have let ad hoc, manually-triggered evaluations land in the same
+append-only table `tidemark run`'s real, scheduled evaluations populate,
+with no way to tell them apart later - a data-hygiene risk, not a
+feature worth preserving. It was already unused in practice (zero rows
+on the live deployment), so removing it changes no observed production
+behavior. `context history` and `context explain` are kept, repointed at
+`journal_entries` (`TidemarkStore.journal_history`) - same output
+format, only the source changed. `_evaluate_symbol`/`_load_context_
+candles`/`_candles_to_frame` (helpers that existed only to support
+`context evaluate`) were removed alongside it, along with the now-
+redundant `tests/context/test_look_ahead_guard.py` - the same look-
+ahead-safety property it proved for `_evaluate_symbol` is still proven,
+for the one remaining point-in-time evaluation path, by `tests/replay/
+test_report.py::test_replay_section1_look_ahead_guard`.
+
+**What changed:**
+- `data/models.py`: `ContextRecord` is now a plain `@dataclass`, not a
+  `Base`-mapped ORM class - same field names, same shape, so every
+  in-memory consumer above needed zero changes. It no longer has a
+  `__tablename__`, an `id`, or any relationship to a table at all -
+  removing the class from the ORM's metadata is what makes it
+  impossible for `context_records` to be silently recreated by a future
+  `init_db()`/`create_all()` call.
+- `data/store.py`: `save_context_record`, `latest_context_record`, and
+  `context_history` (the `ContextRecord`-table methods) are removed.
+  `TidemarkStore.journal_history` (already existed, already used
+  elsewhere) is what `context history`/`context explain` now call.
+- `cli.py`: `context evaluate` is removed. `context history`/`context
+  explain` read `journal_history`/`journal_history()[0]` instead of the
+  removed methods; their rendering code is untouched, since
+  `JournalEntry` carries the exact same fields `ContextRecord` did.
+
+**Tests updated to seed via the real production write path
+(`build_journal_entry` + `save_journal_entry`), never a bespoke row
+insert** - a bespoke insert into the wrong table/method is exactly what
+let the original `context_records` bug through undetected for as long
+as it went unnoticed. This applies to `tests/test_cli.py`'s `context
+history`/`context explain` tests (new: `test_context_history_shows_
+data_written_by_the_production_path`, `test_context_explain_shows_data_
+written_by_the_production_path`) and to the `market_intel` fixtures that
+previously called the now-removed `save_context_record` directly.
+
+### Migration: dropping `context_records` from an existing database
+
+There is no migration tooling in this project - `init_db()` only ever
+runs `Base.metadata.create_all()`, which creates missing tables and
+never drops anything. Removing `ContextRecord` from the ORM stops a
+*fresh* database from ever gaining a `context_records` table, but an
+*existing* database file (any local dev copy, and the live server) keeps
+the orphaned table until it is dropped explicitly. This is a manual,
+one-time step - not something this change automates, and no
+general-purpose migration framework was added to do it.
+
+Run these two steps, in order, against the actual database file
+(`sqlite3 tidemark.db`, or the path in `TIDEMARK_DATABASE_URL`):
+
+```sql
+-- Step 1: confirm nothing is lost. This MUST print 0 before proceeding -
+-- do not skip it or assume the count from this document.
+SELECT COUNT(*) FROM context_records;
+```
+
+```sql
+-- Step 2: only after Step 1 printed 0.
+DROP TABLE context_records;
+```
+
+Equivalently, from a shell:
+
+```bash
+sqlite3 tidemark.db "SELECT COUNT(*) FROM context_records;"   # must print 0
+sqlite3 tidemark.db "DROP TABLE context_records;"
+```
+
+This touches `context_records` only. `candles`, `journal_entries`,
+`observations`, `runs`, `run_symbol_stats`, `swings`, `levels`,
+`market_registry`, `universe_snapshot`, `universe_snapshot_row`, and
+`market_intel_evaluations` are all untouched by this migration and by
+this entire change - verified by the test suite (`test_init_db_creates_
+expected_tables` now asserts `context_records` is absent from a fresh
+database; the `market_intel` isolation tests independently confirm
+`market_intel`'s own writes never touch a research table).
+
+### Consequences (removing `context_records`)
+
+- A table that exists but receives no writes is a trap for anything that
+  queries it by name - it looks like a legitimate, checkable data
+  source right up until the moment someone reads it and silently gets
+  nothing. Removing the table removes the trap; keeping
+  `journal_entries` as the one place Section 1 results live removes the
+  ambiguity about which table is authoritative.
+- `context evaluate` is gone; `tidemark replay` is the standalone,
+  side-effect-free way to inspect what Section 1 would say about a
+  symbol, and `context history`/`context explain` remain the read-only
+  way to inspect what it actually did say, in production.
+- Every future consumer of a Section 1 result - inside `market_intel` or
+  anywhere else - has exactly one table to query:
+  `journal_entries`.
