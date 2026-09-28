@@ -22,7 +22,9 @@ here.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Callable
 
+from tidemark.market_intel.coin_universe_context import CoinUniverseContext, MetricContext
 from tidemark.market_intel.models import MARKET_NOT_FOUND, OK, MarketIntelSnapshot
 
 FOOTER = "Data: Coinalyze (Binance USDT-M perpetuals). Market info only — not a trade signal."
@@ -151,12 +153,44 @@ def _fmt_liquidations_line(metric, reference: dt.datetime) -> str:
     )
 
 
-def render_snapshot(snapshot: MarketIntelSnapshot) -> str:
+def _fmt_universe_context_lines(
+    ctx: MetricContext | None, value_fmt: Callable[[float], str], reference: dt.datetime
+) -> str:
+    """Three lines beneath a metric's own current-value line - median,
+    p75, and when the cache was computed - or "" to omit entirely when
+    `ctx` is None (no cache row at all, or this symbol has no current
+    value for this particular metric). Age is stated plainly, in whole
+    hours, never a judgment word.
+    """
+    if ctx is None:
+        return ""
+    as_of = _fmt_instant(ctx.computed_at, reference)
+    age_suffix = ""
+    if ctx.is_stale:
+        age_suffix = f" ({int(ctx.age.total_seconds() // 3600)}h old)"
+    return (
+        f"\n  Universe median: {value_fmt(ctx.median)}"
+        f"\n  Universe p75: {value_fmt(ctx.p75)}"
+        f"\n  As of: {as_of}{age_suffix}"
+    )
+
+
+def render_snapshot(
+    snapshot: MarketIntelSnapshot,
+    universe_context: CoinUniverseContext | None = None,
+) -> str:
     """Everything `/coin` replies with for one symbol.
 
     Grouped OI, then funding, then positioning, then liquidations and
     volume, one blank line between groups - otherwise every label and
     the live-vs-closed-period distinction are exactly Merge 1's.
+
+    `universe_context`, when given, adds a "Universe median"/"Universe
+    p75"/"As of" block beneath each of the four metrics the cache
+    covers - strictly numbers, no comparison word of any kind. `None`
+    (the default) renders exactly as before Phase 2, with no universe
+    lines at all - a missing/never-refreshed cache must never change
+    what /coin's existing output looks like.
     """
     if snapshot.market_status == MARKET_NOT_FOUND:
         return (
@@ -165,27 +199,61 @@ def render_snapshot(snapshot: MarketIntelSnapshot) -> str:
         )
 
     reference = snapshot.generated_at
+    uc = universe_context
 
-    oi_group = "\n".join(
-        [
-            _fmt_metric_line("Open interest", snapshot.open_interest, reference),
-            _fmt_metric_line("Open interest change", snapshot.open_interest_change, reference),
-        ]
+    oi_pct_line = ""
+    if uc is not None and uc.oi_change_pct is not None:
+        oi_period = _fmt_range(
+            snapshot.open_interest_change.period_start,
+            snapshot.open_interest_change.period_close,
+            reference,
+        )
+        oi_pct_line = (
+            f"\nOpen interest change (%): {_fmt_pct(uc.oi_change_pct.current)} (period {oi_period})"
+            f"{_fmt_universe_context_lines(uc.oi_change_pct, _fmt_pct, reference)}"
+        )
+    oi_group = (
+        "\n".join(
+            [
+                _fmt_metric_line("Open interest", snapshot.open_interest, reference),
+                _fmt_metric_line("Open interest change", snapshot.open_interest_change, reference),
+            ]
+        )
+        + oi_pct_line
     )
+
+    funding_line = _fmt_metric_line("Funding rate", snapshot.funding_rate, reference)
+    if uc is not None:
+        funding_line += _fmt_universe_context_lines(uc.funding_rate, _fmt_pct, reference)
     funding_group = "\n".join(
         [
-            _fmt_metric_line("Funding rate", snapshot.funding_rate, reference),
+            funding_line,
             _fmt_metric_line("Predicted funding rate", snapshot.predicted_funding_rate, reference),
         ]
     )
+
     positioning_group = _fmt_long_short_line(snapshot.long_short_ratio, reference)
-    liquidations_and_volume_group = "\n".join(
-        [
-            _fmt_liquidations_line(snapshot.liquidations, reference),
-            _fmt_volume_line("Futures volume", snapshot.futures_volume, snapshot.symbol, reference),
-            _fmt_volume_line("Buy volume", snapshot.buy_volume, snapshot.symbol, reference),
-            _fmt_volume_line("Sell volume", snapshot.sell_volume, snapshot.symbol, reference),
-        ]
+    if uc is not None:
+        positioning_group += _fmt_universe_context_lines(uc.long_short_ratio, _fmt_ratio, reference)
+
+    bs_line = ""
+    if uc is not None and uc.buy_sell_ratio is not None:
+        bs_line = (
+            f"\nBuy/sell ratio: {_fmt_ratio(uc.buy_sell_ratio.current)}"
+            f"{_fmt_universe_context_lines(uc.buy_sell_ratio, _fmt_ratio, reference)}"
+        )
+    liquidations_and_volume_group = (
+        "\n".join(
+            [
+                _fmt_liquidations_line(snapshot.liquidations, reference),
+                _fmt_volume_line(
+                    "Futures volume", snapshot.futures_volume, snapshot.symbol, reference
+                ),
+                _fmt_volume_line("Buy volume", snapshot.buy_volume, snapshot.symbol, reference),
+                _fmt_volume_line("Sell volume", snapshot.sell_volume, snapshot.symbol, reference),
+            ]
+        )
+        + bs_line
     )
 
     body = "\n\n".join([oi_group, funding_group, positioning_group, liquidations_and_volume_group])
