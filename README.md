@@ -579,6 +579,38 @@ requirement — it only matters if you also run `tidemark run`/
 `tidemark observe run` on their own schedules and want the briefing to
 read a fresh Section 1 record rather than an hour-old one.
 
+### Measuring metric distributions
+
+Before any coin-context rulebook threshold is chosen for long/short
+ratio, funding, OI change, or buy/sell imbalance, `tidemark intel
+distributions` measures what those metrics actually look like across
+the universe, so a threshold like "elevated" is chosen from real numbers
+rather than guessed. It is a measurement tool, not a rule: it prints raw
+values and n/min/p25/median/p75/max per metric, never a label,
+interpretation, or trading recommendation.
+
+```bash
+uv run tidemark intel distributions                              # the latest universe snapshot
+uv run tidemark intel distributions --json                       # machine-readable output
+uv run tidemark intel distributions --symbols BTC/USDT:USDT,ETH/USDT:USDT  # ad-hoc override
+```
+
+Symbols default to the SELECTED rows of the latest universe snapshot for
+the configured venue — the same source `tidemark run` uses, never
+`TIDEMARK_SYMBOLS` — in rank order. `--symbols` overrides that for an
+ad-hoc measurement. Every value is either a number for a fully-closed 1H
+period (the same clamping `/coin` and the hourly briefing use) or
+`UNAVAILABLE`, never a fabricated zero; a symbol's `UNAVAILABLE` metrics
+are excluded from that metric's `n` and counted in its own
+`unavailable` total instead.
+
+Coinalyze's 40 calls/minute budget is shared across the whole run —
+roughly 4 call-units per symbol across the four metrics — so the command
+paces itself against the observed call rate and still honors `Retry-
+After` on a 429. If the budget runs out mid-run, it reports which
+symbols were not fetched rather than failing the whole run, and always
+reports how long it took.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
