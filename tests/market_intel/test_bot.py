@@ -27,6 +27,14 @@ from tidemark.market_intel.errors import (
     TelegramHttpError,
 )
 from tidemark.market_intel.future_markets import FutureMarketsCache
+from tidemark.market_intel.universe_context_store import (
+    METRIC_NAMES,
+    MetricSummaryFields,
+    UniverseContextRecord,
+    init_universe_context_store,
+    record_universe_context,
+)
+from tidemark.market_intel.universe_context_store import make_engine as make_context_engine
 
 VENUE = "binanceusdm"
 ALLOWED_CHAT_ID = 111
@@ -591,3 +599,168 @@ def test_no_secret_appears_in_any_sent_message(tmp_path) -> None:
         assert "TIDEMARK_" not in text
         assert "token" not in text.lower()
         assert "api_key" not in text.lower()
+
+
+# -- Phase 1 regression: the bot's actual path is formatted, not raw ----------
+
+
+class _LargeValueCoinalyze(_FakeCoinalyze):
+    """Open interest large enough that raw-vs-abbreviated is unambiguous -
+    mirrors the exact symptom reported live: a raw float like
+    2410227.0534883 instead of an abbreviated $2.41M.
+    """
+
+    def open_interest(self, symbols, convert_to_usd=True):
+        return [{"symbol": symbols[0], "value": 2_410_227.0534883, "update": 1_700_000_000_000}]
+
+
+def test_coin_reply_through_the_real_bot_path_is_formatted_not_raw(tmp_path) -> None:
+    """This is the gap that let raw floats reach production while
+    render_snapshot's own unit tests passed: those call render_snapshot
+    directly, never through run_once -> _handle_message -> _handle_coin.
+    This test goes through the real dispatch path instead.
+    """
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _LargeValueCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    # Formatted: abbreviated USD, three-decimal percentages, a formatted
+    # ratio - never the raw float the live server was reported showing.
+    assert "$2.41M" in text
+    assert "2410227.0534883" not in text
+    assert "0.001%" in text  # funding_rate=0.001, three decimals
+    assert "1.000" in text  # long/short ratio, three decimals
+    assert "base asset units" not in text  # named the asset instead
+
+
+# -- Phase 2: /coin reads the universe context cache ---------------------------
+
+
+def _context_engine(tmp_path):
+    engine = make_context_engine(f"sqlite:///{(tmp_path / 'context.db').as_posix()}")
+    init_universe_context_store(engine)
+    return engine
+
+
+def _seed_context_row(engine, computed_at: dt.datetime) -> None:
+    summary = MetricSummaryFields(
+        n=30, min=0.5, p25=1.2, median=1.742, p75=2.125, max=2.8, unavailable_count=0
+    )
+    record_universe_context(
+        engine,
+        UniverseContextRecord(
+            computed_at=computed_at,
+            universe_snapshot_id="snap-1",
+            period_start=computed_at - dt.timedelta(hours=1),
+            period_end=computed_at,
+            metrics={name: summary for name in METRIC_NAMES},
+        ),
+    )
+
+
+def test_coin_reads_the_latest_cached_row(tmp_path) -> None:
+    engine = _context_engine(tmp_path)
+    _seed_context_row(engine, NOW - dt.timedelta(hours=1))
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+        context_engine=engine,
+    )
+
+    _, text = telegram.sent[0]
+    assert "Universe median: 1.742" in text
+    assert "Universe p75: 2.125" in text
+    assert "As of:" in text
+
+
+def test_stale_cached_row_is_shown_with_its_age(tmp_path) -> None:
+    engine = _context_engine(tmp_path)
+    _seed_context_row(engine, NOW - dt.timedelta(hours=20))
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+        context_engine=engine,
+        context_stale_after=dt.timedelta(hours=12),
+    )
+
+    _, text = telegram.sent[0]
+    assert "20h old" in text
+
+
+def test_no_cached_row_omits_universe_lines_and_coin_still_renders(tmp_path) -> None:
+    engine = _context_engine(tmp_path)  # never refreshed
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+        context_engine=engine,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    assert "Universe median" not in text
+    assert "SOL/USDT:USDT" in text  # /coin still works
+
+
+def test_no_context_engine_at_all_behaves_exactly_as_before(tmp_path) -> None:
+    """The default (`context_engine=None`) path - unaffected callers."""
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    assert "Universe median" not in text

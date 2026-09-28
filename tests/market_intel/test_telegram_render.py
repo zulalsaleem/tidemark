@@ -14,6 +14,7 @@ import re
 
 import pytest
 
+from tidemark.market_intel.coin_universe_context import CoinUniverseContext, MetricContext
 from tidemark.market_intel.models import (
     MARKET_NOT_FOUND,
     NO_DATA,
@@ -39,7 +40,28 @@ TODAY = dt.datetime(2026, 9, 27, 19, 56, tzinfo=dt.UTC)
 PERIOD_START = dt.datetime(2026, 9, 27, 18, 0, tzinfo=dt.UTC)
 PERIOD_CLOSE = dt.datetime(2026, 9, 27, 19, 0, tzinfo=dt.UTC)
 
-_FORBIDDEN = ["entry", "stop", " sl ", " tp ", "target", "r:r", "long setup", "short setup"]
+_FORBIDDEN = [
+    "entry",
+    "stop",
+    " sl ",
+    " tp ",
+    "target",
+    "r:r",
+    "long setup",
+    "short setup",
+    "setup",
+    "elevated",
+    "crowded",
+    "high",
+    "low",
+    "above",
+    "below",
+    "bullish",
+    "bearish",
+    "avoid",
+    "strong",
+    "weak",
+]
 
 
 def _assert_no_forbidden_language(message: str) -> None:
@@ -47,11 +69,11 @@ def _assert_no_forbidden_language(message: str) -> None:
     for word in _FORBIDDEN:
         assert word not in lowered, f"unexpected {word!r} in rendered message"
 
-    # "buy"/"sell" are allowed ONLY inside the two volume metric labels
-    # this project's spec requires - verified precisely instead of
-    # banning the substring outright, which would make it impossible to
-    # ever render "Buy volume"/"Sell volume" at all.
-    without_allowed_labels = re.sub(r"buy volume|sell volume", "", lowered)
+    # "buy"/"sell" are allowed ONLY inside the raw data field labels this
+    # project's spec requires ("Buy volume"/"Sell volume"/"Buy/sell
+    # ratio") - verified precisely instead of banning the substring
+    # outright, which would make it impossible to ever render them at all.
+    without_allowed_labels = re.sub(r"buy volume|sell volume|buy/sell ratio", "", lowered)
     assert "buy" not in without_allowed_labels
     assert "sell" not in without_allowed_labels
 
@@ -367,3 +389,84 @@ def test_footer_is_unchanged_from_merge_2() -> None:
         FOOTER
         == "Data: Coinalyze (Binance USDT-M perpetuals). Market info only — not a trade signal."
     )
+
+
+# -- Phase 2: universe context lines -------------------------------------
+
+CACHE_COMPUTED_AT = dt.datetime(2026, 9, 27, 8, 0, tzinfo=dt.UTC)
+
+
+def _full_context(
+    is_stale: bool = False, age: dt.timedelta = dt.timedelta(hours=2)
+) -> CoinUniverseContext:
+    def _ctx(current: float, median: float, p75: float) -> MetricContext:
+        return MetricContext(
+            current=current,
+            median=median,
+            p75=p75,
+            computed_at=CACHE_COMPUTED_AT,
+            age=age,
+            is_stale=is_stale,
+        )
+
+    return CoinUniverseContext(
+        long_short_ratio=_ctx(1.207, 1.742, 2.125),
+        funding_rate=_ctx(-0.0032, 0.005, 0.01),
+        oi_change_pct=_ctx(0.394, 0.499, 1.234),
+        buy_sell_ratio=_ctx(0.720, 0.797, 0.944),
+    )
+
+
+def test_none_universe_context_renders_exactly_as_before() -> None:
+    assert render_snapshot(_ok_snapshot(), universe_context=None) == render_snapshot(_ok_snapshot())
+
+
+def test_universe_context_lines_appear_beneath_each_covered_metric() -> None:
+    message = render_snapshot(_ok_snapshot(), universe_context=_full_context())
+
+    assert "Long/short ratio: 1.207" in message
+    assert "Funding rate: -0.003%" in message
+    assert "Open interest change (%): 0.394% (period 18:00–19:00 UTC)" in message
+    assert "Buy/sell ratio: 0.720" in message
+
+    # Each covered metric gets its own median/p75/as-of block.
+    assert message.count("Universe median:") == 4
+    assert message.count("Universe p75:") == 4
+    assert message.count("As of:") == 4
+    assert "Universe median: 1.742" in message
+    assert "Universe p75: 2.125" in message
+    assert "As of: 08:00 UTC" in message
+
+
+def test_universe_context_lines_are_never_a_comparison_word() -> None:
+    message = render_snapshot(_ok_snapshot(), universe_context=_full_context())
+    _assert_no_forbidden_language(message)
+
+
+def test_stale_row_states_its_age_plainly() -> None:
+    stale = _full_context(is_stale=True, age=dt.timedelta(hours=14))
+
+    message = render_snapshot(_ok_snapshot(), universe_context=stale)
+
+    assert "As of: 08:00 UTC (14h old)" in message
+
+
+def test_fresh_row_never_shows_an_age_suffix() -> None:
+    message = render_snapshot(_ok_snapshot(), universe_context=_full_context(is_stale=False))
+
+    assert "h old)" not in message
+
+
+def test_a_metric_with_no_cached_context_is_omitted_individually() -> None:
+    partial = CoinUniverseContext(
+        long_short_ratio=_full_context().long_short_ratio,
+        funding_rate=None,
+        oi_change_pct=None,
+        buy_sell_ratio=None,
+    )
+
+    message = render_snapshot(_ok_snapshot(), universe_context=partial)
+
+    assert message.count("Universe median:") == 1
+    assert "Open interest change (%):" not in message
+    assert "Buy/sell ratio:" not in message

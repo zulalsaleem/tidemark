@@ -183,3 +183,14 @@ def test_the_distributions_file_is_covered_by_the_boundary_scan() -> None:
     market_intel_dir = SRC_ROOT / "market_intel"
     for filename in ("distributions.py", "universe_read.py"):
         assert (market_intel_dir / filename).is_file()
+
+
+def test_the_coin_context_cache_files_are_covered_by_the_boundary_scan() -> None:
+    # Same purpose as the telegram-bot-files test above, for the "/coin
+    # universe context" files (Phase 2) specifically. Neither imports
+    # tidemark.data at all - the cache is market_intel's own table, like
+    # evaluation_store.py's - so they need no new allowlist entry, only
+    # confirmation the general scan actually covers them.
+    market_intel_dir = SRC_ROOT / "market_intel"
+    for filename in ("universe_context_store.py", "coin_universe_context.py"):
+        assert (market_intel_dir / filename).is_file()

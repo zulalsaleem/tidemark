@@ -79,6 +79,13 @@ from tidemark.market_intel.future_markets import FutureMarketsCache
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
+from tidemark.market_intel.universe_context_store import (
+    MetricSummaryFields,
+    UniverseContextRecord,
+    init_universe_context_store,
+    record_universe_context,
+)
+from tidemark.market_intel.universe_context_store import make_engine as make_universe_context_engine
 from tidemark.market_intel.universe_read import read_latest_selected_symbols
 from tidemark.notify.telegram import TelegramNotifier, build_heartbeat_message
 from tidemark.replay.render import render_report
@@ -1547,6 +1554,10 @@ def intel_bot(
     cache = FutureMarketsCache(coinalyze)
     state = BotStateStore(settings.telegram_bot_offset_file)
 
+    context_engine = make_universe_context_engine(settings.database_url)
+    init_universe_context_store(context_engine)
+    context_stale_after = dt.timedelta(hours=settings.universe_context_stale_after_hours)
+
     if once:
         try:
             outcome = run_once(
@@ -1559,6 +1570,8 @@ def intel_bot(
                 dt.datetime.now(dt.UTC),
                 discard_backlog=True,
                 poll_timeout=0,
+                context_engine=context_engine,
+                context_stale_after=context_stale_after,
             )
         except TelegramHttpError as exc:
             typer.echo(f"Telegram returned HTTP {exc.status_code}: {exc.detail}")
@@ -1579,7 +1592,14 @@ def intel_bot(
     typer.echo("Starting the /coin Telegram bot (long polling). Ctrl+C to stop.")
     try:
         run_forever(
-            telegram, coinalyze, cache, state, settings.telegram_allowed_chat_id, settings.venue
+            telegram,
+            coinalyze,
+            cache,
+            state,
+            settings.telegram_allowed_chat_id,
+            settings.venue,
+            context_engine=context_engine,
+            context_stale_after=context_stale_after,
         )
     except KeyboardInterrupt:
         typer.echo("Stopped.")
@@ -1867,6 +1887,85 @@ def intel_distributions(
         typer.echo(json_module.dumps(_distributions_to_dict(measurement), indent=2))
     else:
         _safe_echo(_render_distributions(measurement))
+
+
+def _metric_summary_to_fields(summary: MetricSummary) -> MetricSummaryFields:
+    return MetricSummaryFields(
+        n=summary.n,
+        min=summary.min,
+        p25=summary.p25,
+        median=summary.median,
+        p75=summary.p75,
+        max=summary.max,
+        unavailable_count=summary.unavailable_count,
+    )
+
+
+@intel_app.command("refresh-context")
+def intel_refresh_context() -> None:
+    """Run the same measurement as `intel distributions` over the latest
+    universe snapshot and cache its per-metric summary as one row in
+    `universe_context_cache`, for /coin to read without a live universe
+    scan. The only writer of that table - `intel distributions` stays
+    read-only and unchanged. See docs/adr/0011-market-intelligence-layer.md.
+    """
+    settings = get_settings()
+    try:
+        client = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    snapshot_id, ccxt_symbols = read_latest_selected_symbols(settings.database_url, settings.venue)
+    if not ccxt_symbols:
+        typer.echo(
+            f"No universe snapshot with selected symbols exists for venue={settings.venue!r}. "
+            "Run `tidemark universe snapshot` first."
+        )
+        raise typer.Exit(code=1)
+
+    cache = FutureMarketsCache(client)
+    now = dt.datetime.now(dt.UTC)
+
+    try:
+        measurement = measure_distributions(
+            client, cache, ccxt_symbols, settings.venue, now, "SNAPSHOT", snapshot_id
+        )
+    except UnsupportedVenueError as exc:
+        typer.echo(
+            f"No Coinalyze exchange-code mapping for venue {exc.venue!r}. "
+            "See docs/adr/0011-market-intelligence-layer.md."
+        )
+        raise typer.Exit(code=1) from None
+    except CoinalyzeHttpError as exc:
+        typer.echo(f"Coinalyze returned HTTP {exc.status_code}: {exc.detail}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeConnectionError as exc:
+        typer.echo(f"Could not reach Coinalyze: {exc.detail}")
+        raise typer.Exit(code=1) from None
+
+    context_engine = make_universe_context_engine(settings.database_url)
+    init_universe_context_store(context_engine)
+    metrics = {s.name: _metric_summary_to_fields(s) for s in measurement.summaries}
+    record_universe_context(
+        context_engine,
+        UniverseContextRecord(
+            computed_at=now,
+            universe_snapshot_id=snapshot_id,
+            period_start=measurement.period.start,
+            period_end=measurement.period.close,
+            metrics=metrics,
+        ),
+    )
+
+    typer.echo(
+        f"universe_snapshot_id={snapshot_id}  "
+        f"period={measurement.period.start.isoformat()} to {measurement.period.close.isoformat()}  "
+        f"computed_at={now.isoformat()}  "
+        f"elapsed={measurement.elapsed_seconds:.1f}s  "
+        f"skipped={len(measurement.skipped_symbols)}"
+    )
+    typer.echo("Wrote 1 row to universe_context_cache.")
 
 
 def main() -> None:
