@@ -194,3 +194,21 @@ def test_the_coin_context_cache_files_are_covered_by_the_boundary_scan() -> None
     market_intel_dir = SRC_ROOT / "market_intel"
     for filename in ("universe_context_store.py", "coin_universe_context.py"):
         assert (market_intel_dir / filename).is_file()
+
+
+def test_the_position_flow_files_are_covered_by_the_boundary_scan() -> None:
+    # Same purpose as the telegram-bot-files test above, for
+    # position-flow-v0.1's own files. Neither imports tidemark.data or
+    # derivatives_classifier.py at all - a second, independently
+    # versioned rulebook must never be coupled to the first one's
+    # classifier module, only to its own.
+    market_intel_dir = SRC_ROOT / "market_intel"
+    for filename in ("position_flow_classifier.py", "position_flow.py"):
+        path = market_intel_dir / filename
+        assert path.is_file()
+        names = _imported_module_names(path)
+        assert not any(
+            name == "tidemark.market_intel.derivatives_classifier"
+            or name.startswith("tidemark.market_intel.derivatives_classifier.")
+            for name in names
+        )
