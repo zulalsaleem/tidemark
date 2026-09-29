@@ -33,22 +33,25 @@ from tidemark.market_intel.errors import (
     UnsupportedVenueError,
 )
 from tidemark.market_intel.future_markets import FutureMarketsCache
+from tidemark.market_intel.position_flow import classify_snapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
 from tidemark.market_intel.telegram_render import render_snapshot
 
 logger = logging.getLogger(__name__)
 
-# A /coin lookup can hit up to 8 Coinalyze endpoints for one symbol
+# A /coin lookup can hit up to 7 Coinalyze endpoints for one symbol
 # (open interest, funding rate, predicted funding rate, open-interest
 # history, long/short ratio history, liquidation history, ohlcv
-# history - see service.py - plus one more open-interest-history call
-# for the universe-context OI percentage - see coin_universe_context.py).
-# Checked before dispatching so a single burst of /coin requests can't
-# blow the documented 40/minute budget; RateLimitedError from the client
-# itself (see client.py) is still caught as a fallback in case this
-# estimate undercounts.
-ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 8
+# history - see service.py). The universe-context comparison and the
+# position-flow classifier (coin_universe_context.py,
+# position_flow_classifier.py) both read fields already computed on
+# that same snapshot - no additional calls. Checked before dispatching
+# so a single burst of /coin requests can't blow the documented
+# 40/minute budget; RateLimitedError from the client itself (see
+# client.py) is still caught as a fallback in case this estimate
+# undercounts.
+ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 7
 
 # Default when a caller doesn't pass its own (e.g. `settings.
 # universe_context_stale_after_hours` from the CLI) - a row older than
@@ -142,10 +145,12 @@ def _handle_coin(
     universe_context = None
     if context_engine is not None:
         universe_context = gather_coin_universe_context(
-            coinalyze, context_engine, snapshot, now, context_stale_after
+            context_engine, snapshot, now, context_stale_after
         )
 
-    telegram.send_message(chat_id, render_snapshot(snapshot, universe_context))
+    position_flow = classify_snapshot(snapshot)
+
+    telegram.send_message(chat_id, render_snapshot(snapshot, universe_context, position_flow))
 
 
 def _handle_message(

@@ -42,6 +42,7 @@ _NO_LONG_SHORT_DATA = "not available for this market (has_long_short_ratio_data=
 _NO_OHLCV_DATA = "not available for this market (has_ohlcv_data=False)"
 _NO_BUY_SELL_DATA = "not available for this market (has_buy_sell_data=False)"
 _EMPTY_RESPONSE = "Coinalyze returned no data for this symbol"
+_ZERO_OPEN = "cannot compute a percentage change: the period's opening value was 0"
 
 
 def fetch_market_intel(
@@ -75,6 +76,7 @@ def fetch_market_intel(
         coinalyze_symbol, interval, from_ts, to_ts, convert_to_usd=True
     )
     open_interest_change = _oi_change_metric(oi_history, period)
+    open_interest_change_pct = _oi_change_pct_metric(oi_history, period)
 
     if info.has_long_short_ratio_data:
         ls_history = client.long_short_ratio_history(coinalyze_symbol, interval, from_ts, to_ts)
@@ -87,7 +89,7 @@ def fetch_market_intel(
     )
     liquidations = _liquidations_metric(liq_history, period)
 
-    futures_volume, buy_volume, sell_volume = _volume_metrics(
+    futures_volume, buy_volume, sell_volume, price_change = _volume_metrics(
         client, info, interval, from_ts, to_ts, period
     )
 
@@ -105,6 +107,8 @@ def fetch_market_intel(
         futures_volume=futures_volume,
         buy_volume=buy_volume,
         sell_volume=sell_volume,
+        price_change=price_change,
+        open_interest_change_pct=open_interest_change_pct,
     )
 
 
@@ -126,6 +130,8 @@ def _not_found_snapshot(
         futures_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
         buy_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
         sell_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
+        price_change=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "%", reason),
+        open_interest_change_pct=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "%", reason),
     )
 
 
@@ -164,6 +170,22 @@ def _oi_change_metric(history_response: list[dict], period) -> ClosedPeriodMetri
     )
 
 
+def _oi_change_pct_metric(history_response: list[dict], period) -> ClosedPeriodMetric:
+    """Same bucket `_oi_change_metric` already reads - just the
+    percentage instead of the absolute USD difference. No extra
+    Coinalyze call; see `position_flow_classifier.py`.
+    """
+    bucket = _find_bucket(history_response, int(period.start.timestamp()))
+    if bucket is None:
+        return ClosedPeriodMetric.unavailable(NO_DATA, "%", _EMPTY_RESPONSE)
+    if bucket["o"] == 0:
+        return ClosedPeriodMetric.unavailable(NO_DATA, "%", _ZERO_OPEN)
+    change_pct = (bucket["c"] - bucket["o"]) / bucket["o"] * 100
+    return ClosedPeriodMetric(
+        status=OK, value=change_pct, unit="%", period_start=period.start, period_close=period.close
+    )
+
+
 def _long_short_ratio_metric(history_response: list[dict], period) -> LongShortRatioMetric:
     bucket = _find_bucket(history_response, int(period.start.timestamp()))
     if bucket is None:
@@ -193,6 +215,19 @@ def _liquidations_metric(history_response: list[dict], period) -> LiquidationsMe
     )
 
 
+def _price_change_metric(bucket: dict, period) -> ClosedPeriodMetric:
+    """Same OHLCV bucket the volume metrics already read - just the
+    open/close percentage change instead of volume. No extra Coinalyze
+    call; see `position_flow_classifier.py`.
+    """
+    if bucket["o"] == 0:
+        return ClosedPeriodMetric.unavailable(NO_DATA, "%", _ZERO_OPEN)
+    change_pct = (bucket["c"] - bucket["o"]) / bucket["o"] * 100
+    return ClosedPeriodMetric(
+        status=OK, value=change_pct, unit="%", period_start=period.start, period_close=period.close
+    )
+
+
 def _volume_metrics(
     client: CoinalyzeClient,
     info: FutureMarketInfo,
@@ -200,18 +235,22 @@ def _volume_metrics(
     from_ts: int,
     to_ts: int,
     period,
-) -> tuple[ClosedPeriodMetric, ClosedPeriodMetric, ClosedPeriodMetric]:
+) -> tuple[ClosedPeriodMetric, ClosedPeriodMetric, ClosedPeriodMetric, ClosedPeriodMetric]:
     unit = _VOLUME_UNIT_LABELS.get(info.oi_lq_vol_denominated_in, info.oi_lq_vol_denominated_in)
 
     if not info.has_ohlcv_data:
         unavailable = ClosedPeriodMetric.unavailable(NO_DATA, unit, _NO_OHLCV_DATA)
-        return unavailable, unavailable, unavailable
+        price_change = ClosedPeriodMetric.unavailable(NO_DATA, "%", _NO_OHLCV_DATA)
+        return unavailable, unavailable, unavailable, price_change
 
     history_response = client.ohlcv_history(info.symbol, interval, from_ts, to_ts)
     bucket = _find_bucket(history_response, int(period.start.timestamp()))
     if bucket is None:
         unavailable = ClosedPeriodMetric.unavailable(NO_DATA, unit, _EMPTY_RESPONSE)
-        return unavailable, unavailable, unavailable
+        price_change = ClosedPeriodMetric.unavailable(NO_DATA, "%", _EMPTY_RESPONSE)
+        return unavailable, unavailable, unavailable, price_change
+
+    price_change = _price_change_metric(bucket, period)
 
     futures_volume = ClosedPeriodMetric(
         status=OK,
@@ -223,7 +262,7 @@ def _volume_metrics(
 
     if not info.has_buy_sell_data:
         no_split = ClosedPeriodMetric.unavailable(NO_DATA, unit, _NO_BUY_SELL_DATA)
-        return futures_volume, no_split, no_split
+        return futures_volume, no_split, no_split, price_change
 
     buy_volume = ClosedPeriodMetric(
         status=OK,
@@ -239,4 +278,4 @@ def _volume_metrics(
         period_start=period.start,
         period_close=period.close,
     )
-    return futures_volume, buy_volume, sell_volume
+    return futures_volume, buy_volume, sell_volume, price_change

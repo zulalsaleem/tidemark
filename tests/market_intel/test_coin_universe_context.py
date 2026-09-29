@@ -2,9 +2,9 @@
 the cached universe median/p75 - `None` entirely when the cache has
 never been refreshed, and `None` per-metric when this symbol has no
 current value for that one metric, even though the cache itself has
-data. OI is fetched independently as a percentage (not reused from
-`MarketIntelSnapshot.open_interest_change`, which is an absolute USD
-value) - see the module's own docstring for why.
+data. Every "current" value now comes straight off the existing
+`MarketIntelSnapshot` (including OI as a percentage, via
+`open_interest_change_pct`) - no Coinalyze client, no extra fetch.
 """
 
 from __future__ import annotations
@@ -55,7 +55,6 @@ def _history(**fields) -> list[dict]:
 class _FakeClient:
     def __init__(self, future_markets_rows) -> None:
         self._rows = future_markets_rows
-        self.open_interest_history_calls = 0
 
     def future_markets(self):
         return self._rows
@@ -80,7 +79,6 @@ class _FakeClient:
         ]
 
     def open_interest_history(self, symbol, interval, from_ts, to_ts, convert_to_usd=True):
-        self.open_interest_history_calls += 1
         return _history(o=1000.0, h=1010.0, l=995.0, c=1010.0)  # +1.0%
 
     def long_short_ratio_history(self, symbol, interval, from_ts, to_ts):
@@ -90,7 +88,7 @@ class _FakeClient:
         return _history(l=495_606.6, s=158_077.0)
 
     def ohlcv_history(self, symbol, interval, from_ts, to_ts):
-        return _history(v=597_404.22, bv=250_123.4)  # sell = 347,280.82
+        return _history(o=100.0, h=101.0, l=99.0, c=100.394, v=597_404.22, bv=250_123.4)
 
 
 def _snapshot(client):
@@ -128,20 +126,18 @@ STALE_AFTER = dt.timedelta(hours=12)
 def test_no_cached_row_returns_none_entirely(tmp_path) -> None:
     engine = make_engine(f"sqlite:///{(tmp_path / 'tidemark.db').as_posix()}")
     init_universe_context_store(engine)
-    client = _FakeClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row()]))
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result is None
 
 
 def test_cached_row_pairs_every_metrics_current_value_with_median_and_p75(tmp_path) -> None:
     engine = _seed_cache(tmp_path)
-    client = _FakeClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row()]))
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result is not None
     assert result.long_short_ratio.current == 1.207
@@ -159,19 +155,20 @@ def test_cached_row_pairs_every_metrics_current_value_with_median_and_p75(tmp_pa
         assert metric.computed_at == CACHED_AT
 
 
-def test_oi_percentage_is_computed_independently_not_reused_from_the_snapshot(tmp_path) -> None:
+def test_oi_percentage_comes_from_the_snapshots_own_field(tmp_path) -> None:
     """The snapshot's own open_interest_change is an absolute USD value;
-    the universe-context OI figure must be the percentage, fetched fresh.
+    the universe-context OI figure must be open_interest_change_pct
+    instead - both derived from the same already-fetched bucket, no
+    extra Coinalyze call.
     """
     engine = _seed_cache(tmp_path)
-    client = _FakeClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row()]))
     assert snapshot.open_interest_change.unit == "USD"  # the pre-existing, unchanged metric
+    assert snapshot.open_interest_change_pct.value == 1.0
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result.oi_change_pct.current == 1.0
-    assert client.open_interest_history_calls == 2  # once for USD, once for the percentage
 
 
 def test_stale_row_is_flagged(tmp_path) -> None:
@@ -188,10 +185,9 @@ def test_stale_row_is_flagged(tmp_path) -> None:
             metrics={name: _summary() for name in METRIC_NAMES},
         ),
     )
-    client = _FakeClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row()]))
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result.long_short_ratio.is_stale is True
     assert result.long_short_ratio.age == NOW - old
@@ -199,10 +195,9 @@ def test_stale_row_is_flagged(tmp_path) -> None:
 
 def test_a_metric_missing_its_current_value_is_none_even_with_cache_data(tmp_path) -> None:
     engine = _seed_cache(tmp_path)
-    client = _FakeClient([_market_row(has_long_short_ratio_data=False)])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row(has_long_short_ratio_data=False)]))
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert snapshot.long_short_ratio.status == NO_DATA
     assert result.long_short_ratio is None  # no current value to pair with a real median/p75
@@ -216,25 +211,24 @@ def test_a_metric_with_no_summary_in_the_cache_is_none(tmp_path) -> None:
             n=0, min=None, p25=None, median=None, p75=None, max=None, unavailable_count=30
         ),
     )
-    client = _FakeClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([_market_row()]))
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result.funding_rate is None  # cache had no data for this metric that hour
     assert result.long_short_ratio is not None  # unaffected
 
 
-def test_market_not_found_symbol_skips_the_extra_oi_fetch(tmp_path) -> None:
+def test_market_not_found_symbol_has_no_current_values(tmp_path) -> None:
     engine = _seed_cache(tmp_path)
-    client = _FakeClient([])  # nothing listed
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_FakeClient([]))  # nothing listed
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
-    assert client.open_interest_history_calls == 0
     assert result.long_short_ratio is None
     assert result.oi_change_pct is None
+    assert result.funding_rate is None
+    assert result.buy_sell_ratio is None
 
 
 def test_zero_sell_volume_makes_buy_sell_ratio_unavailable_not_a_division_error(tmp_path) -> None:
@@ -242,12 +236,11 @@ def test_zero_sell_volume_makes_buy_sell_ratio_unavailable_not_a_division_error(
 
     class _ZeroSellClient(_FakeClient):
         def ohlcv_history(self, symbol, interval, from_ts, to_ts):
-            return _history(v=100.0, bv=100.0)  # sell = 0
+            return _history(o=100.0, h=101.0, l=99.0, c=100.0, v=100.0, bv=100.0)  # sell = 0
 
-    client = _ZeroSellClient([_market_row()])
-    snapshot = _snapshot(client)
+    snapshot = _snapshot(_ZeroSellClient([_market_row()]))
     assert snapshot.sell_volume.value == 0.0
 
-    result = gather_coin_universe_context(client, engine, snapshot, NOW, STALE_AFTER)
+    result = gather_coin_universe_context(engine, snapshot, NOW, STALE_AFTER)
 
     assert result.buy_sell_ratio is None

@@ -677,6 +677,38 @@ timer above: it runs once and exits, and a missed run is caught up on
 rather than silently skipped. The `:15` offset just avoids the top of
 the hour if other scheduled jobs also land there — not a requirement.
 
+### Position flow: /coin's own classification
+
+`/coin` classifies price and open interest moving together over one
+closed 1H window into one of nine mechanical states — `LONG_BUILDUP`,
+`SHORT_COVERING`, `QUIET`, and so on — against its own, independently
+versioned rulebook,
+[docs/rulebook/position-flow-v0.1.md](docs/rulebook/position-flow-v0.1.md).
+This is entirely separate from
+[derivatives-context-v0.1.md](docs/rulebook/derivatives-context-v0.1.md)
+(the hourly BTC briefing's own classifier) — different document,
+different classifier module, neither reads or depends on the other, and
+works for any Binance USDT-M perpetual, not only BTC. No extra
+Coinalyze calls: both inputs (price change, OI change — both as
+percentages over the closed 1H window) are derived from OHLCV/
+open-interest-history buckets `/coin` already fetches for its other
+lines.
+
+Every `/coin` reply now has three layers:
+
+- **FACTS** — every existing raw metric, unchanged.
+- **POSITION FLOW** — the classified state (or `NO_MATCH` with a reason,
+  if price or OI change is unavailable), the price/OI inputs that
+  produced it, and the rulebook version.
+- **SUPPORTING CONTEXT** — funding, long/short ratio, buy/sell flow, and
+  liquidations stated as plain directional facts (`POSITIVE`,
+  `LONG-BIASED`, `BUYING > SELLING`, `SHORT > LONG`) — never a label
+  like `BULLISH`/`CROWDED`/`STRONG`, which no rulebook here defines.
+  These are NOT inputs to the classification — position-flow-v0.1 reads
+  only price and open interest.
+
+Still not a trade signal: no entries, stops, targets, or R:R, ever.
+
 ## Project status
 
 **Phase 1 + 2 + 3 + 4B — data layer, Section 1 HTF context engine, the
