@@ -764,3 +764,129 @@ def test_no_context_engine_at_all_behaves_exactly_as_before(tmp_path) -> None:
     assert len(telegram.sent) == 1
     _, text = telegram.sent[0]
     assert "Universe median" not in text
+
+
+# -- Addition B: position flow through the real bot dispatch path -------------
+
+
+def test_coin_reply_through_the_real_bot_path_shows_position_flow(tmp_path) -> None:
+    """The exact gap Addition B calls out: a renderer-only test would not
+    catch a wiring break between run_once -> _handle_message ->
+    _handle_coin -> classify_snapshot -> render_snapshot. This goes
+    through the real dispatch path instead.
+    """
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()  # o=1.0, c=1.0 on both OI and OHLCV -> FLAT/FLAT -> QUIET
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    assert "POSITION FLOW" in text
+    assert "Position flow: QUIET" in text
+    assert "Price change:" in text
+    assert "OI change:" in text
+    assert "Rulebook: position-flow-v0.1" in text
+    assert "SUPPORTING CONTEXT" in text
+    assert "Funding: POSITIVE" in text  # 0.001 > 0
+
+
+def test_coin_reply_position_flow_works_for_any_symbol_not_only_btc(tmp_path) -> None:
+    """/coin (and therefore position flow) must work for any supported
+    Binance perpetual, never only BTC or only the research universe."""
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin MEME")])
+    coinalyze = _FakeCoinalyze(future_markets_rows=[_market_row(symbol="MEMEUSDT_PERP.A")])
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    assert "MEME/USDT:USDT" in text
+    assert "POSITION FLOW" in text
+
+
+def test_coin_reply_no_match_when_market_not_found(tmp_path) -> None:
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin NOPE")])
+    coinalyze = _FakeCoinalyze(future_markets_rows=[])  # nothing listed
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    assert len(telegram.sent) == 1
+    _, text = telegram.sent[0]
+    # MARKET_NOT_FOUND short-circuits to a single clean line - no
+    # position-flow section at all, since render_snapshot returns early.
+    assert "MARKET_NOT_FOUND" in text
+    assert "POSITION FLOW" not in text
+
+
+def test_coin_reply_output_has_no_forbidden_trading_language(tmp_path) -> None:
+    telegram = _FakeTelegram([_message_update(1, ALLOWED_CHAT_ID, "/coin SOL")])
+    coinalyze = _FakeCoinalyze()
+    state = BotStateStore(tmp_path / "offset.json")
+
+    run_once(
+        telegram,
+        coinalyze,
+        _cache(coinalyze),
+        state,
+        ALLOWED_CHAT_ID,
+        VENUE,
+        NOW,
+        discard_backlog=False,
+    )
+
+    _, text = telegram.sent[0]
+    lowered = f" {text.lower()} "
+    for word in (
+        "buy now",
+        "sell now",
+        "long now",
+        "short now",
+        "enter",
+        "avoid",
+        "entry",
+        "stop",
+        " sl ",
+        " tp ",
+        "target",
+        "r:r",
+        "elevated",
+        "crowded",
+        " high ",
+        " low ",
+        "bullish",
+        "bearish",
+        "strong",
+        "weak",
+    ):
+        assert word not in lowered, f"unexpected {word!r} in bot-path output"

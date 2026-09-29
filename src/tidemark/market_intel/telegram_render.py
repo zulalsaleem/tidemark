@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 from tidemark.market_intel.coin_universe_context import CoinUniverseContext, MetricContext
 from tidemark.market_intel.models import MARKET_NOT_FOUND, OK, MarketIntelSnapshot
+from tidemark.market_intel.position_flow_classifier import PositionFlowResult
 
 FOOTER = "Data: Coinalyze (Binance USDT-M perpetuals). Market info only — not a trade signal."
 
@@ -175,22 +176,111 @@ def _fmt_universe_context_lines(
     )
 
 
+def _fmt_position_flow_input_line(name: str, inp, reference: dt.datetime) -> str:
+    """Price change / OI change for Layer 2 - an explicit `+`/`-` sign
+    always shown (`+0.300%`, `-0.300%`), unlike `_fmt_pct`'s Layer 1
+    lines - matching the rulebook's own worked examples exactly.
+    """
+    if inp.status != OK:
+        return f"{name}: UNAVAILABLE ({inp.status}: {inp.reason})"
+    return (
+        f"{name}: {inp.change_pct:+.3f}% "
+        f"(period {_fmt_range(inp.period_start, inp.period_close, reference)})"
+    )
+
+
+def _fmt_bias_line(
+    name: str, current: float, threshold: float, labels: tuple[str, str, str]
+) -> str:
+    """`labels` is (above, below, equal) - used for both long/short ratio
+    (vs. 1.0) and buy/sell or liquidation comparisons (vs. 0, i.e.
+    `current` already the difference of the two raw values).
+    """
+    above, below, equal = labels
+    if current > threshold:
+        return f"{name}: {above}"
+    if current < threshold:
+        return f"{name}: {below}"
+    return f"{name}: {equal}"
+
+
+def _fmt_supporting_context(snapshot: MarketIntelSnapshot) -> list[str]:
+    """Layer 3: funding, long/short ratio, buy/sell flow, and
+    liquidations stated as directional facts only - a sign or a
+    greater-than/less-than/equal comparison, never a label like
+    BULLISH/BEARISH/CROWDED/STRONG/WEAK, which no rulebook here defines.
+    """
+    lines = []
+
+    funding = snapshot.funding_rate
+    if funding.status != OK:
+        lines.append("Funding: UNAVAILABLE")
+    else:
+        lines.append(
+            _fmt_bias_line("Funding", funding.value, 0.0, ("POSITIVE", "NEGATIVE", "ZERO"))
+        )
+
+    ls = snapshot.long_short_ratio
+    if ls.status != OK:
+        lines.append("Long/short: UNAVAILABLE")
+    else:
+        lines.append(
+            _fmt_bias_line("Long/short", ls.ratio, 1.0, ("LONG-BIASED", "SHORT-BIASED", "EVEN"))
+        )
+
+    buy, sell = snapshot.buy_volume, snapshot.sell_volume
+    if buy.status != OK or sell.status != OK:
+        lines.append("Buy/sell flow: UNAVAILABLE")
+    else:
+        lines.append(
+            _fmt_bias_line(
+                "Buy/sell flow",
+                buy.value - sell.value,
+                0.0,
+                ("BUYING > SELLING", "SELLING > BUYING", "BUYING = SELLING"),
+            )
+        )
+
+    liq = snapshot.liquidations
+    if liq.status != OK:
+        lines.append("Liquidations: UNAVAILABLE")
+    else:
+        lines.append(
+            _fmt_bias_line(
+                "Liquidations",
+                liq.short_usd - liq.long_usd,
+                0.0,
+                ("SHORT > LONG", "LONG > SHORT", "LONG = SHORT"),
+            )
+        )
+
+    return lines
+
+
 def render_snapshot(
     snapshot: MarketIntelSnapshot,
     universe_context: CoinUniverseContext | None = None,
+    position_flow: PositionFlowResult | None = None,
 ) -> str:
-    """Everything `/coin` replies with for one symbol.
+    """Everything `/coin` replies with for one symbol, in three layers.
 
-    Grouped OI, then funding, then positioning, then liquidations and
-    volume, one blank line between groups - otherwise every label and
-    the live-vs-closed-period distinction are exactly Merge 1's.
+    Layer 1 (FACTS): grouped OI, then funding, then positioning, then
+    liquidations and volume, one blank line between groups - unchanged
+    from Merge 1/Phase 2. `universe_context`, when given, adds a
+    "Universe median"/"Universe p75"/"As of" block beneath each of the
+    four metrics the cache covers - strictly numbers, no comparison word
+    of any kind. `None` (the default) renders exactly as before Phase 2.
 
-    `universe_context`, when given, adds a "Universe median"/"Universe
-    p75"/"As of" block beneath each of the four metrics the cache
-    covers - strictly numbers, no comparison word of any kind. `None`
-    (the default) renders exactly as before Phase 2, with no universe
-    lines at all - a missing/never-refreshed cache must never change
-    what /coin's existing output looks like.
+    Layer 2 (POSITION FLOW): `position_flow`'s nine-state result (or
+    NO_MATCH) from docs/rulebook/position-flow-v0.1.md, and the price/OI
+    inputs that produced it. `None` (the default) omits this section
+    entirely - existing callers/tests render exactly as before.
+
+    Layer 3 (SUPPORTING CONTEXT): funding/long-short/buy-sell/
+    liquidations as plain directional facts (sign or greater-than/less-
+    than/equal) - never a label like BULLISH/BEARISH/CROWDED. Shown
+    only alongside Layer 2, since it exists to accompany the
+    classification, not to duplicate Layer 1's own lines.
     """
     if snapshot.market_status == MARKET_NOT_FOUND:
         return (
@@ -256,7 +346,24 @@ def render_snapshot(
         + bs_line
     )
 
-    body = "\n\n".join([oi_group, funding_group, positioning_group, liquidations_and_volume_group])
+    groups = [oi_group, funding_group, positioning_group, liquidations_and_volume_group]
+
+    if position_flow is not None:
+        pf = position_flow
+        flow_lines = ["POSITION FLOW", ""]
+        if pf.result == "NO_MATCH":
+            flow_lines.append(f"Position flow: NO_MATCH ({pf.reason})")
+        else:
+            flow_lines.append(f"Position flow: {pf.result}")
+        flow_lines.append(_fmt_position_flow_input_line("Price change", pf.price, reference))
+        flow_lines.append(_fmt_position_flow_input_line("OI change", pf.open_interest, reference))
+        flow_lines.append(f"Rulebook: {pf.rulebook_version}")
+        groups.append("\n".join(flow_lines))
+
+        context_lines = ["SUPPORTING CONTEXT", ""] + _fmt_supporting_context(snapshot)
+        groups.append("\n".join(context_lines))
+
+    body = "\n\n".join(groups)
     return f"{snapshot.symbol} ({snapshot.coinalyze_symbol})\n\n{body}\n\n{FOOTER}"
 
 
