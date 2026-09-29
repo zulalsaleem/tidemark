@@ -2,26 +2,21 @@
 the cached universe median/p75 - the data-gathering half; formatting
 lives in `telegram_render.py`, exactly like every other `/coin` value.
 
-Deliberately independent from `service.py`'s `MarketIntelSnapshot` for
-OI: `open_interest_change` there is an absolute USD difference, while
-`intel distributions`/the cache measure OI as a 1H percentage change -
-different quantities, not just different formatting (see
-docs/adr/0011-market-intelligence-layer.md). Pairing a USD "current"
-value with a percentage median/p75 would silently invite exactly the
-kind of misreading the "numbers only, no comparison words" design is
-trying to avoid a different way, so this module fetches its own
-OI-history bucket and computes the percentage directly - one extra
-Coinalyze call per `/coin` lookup (see `bot.py`'s
-`ESTIMATED_CALL_COST_PER_COIN_LOOKUP`), not the ~120-call universe scan
-`intel distributions` itself costs.
-
-Long/short ratio and buy/sell ratio need no extra fetch: both are
-already on the snapshot `fetch_market_intel` already built for `/coin`'s
-own existing lines (buy/sell ratio is computed here from the two volume
-values already there). Funding rate reuses the snapshot's existing LIVE
-`funding_rate` value, not a second closed-period fetch, unlike the
-hourly BTC briefing's classifier - a deliberate, documented tradeoff:
-see the ADR for why a live-vs-closed-period pairing is acceptable here.
+All four "current" values now come straight off the existing
+`MarketIntelSnapshot` - zero extra Coinalyze calls. OI change is
+`snapshot.open_interest_change_pct` (added alongside `price_change` for
+`position_flow_classifier.py` - see docs/adr/0011-market-intelligence-
+layer.md): before that field existed, this module fetched its own
+OI-history bucket independently, since `open_interest_change` is an
+absolute USD difference, a different quantity from the percentage the
+cache measures. That extra fetch is gone now that the percentage is
+computed once, in `service.py`, from a bucket already fetched there.
+Long/short ratio and buy/sell ratio (computed here from the two volume
+values already on the snapshot) needed no extra fetch either way.
+Funding rate reuses the snapshot's existing LIVE `funding_rate` value,
+not a second closed-period fetch, unlike the hourly BTC briefing's
+classifier - a deliberate, documented tradeoff: see the ADR for why a
+live-vs-closed-period pairing is acceptable here.
 """
 
 from __future__ import annotations
@@ -29,15 +24,11 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 
-from tidemark.market_intel.clamping import closed_period
-from tidemark.market_intel.client import CoinalyzeClient
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.universe_context_store import (
     UniverseContextCache,
     latest_universe_context,
 )
-
-INTERVAL = "1hour"
 
 
 @dataclass(frozen=True)
@@ -58,27 +49,6 @@ class CoinUniverseContext:
     buy_sell_ratio: MetricContext | None
 
 
-def _find_bucket(history_response: list[dict], period_start_epoch: int) -> dict | None:
-    if not history_response:
-        return None
-    for bucket in history_response[0].get("history", []):
-        if bucket["t"] == period_start_epoch:
-            return bucket
-    return None
-
-
-def _fetch_oi_change_pct(
-    client: CoinalyzeClient, coinalyze_symbol: str, from_ts: int, to_ts: int
-) -> float | None:
-    history = client.open_interest_history(
-        coinalyze_symbol, INTERVAL, from_ts, to_ts, convert_to_usd=True
-    )
-    bucket = _find_bucket(history, from_ts)
-    if bucket is None or bucket["o"] == 0:
-        return None
-    return (bucket["c"] - bucket["o"]) / bucket["o"] * 100
-
-
 def _metric_context(
     current: float | None,
     median: float | None,
@@ -95,7 +65,6 @@ def _metric_context(
 
 
 def gather_coin_universe_context(
-    client: CoinalyzeClient,
     context_engine,
     snapshot: MarketIntelSnapshot,
     now: dt.datetime,
@@ -116,13 +85,11 @@ def gather_coin_universe_context(
 
     ls_current = snapshot.long_short_ratio.ratio if snapshot.long_short_ratio.status == OK else None
     funding_current = snapshot.funding_rate.value if snapshot.funding_rate.status == OK else None
-
-    oi_current = None
-    if snapshot.market_status == OK:
-        period = closed_period(now, INTERVAL)
-        from_ts = int(period.start.timestamp())
-        to_ts = int(period.close.timestamp()) - 1
-        oi_current = _fetch_oi_change_pct(client, snapshot.coinalyze_symbol, from_ts, to_ts)
+    oi_current = (
+        snapshot.open_interest_change_pct.value
+        if snapshot.open_interest_change_pct.status == OK
+        else None
+    )
 
     bs_current = None
     if (

@@ -130,6 +130,14 @@ class MarketIntelSnapshot:
     `market_status` is `MARKET_NOT_FOUND`, every metric field carries
     that same status and a reason, and no network call beyond
     `/future-markets` was made.
+
+    `price_change`/`open_interest_change_pct` are derived from buckets
+    `service.py` already fetches for other fields (the OHLCV bucket's
+    `o`/`c`, and the OI-history bucket's `o`/`c`) - no extra Coinalyze
+    call. They exist to feed `position_flow_classifier.py`
+    (docs/rulebook/position-flow-v0.1.md), a second, independently
+    versioned rulebook from derivatives-context-v0.1 - see
+    docs/adr/0011-market-intelligence-layer.md.
     """
 
     symbol: str
@@ -145,3 +153,5 @@ class MarketIntelSnapshot:
     futures_volume: ClosedPeriodMetric
     buy_volume: ClosedPeriodMetric
     sell_volume: ClosedPeriodMetric
+    price_change: ClosedPeriodMetric
+    open_interest_change_pct: ClosedPeriodMetric

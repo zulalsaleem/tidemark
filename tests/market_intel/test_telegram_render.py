@@ -25,6 +25,11 @@ from tidemark.market_intel.models import (
     MarketIntelSnapshot,
     PointInTimeMetric,
 )
+from tidemark.market_intel.position_flow_classifier import (
+    OpenInterestInput,
+    PositionFlowResult,
+    PriceInput,
+)
 from tidemark.market_intel.telegram_render import (
     FOOTER,
     _fmt_instant,
@@ -42,6 +47,7 @@ PERIOD_CLOSE = dt.datetime(2026, 9, 27, 19, 0, tzinfo=dt.UTC)
 
 _FORBIDDEN = [
     "entry",
+    "enter",
     "stop",
     " sl ",
     " tp ",
@@ -50,10 +56,12 @@ _FORBIDDEN = [
     "long setup",
     "short setup",
     "setup",
+    "long now",
+    "short now",
     "elevated",
     "crowded",
-    "high",
-    "low",
+    " high ",
+    " low ",
     "above",
     "below",
     "bullish",
@@ -71,9 +79,12 @@ def _assert_no_forbidden_language(message: str) -> None:
 
     # "buy"/"sell" are allowed ONLY inside the raw data field labels this
     # project's spec requires ("Buy volume"/"Sell volume"/"Buy/sell
-    # ratio") - verified precisely instead of banning the substring
-    # outright, which would make it impossible to ever render them at all.
-    without_allowed_labels = re.sub(r"buy volume|sell volume|buy/sell ratio", "", lowered)
+    # ratio"/"Buy/sell flow"/"BUYING > SELLING"-style directional facts)
+    # - verified precisely instead of banning the substring outright,
+    # which would make it impossible to ever render them at all.
+    without_allowed_labels = re.sub(
+        r"buy volume|sell volume|buy/sell ratio|buy/sell flow|buying|selling", "", lowered
+    )
     assert "buy" not in without_allowed_labels
     assert "sell" not in without_allowed_labels
 
@@ -202,6 +213,20 @@ def _ok_snapshot(**metric_overrides) -> MarketIntelSnapshot:
             period_start=PERIOD_START,
             period_close=PERIOD_CLOSE,
         ),
+        price_change=ClosedPeriodMetric(
+            status=OK,
+            value=0.394,
+            unit="%",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        open_interest_change_pct=ClosedPeriodMetric(
+            status=OK,
+            value=-0.468,
+            unit="%",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
     )
     defaults.update(metric_overrides)
     return MarketIntelSnapshot(**defaults)
@@ -223,6 +248,8 @@ def _not_found_snapshot(ccxt_symbol: str, coinalyze_symbol: str) -> MarketIntelS
         futures_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
         buy_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
         sell_volume=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "-", reason),
+        price_change=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "%", reason),
+        open_interest_change_pct=ClosedPeriodMetric.unavailable(MARKET_NOT_FOUND, "%", reason),
     )
 
 
@@ -470,3 +497,171 @@ def test_a_metric_with_no_cached_context_is_omitted_individually() -> None:
     assert message.count("Universe median:") == 1
     assert "Open interest change (%):" not in message
     assert "Buy/sell ratio:" not in message
+
+
+# -- position flow (Layer 2) and supporting context (Layer 3) -----------------
+
+
+def _pf(price_pct: float, oi_pct: float, result: str) -> PositionFlowResult:
+    price = PriceInput(OK, price_pct, PERIOD_START, PERIOD_CLOSE)
+    oi = OpenInterestInput(OK, oi_pct, PERIOD_START, PERIOD_CLOSE)
+    return PositionFlowResult(result, None, price, oi)
+
+
+def _pf_no_match(reason: str) -> PositionFlowResult:
+    price = PriceInput(NO_DATA, None, None, None, reason)
+    oi = OpenInterestInput(NO_DATA, None, None, None, reason)
+    return PositionFlowResult("NO_MATCH", reason, price, oi)
+
+
+def test_no_position_flow_omits_layers_2_and_3_entirely() -> None:
+    with_none = render_snapshot(_ok_snapshot(), position_flow=None)
+    without_arg = render_snapshot(_ok_snapshot())
+
+    assert with_none == without_arg
+    assert "POSITION FLOW" not in with_none
+    assert "SUPPORTING CONTEXT" not in with_none
+
+
+def test_position_flow_shows_result_price_oi_and_rulebook() -> None:
+    pf = _pf(0.30, 0.30, "LONG_BUILDUP")
+
+    message = render_snapshot(_ok_snapshot(), position_flow=pf)
+
+    assert "POSITION FLOW" in message
+    assert "Position flow: LONG_BUILDUP" in message
+    assert "Price change: +0.300% (period 18:00–19:00 UTC)" in message
+    assert "OI change: +0.300% (period 18:00–19:00 UTC)" in message
+    assert "Rulebook: position-flow-v0.1" in message
+
+
+def test_position_flow_no_match_shows_the_reason() -> None:
+    pf = _pf_no_match("missing/unavailable input(s): price")
+
+    message = render_snapshot(_ok_snapshot(), position_flow=pf)
+
+    assert "Position flow: NO_MATCH (missing/unavailable input(s): price)" in message
+
+
+def test_layer_1_is_unchanged_when_position_flow_is_added() -> None:
+    """Adding Layers 2/3 must never alter Layer 1's own lines - everything
+    before the footer in the no-position-flow render is an exact prefix
+    of the with-position-flow render (new layers are appended before the
+    footer moves further down, never rewriting what was already there).
+    """
+    without_pf = render_snapshot(_ok_snapshot())
+    with_pf = render_snapshot(_ok_snapshot(), position_flow=_pf(0.30, 0.30, "LONG_BUILDUP"))
+
+    layer1_body = without_pf[: -(len(FOOTER) + 2)]  # strip the trailing "\n\n" + FOOTER
+    assert with_pf.startswith(layer1_body)
+
+
+def test_supporting_context_shows_directional_facts() -> None:
+    snapshot = _ok_snapshot(
+        funding_rate=PointInTimeMetric(status=OK, value=0.01, unit="%", updated_at=TODAY),
+        long_short_ratio=LongShortRatioMetric(
+            status=OK,
+            ratio=1.5,
+            long_pct=60.0,
+            short_pct=40.0,
+            percent_unit="%",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        buy_volume=ClosedPeriodMetric(
+            status=OK,
+            value=600.0,
+            unit="base asset units",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        sell_volume=ClosedPeriodMetric(
+            status=OK,
+            value=400.0,
+            unit="base asset units",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        liquidations=LiquidationsMetric(
+            status=OK,
+            long_usd=100.0,
+            short_usd=900.0,
+            unit="USD",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+    )
+
+    message = render_snapshot(snapshot, position_flow=_pf(0.30, 0.30, "LONG_BUILDUP"))
+
+    assert "SUPPORTING CONTEXT" in message
+    assert "Funding: POSITIVE" in message
+    assert "Long/short: LONG-BIASED" in message
+    assert "Buy/sell flow: BUYING > SELLING" in message
+    assert "Liquidations: SHORT > LONG" in message
+
+
+def test_supporting_context_negative_and_reversed_facts() -> None:
+    snapshot = _ok_snapshot(
+        funding_rate=PointInTimeMetric(status=OK, value=-0.01, unit="%", updated_at=TODAY),
+        long_short_ratio=LongShortRatioMetric(
+            status=OK,
+            ratio=0.5,
+            long_pct=33.0,
+            short_pct=67.0,
+            percent_unit="%",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        buy_volume=ClosedPeriodMetric(
+            status=OK,
+            value=100.0,
+            unit="base asset units",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        sell_volume=ClosedPeriodMetric(
+            status=OK,
+            value=900.0,
+            unit="base asset units",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+        liquidations=LiquidationsMetric(
+            status=OK,
+            long_usd=900.0,
+            short_usd=100.0,
+            unit="USD",
+            period_start=PERIOD_START,
+            period_close=PERIOD_CLOSE,
+        ),
+    )
+
+    message = render_snapshot(snapshot, position_flow=_pf(-0.30, 0.30, "SHORT_BUILDUP"))
+
+    assert "Funding: NEGATIVE" in message
+    assert "Long/short: SHORT-BIASED" in message
+    assert "Buy/sell flow: SELLING > BUYING" in message
+    assert "Liquidations: LONG > SHORT" in message
+
+
+def test_supporting_context_unavailable_metrics_say_so() -> None:
+    snapshot = _ok_snapshot(
+        funding_rate=PointInTimeMetric.unavailable(NO_DATA, "%", "no data"),
+        long_short_ratio=LongShortRatioMetric.unavailable(NO_DATA, "no data"),
+    )
+
+    message = render_snapshot(snapshot, position_flow=_pf(0.30, 0.30, "LONG_BUILDUP"))
+
+    assert "Funding: UNAVAILABLE" in message
+    assert "Long/short: UNAVAILABLE" in message
+
+
+def test_position_flow_and_context_contain_no_forbidden_language() -> None:
+    message = render_snapshot(_ok_snapshot(), position_flow=_pf(0.30, 0.30, "LONG_BUILDUP"))
+    _assert_no_forbidden_language(message)
+
+    no_match_message = render_snapshot(
+        _ok_snapshot(), position_flow=_pf_no_match("missing/unavailable input(s): price")
+    )
+    _assert_no_forbidden_language(no_match_message)
