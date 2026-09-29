@@ -728,3 +728,132 @@ computed from zero symbols when the truth is "this symbol has none."
   none - `intel distributions`/`refresh-context`/`/coin`'s new lines
   measure and display only; choosing what counts as "elevated" for any
   of these four metrics remains a future, separate rulebook decision.
+
+## Addendum: position-flow-v0.1 and universal /coin interpretation
+
+`/coin` gains its first real classification - not a fourth measurement
+tool like `intel distributions`, but a genuine rulebook interpretation
+of price and open interest moving together over one closed 1H window,
+for any Binance USDT-M perpetual. This is Option A: a second,
+independently versioned rulebook (`docs/rulebook/position-flow-v0.1.md`)
+and a second, independent classifier (`position_flow_classifier.py`),
+entirely separate from `derivatives-context-v0.1.md` and the hourly BTC
+briefing's classifier - neither reads, imports, or depends on the other,
+enforced the same way the rest of this ADR enforces separation: a
+static import-boundary test
+(`test_the_position_flow_files_are_covered_by_the_boundary_scan`)
+confirms `position_flow_classifier.py`/`position_flow.py` never import
+`derivatives_classifier.py`.
+
+**Addition A's finding, before anything was built:** both classifier
+inputs were already reachable from data `/coin` fetches for other
+reasons, at zero extra Coinalyze cost.
+`service.py`'s existing OHLCV fetch (for "Futures volume"/"Buy
+volume"/"Sell volume") already carries the bucket's open/close, so price
+change is `(c-o)/o*100` from a bucket already in hand. The existing
+OI-history fetch (for the absolute-USD "Open interest change" line)
+carries the same open/close shape, so OI change as a percentage is the
+same computation on a bucket already in hand too. Both are now fields on
+`MarketIntelSnapshot` itself (`price_change`, `open_interest_change_pct`)
+rather than living only inside the classifier's own input-gathering, so
+any future consumer of a snapshot gets them for free. A useful side
+effect: `coin_universe_context.py`'s OI-percentage comparison (added in
+the previous addendum at a cost of one extra call, specifically because
+`open_interest_change` was USD, not a percentage) now reads
+`open_interest_change_pct` off the snapshot instead of fetching its own
+copy - `ESTIMATED_CALL_COST_PER_COIN_LOOKUP` returns to 7, where it was
+before that addendum, not 8. Net effect of this whole addendum on
+`/coin`'s Coinalyze budget: zero extra calls, one fewer than before.
+
+**All nine (price, OI) combinations are defined - unlike
+derivatives-context-v0.1's 18-combination, 6-defined matrix.** NO_MATCH
+here has exactly one cause: a missing or non-OK price or OI input.
+There is no "no rulebook combination for this case" path, because there
+is no case this document doesn't cover - `position_flow_classifier.
+classify` looks the two states up in a dict of all nine entries and it
+is always present once both inputs are `OK`.
+
+**State names describe what happened, not what it means.** `LONG_
+BUILDUP`/`SHORT_BUILDUP` name the price direction paired with rising
+open interest - they say nothing about which side's positions grew, and
+explicitly do not mean a bullish or bearish trade. This is stated in the
+rulebook document itself (each state's own description says so) and
+enforced in the renderer by never attaching an interpretation sentence
+to a state name, unlike D1-D6's `_INTERPRETATIONS` dict in
+`derivatives_classifier.py` - position-flow-v0.1's states are the
+message; there is no second sentence to write or get wrong.
+
+**Three-layer output, one optional parameter each.** `render_snapshot`
+gained two more optional, defaulted parameters
+(`position_flow: PositionFlowResult | None = None`, layered on top of
+the existing `universe_context` one from the previous addendum). `None`
+for both renders exactly Layer 1, byte for byte - verified the same way
+as before
+(`test_none_universe_context_renders_exactly_as_before`,
+`test_no_position_flow_omits_layers_2_and_3_entirely`). Layer 2
+(POSITION FLOW) and Layer 3 (SUPPORTING CONTEXT) are appended together,
+after Layer 1's four groups, only when `position_flow` is given -
+`_handle_coin` always computes and passes it now (it costs nothing to
+compute, being pure arithmetic on an already-fetched snapshot), but the
+parameter stays optional so every existing caller and test is
+unaffected by construction, not by convention.
+
+**Layer 2 reuses the rulebook-input display pattern, not the exact
+function.** `render_briefing` already had `_fmt_classifier_input_line`
+for D1-D6's Price/OI/Funding lines, but it formats via the existing
+`_fmt_pct` (no explicit sign for a positive value - `"0.002%"`, matching
+every other percentage `/coin` has ever shown). Position-flow-v0.1's own
+worked examples show an explicit sign (`+X.XX%`), so Layer 2 gets its
+own `_fmt_position_flow_input_line` instead of reusing
+`_fmt_classifier_input_line` outright - a deliberate divergence, not
+inconsistency: changing `_fmt_pct` itself to always sign positive values
+would have silently changed every existing Layer 1 percentage line
+(funding rate, predicted funding rate, OI change %), which nothing in
+this addendum was asked to touch.
+
+**Layer 3 is arithmetic, not a rule - no rulebook document needed for
+it.** "POSITIVE"/"NEGATIVE"/"ZERO" is a sign check; "LONG-BIASED"/
+"SHORT-BIASED"/"EVEN" is a comparison against a long/short ratio of
+1.0; "BUYING > SELLING"/"SELLING > BUYING"/"BUYING = SELLING" and
+"SHORT > LONG"/"LONG > SHORT"/"LONG = SHORT" are comparisons between two
+already-computed values. None of these involve a threshold that could be
+tuned, a judgment call, or a combination the way position-flow-v0.1's
+nine states or derivatives-context-v0.1's six do - CLAUDE.md's standing
+rule against inventing rulebook behavior applies to interpretation
+decisions, not to stating which of two numbers is larger. The forbidden-
+language list (`_FORBIDDEN` in `test_telegram_render.py`) is the actual
+enforcement: `elevated`, `crowded`, `high`, `low`, `above`, `below`,
+`bullish`, `bearish`, `avoid`, `strong`, `weak`, `setup`, `enter`,
+`long now`, `short now`, plus the existing entry/stop/SL/TP/target/R:R
+list, checked against every rendered message, including the position-
+flow and supporting-context sections specifically.
+
+**Addition B's test, taken literally.** The Phase 1 investigation in the
+previous addendum found that a renderer-only test suite had missed a
+wiring gap between the bot's real dispatch path and `render_snapshot`.
+This addendum's own tests (`test_bot.py`) go through `run_once` ->
+`_handle_message` -> `_handle_coin` -> `classify_snapshot` ->
+`render_snapshot` for every position-flow assertion, never calling
+`classify`/`render_snapshot` directly to fake a passing test - including
+one confirming `/coin MEME` (an unlisted-by-default, non-BTC, non-
+universe symbol) gets a full POSITION FLOW section, and one confirming
+`/coin NOPE` (MARKET_NOT_FOUND) gets none at all, matching
+`render_snapshot`'s early-return short circuit.
+
+### Consequences (position-flow-v0.1 and universal /coin interpretation)
+
+- `/coin` now interprets, for the first time - deliberately, narrowly,
+  and behind its own versioned rulebook document, not a quiet extension
+  of derivatives-context-v0.1 or Section 1/2.
+- `MarketIntelSnapshot` gained two fields
+  (`price_change`/`open_interest_change_pct`) that any future
+  `market_intel` consumer can read without an extra Coinalyze call -
+  the same "compute once, reuse" pattern that let this addendum remove
+  a call rather than add one.
+- Every future coin-context rulebook question (this addendum's Layer 3
+  is deliberately NOT one - it invents no threshold) has a concrete
+  precedent to follow: measure with `intel distributions` first
+  (already done, prior addendum), write the rulebook document before any
+  classifier code (done here, and in Merge 3), keep it in its own file
+  and its own classifier, and prove the isolation with a test rather
+  than a comment.
