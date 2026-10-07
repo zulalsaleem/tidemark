@@ -46,6 +46,7 @@ nothing else:
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError
@@ -59,6 +60,7 @@ from tidemark.data.models import JournalEntry
 # a rulebook parameter - Section 1 itself defines no "staleness" concept
 # for its own output, and this module invents no Section 1 behavior.
 SECTION1_STALE_AFTER = dt.timedelta(hours=8)
+SECTION1_CANDLE = dt.timedelta(hours=4)
 
 
 def read_latest_journal_entry(database_url: str, asset: str) -> JournalEntry | None:
@@ -86,3 +88,62 @@ def read_latest_journal_entry(database_url: str, asset: str) -> JournalEntry | N
 
 def is_stale(entry: JournalEntry, now: dt.datetime) -> bool:
     return now - entry.evaluated_at > SECTION1_STALE_AFTER
+
+
+@dataclass(frozen=True)
+class Section1Read:
+    """A stored Section 1 result for one asset, or why it isn't usable.
+
+    Only ever built from a stored `JournalEntry` - never recomputed. A
+    missing or stale record is `available=False` with a reason, and the
+    caller renders UNAVAILABLE rather than falling back to structure
+    computation (there is no code path here that could compute it).
+    """
+
+    asset: str
+    available: bool
+    reason: str | None = None
+    state: str | None = None
+    watch: str | None = None
+    grade: str | None = None
+    rule_version: str | None = None
+    evaluated_at: dt.datetime | None = None
+    active_levels: tuple[dict, ...] = ()
+
+    @property
+    def window_start(self) -> dt.datetime | None:
+        """Start of the 4H candle this record evaluated, assuming
+        `evaluated_at` is that candle's close (see ADR 0011, Phase A).
+        """
+        if self.evaluated_at is None:
+            return None
+        return self.evaluated_at - SECTION1_CANDLE
+
+
+def read_section1(database_url: str, asset: str, now: dt.datetime) -> Section1Read:
+    entry = read_latest_journal_entry(database_url, asset)
+    if entry is None:
+        return Section1Read(
+            asset=asset, available=False, reason="no stored Section 1 record for this asset"
+        )
+    if is_stale(entry, now):
+        return Section1Read(
+            asset=asset,
+            available=False,
+            reason=(
+                "stored Section 1 record is stale, last evaluated "
+                f"{entry.evaluated_at.strftime('%Y-%m-%d %H:%M')} UTC, more than "
+                f"{int(SECTION1_STALE_AFTER.total_seconds() // 3600)}h ago"
+            ),
+            evaluated_at=entry.evaluated_at,
+        )
+    return Section1Read(
+        asset=asset,
+        available=True,
+        state=entry.state,
+        watch=entry.watch,
+        grade=entry.grade,
+        rule_version=entry.rule_version,
+        evaluated_at=entry.evaluated_at,
+        active_levels=tuple(entry.active_levels or ()),
+    )
