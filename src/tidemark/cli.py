@@ -50,9 +50,17 @@ from tidemark.data.universe_sync import (
     run_universe_sync,
     selected_symbols,
 )
+from tidemark.enrich.alerts import (
+    WOULD_SEND,
+    EnrichOutcome,
+    build_live_bundle,
+    run_enrichment,
+    sent_journal_alerts,
+)
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
+from tidemark.market_intel import alert_cursor
 from tidemark.market_intel.bot import run_forever, run_once
 from tidemark.market_intel.bot_state import BotStateStore
 from tidemark.market_intel.briefing import BriefingResult, evaluate_briefing, mark_sent
@@ -233,18 +241,17 @@ def run(
     the venue, if one exists and isn't stale; otherwise TIDEMARK_SYMBOLS
     as a last-resort fallback. For each symbol: evaluate against stored
     candles, write the journal row (a no-op if this 4H candle was already
-    journaled), run the change detector, and send a Telegram alert if it
-    returns a reason. One symbol failing gives a PARTIAL run, not FAILED.
+    journaled), run the change detector, and record its alert reason on the
+    row. It sends nothing: `tidemark alert enrich` composes and sends.
+    One symbol failing gives a PARTIAL run, not FAILED.
     """
     settings = get_settings()
     store = _store(settings)
-    notifier = _notifier(settings)
     now = dt.datetime.now(dt.UTC)
     resolved = _resolve_and_report(store, settings, symbols, now)
 
     outcome = run_pipeline(
         store,
-        notifier,
         settings.venue,
         resolved.symbols,
         now=now,
@@ -264,8 +271,9 @@ def _print_pipeline_outcome(outcome: PipelineRunOutcome) -> None:
         elif o.alert_reason is None:
             _safe_echo(f"  {o.symbol:<16} journaled, no alert")
         else:
-            sent = "sent" if o.alert_sent else "FAILED TO SEND"
-            _safe_echo(f"  {o.symbol:<16} journaled, alert={o.alert_reason} ({sent})")
+            _safe_echo(
+                f"  {o.symbol:<16} journaled, alert={o.alert_reason} (queued for alert enrich)"
+            )
 
 
 @app.command()
@@ -762,19 +770,20 @@ def journal_list(
 def journal_alerts(days: int = typer.Option(30, "--days")) -> None:
     """List journal rows where an alert was sent, across all symbols, newest first."""
     settings = get_settings()
-    store = _store(settings)
     since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
-    entries = store.journal_alerts(since=since)
+    # The enricher's sent records, joined to the journal rows they describe.
+    alerts = sent_journal_alerts(settings.database_url, since=since)
 
-    if not entries:
+    if not alerts:
         typer.echo("No alerts sent.")
         return
 
-    for entry in entries:
+    for entry, sent in alerts:
         grade = entry.grade or "-"
         typer.echo(
             f"{entry.evaluated_at.isoformat()}  {entry.asset:<16}  {entry.state:22}  "
-            f"{entry.watch:11}  grade={grade}  alert_reason={entry.alert_reason}"
+            f"{entry.watch:11}  grade={grade}  alert_reason={sent.alert_reason}  "
+            f"sent_at={sent.sent_at.isoformat()}"
         )
 
 
@@ -2043,6 +2052,124 @@ def intel_refresh_context() -> None:
         f"skipped={len(measurement.skipped_symbols)}"
     )
     typer.echo("Wrote 1 row to universe_context_cache.")
+
+
+alert_app = typer.Typer(
+    name="alert",
+    help=(
+        "Telegram alert composition. Separate from the research run: `tidemark run` "
+        "journals and decides, `tidemark alert enrich` composes and sends. "
+        "See docs/adr/0012-alert-enricher.md."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(alert_app, name="alert")
+
+
+def _print_enrich_outcome(outcome: EnrichOutcome) -> None:
+    if outcome.first_run:
+        base = outcome.first_run_baseline
+        if base is None:
+            typer.echo("No checkpoint yet and the journal is empty: checkpoint set to 0.")
+        else:
+            typer.echo(
+                f"No checkpoint yet: starting at the latest journal entry #{base.id} "
+                f"({base.asset}, evaluated {base.evaluated_at.isoformat()}). "
+                "Nothing is sent for history before it - the journal is not replayed."
+            )
+        if not outcome.send:
+            typer.echo("Dry run: that baseline would be recorded by a send run. Nothing written.")
+        else:
+            typer.echo(f"Checkpoint recorded at #{outcome.checkpoint_after}. Nothing sent.")
+        return
+
+    for d in outcome.decisions:
+        reason = d.alert_reason or "-"
+        size = "" if d.text is None else f" ({len(d.text)} chars)"
+        _safe_echo(
+            f"  #{d.journal_entry_id:<6} {d.asset:<18} {d.evaluated_at.isoformat()} "
+            f"{reason:<18} -> {d.decision}{size}"
+        )
+    for d in outcome.decisions:
+        if d.decision == WOULD_SEND and d.text is not None:
+            typer.echo("")
+            typer.echo(f"--- composed alert for journal entry #{d.journal_entry_id} ---")
+            _safe_echo(d.text)
+            typer.echo("--- end ---")
+
+    counts: dict[str, int] = {}
+    for d in outcome.decisions:
+        counts[d.decision] = counts.get(d.decision, 0) + 1
+    summary = ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "nothing new"
+    typer.echo(f"summary: {summary}")
+    typer.echo(f"checkpoint: before={outcome.checkpoint_before} after={outcome.checkpoint_after}")
+    if not outcome.send:
+        typer.echo("Dry run: nothing sent, nothing written; the checkpoint is unchanged.")
+    if outcome.failure is not None:
+        typer.echo(f"FAILED: {outcome.failure}")
+
+
+@alert_app.command("enrich")
+def alert_enrich(
+    send: bool = typer.Option(
+        False, "--send", help="Send composed alerts and advance the durable cursor."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Compose and print only; write nothing (also the default)."
+    ),
+) -> None:
+    """Compose and (with --send) send the Section 1 WATCH alerts for journal
+    entries the enricher has not processed yet.
+
+    Dry run is the default. A send run keeps a durable checkpoint in
+    market_intel's own tables: it advances only after a successful send, so a
+    failed run is retried by the next one. With no checkpoint yet, it starts
+    from the latest journal entry and sends nothing for history.
+    """
+    if send and dry_run:
+        typer.echo("Choose --send or --dry-run, not both.")
+        raise typer.Exit(code=2)
+
+    settings = get_settings()
+    now = dt.datetime.now(dt.UTC)
+    cursor_engine = alert_cursor.make_engine(settings.database_url)
+    notifier = _notifier(settings) if send else None
+
+    typer.echo(
+        "mode: SEND (sends Telegram messages, advances the cursor)"
+        if send
+        else "mode: DRY RUN (nothing sent, nothing written)"
+    )
+
+    # One reference cache for the whole run: BTC and ETH are the same for every
+    # alert in the same closed period, so a catch-up of N entries fetches them once.
+    reference_cache = ReferenceSnapshotCache()
+
+    def build_bundle(entry, when):
+        return build_live_bundle(
+            entry,
+            when,
+            database_url=settings.database_url,
+            venue=settings.venue,
+            api_key=settings.coinalyze_api_key,
+            reference_cache=reference_cache,
+        )
+
+    try:
+        outcome = run_enrichment(
+            database_url=settings.database_url,
+            cursor_engine=cursor_engine,
+            now=now,
+            send=send,
+            build_bundle=build_bundle,
+            send_text=notifier.send_text if notifier is not None else None,
+        )
+    finally:
+        cursor_engine.dispose()
+
+    _print_enrich_outcome(outcome)
+    if outcome.failure is not None:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

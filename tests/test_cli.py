@@ -1862,3 +1862,24 @@ def test_evidence_json_output_is_valid_json(tmp_path, monkeypatch: pytest.Monkey
     payload = json.loads(result.stdout)
     assert payload["full_report"] is True
     assert payload["is_young_archive"] is True
+
+
+def test_run_never_builds_a_notifier_and_sends_nothing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`tidemark run` journals and decides; it must not touch Telegram at all.
+    The notifier factory raises if called, so any send path fails loudly.
+    """
+    url = _use_temp_db(tmp_path, monkeypatch)
+    _seed_candles(url, SYMBOL, n=3)
+
+    def _forbidden(settings):
+        raise AssertionError("tidemark run must never construct a notifier")
+
+    monkeypatch.setattr(cli_module, "_notifier", _forbidden)
+    monkeypatch.setattr(cli_module, "TelegramNotifier", _forbidden)
+
+    result = runner.invoke(app, ["run", "--symbols", SYMBOL])
+
+    assert result.exit_code == 0, result.output
+    assert "AssertionError" not in result.output

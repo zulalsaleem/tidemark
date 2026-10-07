@@ -236,3 +236,70 @@ def test_the_market_context_files_are_covered_by_the_boundary_scan() -> None:
         or name.startswith("tidemark.market_intel.derivatives_classifier.")
         for name in names
     )
+
+
+# -- the alert enricher (docs/adr/0012-alert-enricher.md) --------------------
+
+ENRICH_DIR = SRC_ROOT / "enrich"
+ENRICHER_FILE = ENRICH_DIR / "alerts.py"
+
+
+def _all_package_files(package: str) -> list[Path]:
+    return sorted((SRC_ROOT / package).rglob("*.py"))
+
+
+def test_the_enricher_is_the_one_place_that_reads_both_sides() -> None:
+    """The enricher may import the research models, Section 1's alert text,
+    and market_intel. That is the whole point of it being a third component.
+    """
+    names = _imported_module_names(ENRICHER_FILE)
+    assert "tidemark.data.models" in names
+    assert "tidemark.notify.telegram" in names
+    assert any(name.startswith("tidemark.market_intel") for name in names)
+
+
+def test_nothing_imports_the_enricher_except_the_cli() -> None:
+    """Neither side may import the enricher back - that would make the boundary
+    a cycle. Only the CLI wires it in.
+    """
+    importers = set()
+    for path in sorted(SRC_ROOT.rglob("*.py")):
+        if path.parent == ENRICH_DIR:
+            continue
+        for name in _imported_module_names(path):
+            if name == "tidemark.enrich" or name.startswith("tidemark.enrich."):
+                importers.add(path.relative_to(SRC_ROOT).as_posix())
+    assert importers == {"cli.py"}, importers
+
+
+def test_the_research_engine_still_never_imports_the_enricher_or_market_intel() -> None:
+    for path in _research_engine_files():
+        for name in _imported_module_names(path):
+            assert not (name == "tidemark.enrich" or name.startswith("tidemark.enrich.")), path
+            assert not (
+                name == "tidemark.market_intel" or name.startswith("tidemark.market_intel.")
+            ), path
+
+
+def test_the_research_pipeline_no_longer_imports_the_notifier() -> None:
+    """`tidemark run` decides and journals. Telegram is the enricher's concern,
+    so the pipeline module must not reach the notifier at all.
+    """
+    names = _imported_module_names(SRC_ROOT / "journal" / "pipeline.py")
+    assert not any(
+        name == "tidemark.notify" or name.startswith("tidemark.notify.") for name in names
+    )
+
+
+def test_market_intel_still_never_imports_the_enricher_or_the_notifier() -> None:
+    for path in _all_package_files("market_intel"):
+        for name in _imported_module_names(path):
+            assert not (name == "tidemark.enrich" or name.startswith("tidemark.enrich.")), path
+            assert not (name == "tidemark.notify" or name.startswith("tidemark.notify.")), path
+
+
+def test_the_cursor_module_is_covered_and_touches_no_research_module() -> None:
+    path = SRC_ROOT / "market_intel" / "alert_cursor.py"
+    assert path.is_file()
+    names = _imported_module_names(path)
+    assert not any(name == "tidemark.data" or name.startswith("tidemark.data.") for name in names)

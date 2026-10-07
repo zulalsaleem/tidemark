@@ -1026,3 +1026,19 @@ empty.
   is tested for every combination, including missing and unavailable data.
 - The `/coin` budget is now per lookup, not a flat 7, and a failing
   reference can never take down the reply to the coin.
+
+## Addendum: the alert enricher
+
+Phase A left the Section 1 WATCH alert being sent by `tidemark run`, inside
+the research run, which could not reach market context. ADR 0012 resolves
+this: `tidemark run` now journals and decides but sends nothing, and the
+new `tidemark alert enrich` composes the enriched alert from the journal row
+plus this ADR's market context, then sends it. The enricher is the only
+component that reads both the research engine and `market_intel`.
+
+Changes to this ADR's own decisions: none. The reference cache (7 warm, 21
+cold per lookup) and the point-in-time labelling are unchanged, and the
+`intel alert` preview still works as before. The enricher's own cost is one
+snapshot for the coin per alerted entry, plus BTC and ETH once per closed
+period for the whole run (14 + 7N call-units for N alerts); see ADR 0012.
+

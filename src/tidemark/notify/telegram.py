@@ -96,11 +96,19 @@ def _body_lines(record: ContextRecord) -> list[str]:
     return lines
 
 
+def section1_parts(record, alert_reason: str, symbol: str) -> tuple[str, str]:
+    """The Section 1 header and body lines for one (record, alert_reason)
+    pair - the Section 1 facts only, with no rulebook line and no disclaimer.
+    Shared by `build_message` and the alert enricher (`tidemark.enrich`), so
+    the Section 1 text of an enriched alert cannot drift from this one.
+    """
+    header = _header(alert_reason, record, _display_symbol(symbol))
+    return header, "\n".join(_body_lines(record))
+
+
 def build_message(record: ContextRecord, alert_reason: str, symbol: str) -> str:
     """Render the fixed alert shape for one (record, alert_reason) pair."""
-    display = _display_symbol(symbol)
-    header = _header(alert_reason, record, display)
-    body = "\n".join(_body_lines(record))
+    header, body = section1_parts(record, alert_reason, symbol)
     return f"{header}\n\n{body}\n\nRulebook: {record.rule_version}\n\n{DISCLAIMER}"
 
 

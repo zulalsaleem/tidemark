@@ -42,8 +42,9 @@ closed candles (exchange, read-only)
                         evaluation -> an alert reason, or None
         |
         v (only when a reason was returned)
-  notify/telegram.py   CHANGE DETECTOR -> TELEGRAM
-                        read-only, filtered alert
+  enrich/alerts.py     JOURNAL -> TELEGRAM   (separate command, own timer)
+                        `tidemark alert enrich`: composes the alert from
+                        the journal row + market context, then sends it
 ```
 
 The journal is the complete research record; Telegram is a filtered
@@ -146,16 +147,16 @@ uv run tidemark context explain --symbol BTC/USDT:USDT
 
 ```bash
 # Evaluate Section 1 for each symbol, journal the result (a no-op if this
-# 4H candle is already journaled), and send a Telegram alert only if the
-# change detector finds a reason to. One symbol failing gives PARTIAL,
-# not FAILED.
+# 4H candle is already journaled), and record the change detector's alert
+# reason if it finds one. It sends nothing: `tidemark alert enrich` does.
+# One symbol failing gives PARTIAL, not FAILED.
 uv run tidemark run --symbols BTC/USDT:USDT
 
 # The full research record for a symbol, newest first — every evaluation,
 # including every WAIT.
 uv run tidemark journal list --symbol BTC/USDT:USDT
 
-# Only the rows where an alert actually went out, across all symbols.
+# Alerts the enricher actually sent, with their send time (ADR 0012).
 uv run tidemark journal alerts
 
 # Send one fixed message to prove TIDEMARK_TELEGRAM_BOT_TOKEN /
@@ -708,6 +709,73 @@ Every `/coin` reply now has three layers:
   only price and open interest.
 
 Still not a trade signal: no entries, stops, targets, or R:R, ever.
+
+## Alert enricher (`tidemark alert enrich`)
+
+`tidemark run` journals and decides; it sends nothing. The Telegram
+WATCH alert is composed and sent by a separate command, which reads the
+journal entries it has not yet processed. The full design is in
+[docs/adr/0012-alert-enricher.md](docs/adr/0012-alert-enricher.md).
+
+```bash
+uv run tidemark alert enrich --dry-run   # the default: compose and print, write nothing
+uv run tidemark alert enrich --send      # send, and advance the durable cursor
+```
+
+- **Cursor.** A checkpoint in market_intel's own tables records the last
+  journal entry processed. It advances only after a successful send, so a
+  failed run is retried by the next one. Each sent alert is recorded
+  against its journal entry, so a re-run never sends it twice.
+- **First run.** With no checkpoint, the enricher starts at the latest
+  journal entry, sends nothing for history, and says so.
+- **Outages.** If Coinalyze is unreachable, the alert still sends, with
+  the market context marked `UNAVAILABLE`. The Section 1 facts never
+  depend on Coinalyze.
+- **Nothing is written to research tables.** Its only writes are the two
+  cursor tables, and only on a send.
+
+### Scheduling it (systemd timer, example only)
+
+The research run, the enricher, and their timers are separate units. The
+example below runs the enricher at :08 past each 4H boundary. Every path,
+user, and file here is a placeholder: replace them with your own. Nothing
+in this repository assumes a particular server.
+
+```ini
+# /etc/systemd/system/tidemark-alert-enrich.service
+[Unit]
+Description=Tidemark alert enricher (compose and send Section 1 WATCH alerts)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=<service-user>
+WorkingDirectory=<path-to-tidemark-checkout>
+EnvironmentFile=<path-to-tidemark-checkout>/.env
+ExecStart=<path-to-tidemark-checkout>/.venv/bin/tidemark alert enrich --send
+```
+
+```ini
+# /etc/systemd/system/tidemark-alert-enrich.timer
+[Unit]
+Description=Run the Tidemark alert enricher at :08 after each 4H boundary
+
+[Timer]
+OnCalendar=*-*-* 00/4:08:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Check the calendar expression before enabling it, with
+`systemd-analyze calendar "*-*-* 00/4:08:00"`. Then enable the timer with
+`systemctl enable --now tidemark-alert-enrich.timer`.
+
+`Type=oneshot` means systemd never overlaps a run with itself, which the
+single-writer assumption in ADR 0012 depends on. `Persistent=true` makes a
+run missed during downtime fire at the next start; the cursor then picks
+up everything it missed in order.
 
 ## Project status
 
