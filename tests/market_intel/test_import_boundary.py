@@ -212,3 +212,27 @@ def test_the_position_flow_files_are_covered_by_the_boundary_scan() -> None:
             or name.startswith("tidemark.market_intel.derivatives_classifier.")
             for name in names
         )
+
+
+def test_the_market_context_files_are_covered_by_the_boundary_scan() -> None:
+    # Phase A (docs/adr/0011): unified market context and the WATCH alert
+    # renderer. `market_context.py` reads Section 1 only through
+    # `context_read.read_section1`, so it must import nothing from
+    # `tidemark.data` at all - the one allowed importer of `data.models`
+    # stays `context_read.py`, which the allowlist test already pins.
+    market_intel_dir = SRC_ROOT / "market_intel"
+    path = market_intel_dir / "market_context.py"
+    assert path.is_file()
+    names = _imported_module_names(path)
+    assert not any(name == "tidemark.data" or name.startswith("tidemark.data.") for name in names)
+    assert not any(
+        name == "tidemark.context" or name.startswith("tidemark.context.") for name in names
+    )
+    assert not any(
+        name == "tidemark.journal" or name.startswith("tidemark.journal.") for name in names
+    )
+    assert not any(
+        name == "tidemark.market_intel.derivatives_classifier"
+        or name.startswith("tidemark.market_intel.derivatives_classifier.")
+        for name in names
+    )
