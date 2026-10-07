@@ -857,3 +857,151 @@ universe symbol) gets a full POSITION FLOW section, and one confirming
   classifier code (done here, and in Merge 3), keep it in its own file
   and its own classifier, and prove the isolation with a test rather
   than a comment.
+
+## Addendum: Phase A — the live market context layer
+
+Section 1 WATCH context and `/coin` were materially thin: a WATCH told
+a human a level and a direction, and `/coin` showed one symbol's
+derivatives with no reference point. Phase A adds context - BTC and ETH
+as reference points, relative strength against BTC, BTC alignment, a
+liquidation imbalance, and a WHAT TO WATCH summary - using only data and
+rules already in the repository. It defines no new trading rule.
+
+**Deferred, not built: the liquidity, 15M and 5M layers.** These are
+explicitly out of scope and are not stubbed, named in output, or left as
+placeholder code:
+- Liquidity: `LIQUIDITY_SWEEP`, `CLEAN_TOUCH_REVERSAL`, `SWEEP_REVERSAL`,
+  and any sweep or reclaim concept.
+- 15M setup detection and 5M confirmation.
+- Entry triggers and confirmation patterns.
+- Setup scoring or ranking, any confidence score, and any BULLISH/BEARISH
+  summary label for derivatives.
+
+Why: CLAUDE.md's first standing rule is that strategy logic comes only
+from `docs/rulebook/`, and none of these have a rulebook. Defining them
+here would invent behaviour the human has not written. Each one needs its
+own rulebook document, reviewed before any code, following the
+derivatives-context-v0.1 and position-flow-v0.1 precedent. Until then,
+Section 2 remains observation-only and the WHAT TO WATCH summary states
+only what Section 1 already stored.
+
+**Context objects, calculation only in `market_context.py`.**
+- `AssetContext` is one asset's fields: its stored Section 1 state (read,
+  never recomputed), price change, OI change, position flow (the unchanged
+  position-flow-v0.1 classification of that asset's own closed 1H reading),
+  funding, long/short ratio and liquidations. It serves as `CoinContext`
+  for the requested symbol and as each `MarketContext` member for BTC and
+  ETH - same fields, no ETH-specific logic.
+- `Derived` holds relative strength, BTC alignment, and liquidation
+  imbalance. `WatchSummary` holds what WHAT TO WATCH may name.
+- `MarketContextBundle` ties these together and lists the rulebook
+  versions a rendered message used.
+- `telegram_render.py` only formats these values. It compares, classifies
+  and chooses nothing.
+
+**Section 1 is read, never recomputed.** `context_read.read_section1` is
+the one read path, and it reads `journal_entries` only, as before. A
+missing or stale record (older than the 8h `SECTION1_STALE_AFTER`) is
+`UNAVAILABLE` with its reason. There is no fallback to computing structure.
+The 4H window is taken as the four hours ending at `evaluated_at`, on the
+assumption that `evaluated_at` is the 4H candle's close. This assumption
+should be confirmed against `context/htf.py`.
+
+**Derived comparisons are direct and threshold-free.**
+- Relative strength compares the coin's and BTC's price change over the
+  same closed 1H period: greater is `COIN STRONGER THAN BTC`, less is
+  `COIN WEAKER THAN BTC`, equal is `IN LINE WITH BTC`. Missing data on
+  either side, or periods that differ, is `NO_MATCH` with a reason. No
+  threshold for "strong" or "weak" exists, so none is defined.
+- BTC alignment maps only `BULLISH` to up and `BEARISH` to down. Same
+  direction is `ALIGNED`, opposite is `AGAINST BTC`, and anything else
+  (NEUTRAL, INSUFFICIENT_STRUCTURE, STRUCTURE_BROKEN_*, or an unavailable
+  record) is `NO_DIRECTIONAL_ALIGNMENT`. Mapping `STRUCTURE_BROKEN_*` to
+  nothing is the conservative reading of an unstated rule. It is an open
+  decision (see below), not a settled one. `AGAINST BTC` is a label, never
+  a rejection.
+- Liquidation imbalance compares long and short liquidation USD for the
+  coin's own closed 1H period: `LONG LIQUIDATIONS > SHORT`, `SHORT
+  LIQUIDATIONS > LONG`, `LIQUIDATIONS BALANCED`, or `UNAVAILABLE` with
+  a reason. It describes which side was liquidated more and implies no
+  intent.
+- For BTC as the coin, relative strength and alignment are `NO_MATCH`
+  with the reason that the requested symbol is the reference itself.
+
+**Coinalyze cost, reported before it was added.** BTC and ETH context
+reuse `fetch_market_intel` (7 call-units each), with no extra endpoint.
+A reference that is the coin itself is not fetched again. Per lookup:
+`/coin` on BTC or ETH costs 14, and `/coin` on any other symbol costs 21,
+against 7 before. `intel market --symbol TRUMP/USDT:USDT` costs 21. The
+`/coin` pre-check is computed per lookup from `estimated_call_cost`, so a
+burst of requests is still refused before it exceeds 40/minute. A BTC or
+ETH fetch that fails becomes that asset's `UNAVAILABLE` context, and the
+reply to the coin is still sent.
+
+**Every value states LIVE or CLOSED.** Funding is `LIVE, updated HH:MM
+UTC`. Closed-period metrics carry their 1H range, and Section 1 carries
+its 4H window. Position flow and liquidation imbalance carry their own
+closed 1H period.
+
+**Alerts: the renderer exists, live sending does not.** `render_watch_alert`
+produces the Section 1 WATCH alert in the new format: 4H structure, market
+context, position flow, key derivatives, WHAT TO WATCH, the rulebook
+versions used, and the disclaimer. `intel alert --symbol` previews it
+and never sends anything. The existing Section 1 WATCH alert is sent by
+`notify/telegram.py`, inside the research engine. That engine cannot
+import `market_intel`, and wiring market context into `tidemark run`
+would also add Coinalyze calls to a research run. Whether and how the
+live alert should be sent is a separate decision, and it is not made by
+this merge.
+
+**Output language.** The mandated labels (`COIN STRONGER THAN BTC`,
+`COIN WEAKER THAN BTC`) are allowed. Stored Section 1 state names
+(`BULLISH`, `BEARISH`) appear only as Section 1 states. The rendered
+output is checked, on every path, against word-boundary matches for the
+out-of-scope terms above, for `entry`, `stop`, `SL`, `TP`, `target`, `R:R`,
+`buy`, and `sell`, and for the derivatives labels `elevated`, `crowded`,
+`high`, `low`, `above`, `below`, `avoid`, `score` and `confidence`. Layer
+1 and Layer 3's existing `Buy`/`Sell` labels are kept, because the brief
+requires Layer 1 to stay exactly as it was. The new context block and the
+alert avoid those words entirely. The alert's footer no longer carries
+"1H/15M/5M rules not yet built" or "No entry, stop, or target defined".
+Those phrases name deferred layers and banned words, so the footer keeps
+only "Context only, not a trade signal".
+
+**Isolation holds.** `market_context.py` imports nothing from
+`tidemark.data`, `tidemark.context`, or `tidemark.journal`, and nothing
+from `derivatives_classifier.py`. The import-boundary suite covers it.
+`context_read.py` remains the only file allowed to import `data.models`.
+`read_section1` is read-only, and a test confirms it writes nothing.
+
+### Open decisions (not settled by this merge)
+
+1. Whether, and how, the Section 1 WATCH alert should be sent with market
+   context. Options: have `tidemark run` call market_intel (which the
+   boundary forbids), have a market_intel process watch for WATCH
+   transitions, or keep `intel alert` as a manual preview.
+2. Whether `STRUCTURE_BROKEN_BULL` and `STRUCTURE_BROKEN_BEAR` carry a
+   direction for alignment. This merge treats them as non-directional.
+3. Whether the ETH and BTC reference fetch should use a leaner subset of
+   endpoints (5 call-units instead of 7). The saving is small, and it
+   would mean a second code path.
+
+### Operational state at the time of writing
+
+Every stored Section 1 record was last evaluated at 2026-09-27 08:00 UTC,
+more than 8h before this merge. So live output shows Section 1 as
+`UNAVAILABLE` for BTC, ETH and TRUMP until `tidemark run` produces a fresh
+result. The universe context cache, last refreshed 2026-09-28 17:36 UTC,
+is also past its 12h freshness threshold. The `observations` table is
+empty.
+
+### Consequences (Phase A)
+
+- `/coin` and `intel market` show the same context objects in one
+  renderer. Every existing Layer 1 and Layer 2/3 line is unchanged; when
+  no market context is supplied, output is byte-identical to before.
+- Relative strength, BTC alignment and liquidation imbalance are pure
+  functions of already-fetched data and stored Section 1 state. Each
+  is tested for every combination, including missing and unavailable data.
+- The `/coin` budget is now per lookup, not a flat 7, and a failing
+  reference can never take down the reply to the coin.
