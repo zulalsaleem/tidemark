@@ -928,20 +928,41 @@ should be confirmed against `context/htf.py`.
 - For BTC as the coin, relative strength and alignment are `NO_MATCH`
   with the reason that the requested symbol is the reference itself.
 
-**Coinalyze cost, reported before it was added.** BTC and ETH context
-reuse `fetch_market_intel` (7 call-units each), with no extra endpoint.
-A reference that is the coin itself is not fetched again. Per lookup:
-`/coin` on BTC or ETH costs 14, and `/coin` on any other symbol costs 21,
-against 7 before. `intel market --symbol TRUMP/USDT:USDT` costs 21. The
-`/coin` pre-check is computed per lookup from `estimated_call_cost`, so a
-burst of requests is still refused before it exceeds 40/minute. A BTC or
-ETH fetch that fails becomes that asset's `UNAVAILABLE` context, and the
-reply to the coin is still sent.
+**Coinalyze cost.** Each snapshot fetch costs 7 call-units
+(`ESTIMATED_CALL_COST_PER_COIN_LOOKUP`). BTC and ETH context reuses
+`fetch_market_intel`, with no extra endpoint. Their snapshots are cached
+in memory by closed 1H period (`ReferenceSnapshotCache`), keyed by the
+period the coin's own data describes, not by a wall-clock TTL. So a
+lookup costs 7 when warm (the coin's own snapshot only) and 21 when cold
+for a non-BTC/ETH coin, which is the first lookup in a new period. A BTC
+or ETH lookup costs 7 warm and 14 cold, because the coin's own snapshot
+seeds the cache. The `/coin` pre-check counts only the references not yet
+cached for the current period, and `intel market --symbol TRUMP/USDT:USDT`
+costs 21. The cache is not persisted, so a restart pays one cold period.
+A BTC or ETH fetch that fails becomes that asset's `UNAVAILABLE` context,
+is never cached, and the reply to the coin is still sent.
+
+**Accepted consequence: cached point-in-time values can be older than the
+lookup.** Within one closed period, a cached BTC or ETH reading (open
+interest, funding, predicted funding) is the value from the period's first
+fetch, not a fresh one. Since they are reused rather than refetched, they
+may be minutes old. The renderer says so: BTC and ETH point-in-time values
+are labelled `as of HH:MM UTC`, not `LIVE`. The requested coin's values
+are fetched every lookup and keep the `LIVE, updated` label. Accepted
+because the alternative is 21 call-units per lookup against a budget of
+40 per minute shared with `intel distributions` and every other consumer
+of the key, and because the closed-period values (price change, OI change,
+long/short, liquidations) are the ones that matter for the comparison, and
+those are fixed for the whole period anyway. The one value that is not
+period-fixed is the point-in-time reading, which is why it carries its own
+timestamp.
 
 **Every value states LIVE or CLOSED.** Funding is `LIVE, updated HH:MM
 UTC`. Closed-period metrics carry their 1H range, and Section 1 carries
 its 4H window. Position flow and liquidation imbalance carry their own
 closed 1H period.
+BTC and ETH point-in-time values from the reference cache are `as of HH:MM UTC`,
+not LIVE (see the cost paragraph).
 
 **Alerts: the renderer exists, live sending does not.** `render_watch_alert`
 produces the Section 1 WATCH alert in the new format: 4H structure, market
