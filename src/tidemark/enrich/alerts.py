@@ -25,11 +25,12 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import Engine, create_engine, select
+from sqlalchemy import Engine, create_engine, inspect, select
 from sqlalchemy.orm import Session
 
 from tidemark.data.models import JournalEntry
 from tidemark.market_intel import alert_cursor
+from tidemark.market_intel.alert_cursor import SentRecord
 from tidemark.market_intel.client import CoinalyzeClient
 from tidemark.market_intel.context_read import read_section1, section1_from_entry
 from tidemark.market_intel.errors import (
@@ -44,6 +45,7 @@ from tidemark.market_intel.market_context import (
     BTC_SYMBOL,
     ETH_SYMBOL,
     MarketContextBundle,
+    ReferenceSnapshotCache,
     build_market_context,
     fetch_market_context,
     unavailable_asset_context,
@@ -140,6 +142,7 @@ def build_live_bundle(
     database_url: str,
     venue: str,
     api_key,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> MarketContextBundle:
     """The market context for one alert. The coin's Section 1 facts are the
     entry itself; BTC and ETH use their latest stored Section 1 (with the
@@ -159,6 +162,7 @@ def build_live_bundle(
             now,
             database_url,
             coin_section1=coin_section1,
+            reference_cache=reference_cache,
         )
     except CoinalyzeError as exc:
         reason = _outage_reason(exc)
@@ -318,3 +322,42 @@ def run_enrichment(
         failure=failure,
         checkpoint_after=checkpoint_after,
     )
+
+
+def sent_journal_alerts(
+    database_url: str, since: dt.datetime | None = None
+) -> list[tuple[JournalEntry, SentRecord]]:
+    """Every alert the enricher actually delivered, joined back to the journal
+    row it describes, newest first. The join is read-only and lives here, not
+    in the research store, so the research engine never imports market_intel.
+
+    Alerts sent by `tidemark run` before the enricher existed are not in the
+    sent table and are not listed; their journal rows keep `alert_sent=True`.
+    """
+    engine = create_engine(database_url)
+    try:
+        if not inspect(engine).has_table(alert_cursor.SENT_TABLE):
+            return []
+        with Session(engine) as session:
+            stmt = select(JournalEntry, alert_cursor.SentAlert).join(
+                alert_cursor.SentAlert,
+                alert_cursor.SentAlert.journal_entry_id == JournalEntry.id,
+            )
+            if since is not None:
+                stmt = stmt.where(JournalEntry.evaluated_at >= since)
+            stmt = stmt.order_by(JournalEntry.evaluated_at.desc())
+            return [
+                (
+                    journal,
+                    SentRecord(
+                        journal_entry_id=sent.journal_entry_id,
+                        asset=sent.asset,
+                        evaluated_at=sent.evaluated_at,
+                        alert_reason=sent.alert_reason,
+                        sent_at=sent.sent_at,
+                    ),
+                )
+                for journal, sent in session.execute(stmt).all()
+            ]
+    finally:
+        engine.dispose()

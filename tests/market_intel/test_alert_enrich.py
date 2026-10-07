@@ -33,7 +33,7 @@ from tidemark.enrich.alerts import (
 from tidemark.journal.records import build_journal_entry
 from tidemark.market_intel import alert_cursor
 from tidemark.market_intel.context_read import section1_from_entry
-from tidemark.market_intel.market_context import fetch_market_context
+from tidemark.market_intel.market_context import ReferenceSnapshotCache, fetch_market_context
 from tidemark.market_intel.service import fetch_market_intel
 
 SOL = "SOL/USDT:USDT"
@@ -563,3 +563,74 @@ def _journal_snapshot(url: str) -> dict[int, tuple]:
         return {row.id: (row.alert_sent, row.alert_reason, row.state) for row in rows}
     finally:
         engine.dispose()
+
+
+# -- one reference cache per run ------------------------------------------
+
+
+def test_three_entries_in_one_period_fetch_btc_and_eth_once(world, monkeypatch) -> None:
+    """A catch-up of N entries in the same closed period costs 14 + 7N, not 21N:
+    the coin is fetched per alert, BTC and ETH once for the whole run.
+    """
+    url, cursor = world
+    _baseline(world)
+    ids = [seed_watch_opened(url, i) for i in (1, 2, 3)]
+    fake = _FakeMarketClient(_readings())
+    monkeypatch.setattr(enrich_alerts, "CoinalyzeClient", lambda api_key: fake)
+    reference_cache = ReferenceSnapshotCache()
+
+    outcome = run(
+        url,
+        cursor,
+        send=True,
+        builder=lambda entry, now: build_live_bundle(
+            entry,
+            now,
+            database_url=url,
+            venue=VENUE,
+            api_key="unused",
+            reference_cache=reference_cache,
+        ),
+    )
+
+    assert [d.journal_entry_id for d in outcome.decisions] == ids
+    assert [d.decision for d in outcome.decisions] == [SENT, SENT, SENT]
+    # One metric-call set per snapshot: 7 calls each. Coin 3x, BTC once, ETH once.
+    assert fake.requested.count(SOL) == 3 * 7
+    assert fake.requested.count(BTC_SYMBOL) == 7
+    assert fake.requested.count(ETH_SYMBOL) == 7
+
+
+# -- journal alerts reads the enricher's sent records ---------------------
+
+
+def test_an_alert_recorded_by_the_enricher_appears_in_journal_alerts(
+    cli_world, world, monkeypatch
+) -> None:
+    url, cursor = cli_world
+    _baseline(world)
+    opened = seed_watch_opened(url, 1)
+    # No alert decision on this entry: it must never appear in the listing.
+    seed_quiet(url, 2)
+
+    class _Notifier:
+        def __init__(self, settings) -> None:
+            self.send_text = Sender()
+
+    monkeypatch.setattr(cli_module, "_notifier", lambda settings: _Notifier(settings))
+    sent = runner.invoke(app, ["alert", "enrich", "--send"])
+    assert sent.exit_code == 0, sent.output
+
+    listing = runner.invoke(app, ["journal", "alerts", "--days", "36500"])
+
+    assert listing.exit_code == 0, listing.output
+    assert "alert_reason=WATCH_OPENED" in listing.output
+    assert "sent_at=" in listing.output
+    assert len(listing.output.strip().splitlines()) == 1
+    assert alert_cursor.is_sent(cursor, opened)
+
+
+def test_journal_alerts_says_so_when_the_enricher_has_sent_nothing(cli_world) -> None:
+    result = runner.invoke(app, ["journal", "alerts", "--days", "36500"])
+    assert result.exit_code == 0, result.output
+    assert "No alerts sent." in result.output

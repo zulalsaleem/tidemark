@@ -50,7 +50,13 @@ from tidemark.data.universe_sync import (
     run_universe_sync,
     selected_symbols,
 )
-from tidemark.enrich.alerts import WOULD_SEND, EnrichOutcome, build_live_bundle, run_enrichment
+from tidemark.enrich.alerts import (
+    WOULD_SEND,
+    EnrichOutcome,
+    build_live_bundle,
+    run_enrichment,
+    sent_journal_alerts,
+)
 from tidemark.health.checks import EXIT_CODES, HealthReport, run_all_checks
 from tidemark.journal.observe_pipeline import ObservePipelineRunOutcome, run_observe_pipeline
 from tidemark.journal.pipeline import PipelineRunOutcome, run_pipeline
@@ -764,19 +770,20 @@ def journal_list(
 def journal_alerts(days: int = typer.Option(30, "--days")) -> None:
     """List journal rows where an alert was sent, across all symbols, newest first."""
     settings = get_settings()
-    store = _store(settings)
     since = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
-    entries = store.journal_alerts(since=since)
+    # The enricher's sent records, joined to the journal rows they describe.
+    alerts = sent_journal_alerts(settings.database_url, since=since)
 
-    if not entries:
+    if not alerts:
         typer.echo("No alerts sent.")
         return
 
-    for entry in entries:
+    for entry, sent in alerts:
         grade = entry.grade or "-"
         typer.echo(
             f"{entry.evaluated_at.isoformat()}  {entry.asset:<16}  {entry.state:22}  "
-            f"{entry.watch:11}  grade={grade}  alert_reason={entry.alert_reason}"
+            f"{entry.watch:11}  grade={grade}  alert_reason={sent.alert_reason}  "
+            f"sent_at={sent.sent_at.isoformat()}"
         )
 
 
@@ -2134,6 +2141,10 @@ def alert_enrich(
         else "mode: DRY RUN (nothing sent, nothing written)"
     )
 
+    # One reference cache for the whole run: BTC and ETH are the same for every
+    # alert in the same closed period, so a catch-up of N entries fetches them once.
+    reference_cache = ReferenceSnapshotCache()
+
     def build_bundle(entry, when):
         return build_live_bundle(
             entry,
@@ -2141,6 +2152,7 @@ def alert_enrich(
             database_url=settings.database_url,
             venue=settings.venue,
             api_key=settings.coinalyze_api_key,
+            reference_cache=reference_cache,
         )
 
     try:
