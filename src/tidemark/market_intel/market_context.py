@@ -447,6 +447,7 @@ def fetch_market_context(
     now: dt.datetime,
     database_url: str,
     reference_cache: ReferenceSnapshotCache | None = None,
+    coin_section1: Section1Read | None = None,
 ) -> MarketContextBundle:
     """Assembles the full bundle for one coin whose snapshot is already
     fetched. BTC/ETH come from `reference_cache` when it holds them for this
@@ -456,9 +457,9 @@ def fetch_market_context(
     becomes that asset's UNAVAILABLE context, never an error for the reply.
     """
     period_start = _period_start(now)
-    coin = asset_context_from_snapshot(
-        coin_snapshot, read_section1(database_url, coin_snapshot.symbol, now)
-    )
+    if coin_section1 is None:
+        coin_section1 = read_section1(database_url, coin_snapshot.symbol, now)
+    coin = asset_context_from_snapshot(coin_snapshot, coin_section1)
     coin_is_reference = coin.symbol in REFERENCE_SYMBOLS
     if reference_cache is not None and coin_is_reference and coin_snapshot.market_status == OK:
         reference_cache.put(coin.symbol, period_start, coin_snapshot)

@@ -1,5 +1,6 @@
 """Orchestrates `tidemark run`'s evaluation -> journal -> change detector
--> Telegram pipeline.
+pipeline. It sends nothing: an alert is a journal decision (`alert_reason`),
+and `tidemark alert enrich` composes and sends it. See docs/adr/0012.
 
 Data-layer orchestration only, mirroring `data/ingest.py`'s pattern: one
 symbol failing never aborts the others, and the run's overall status is
@@ -24,7 +25,6 @@ from tidemark.data.models import Candle
 from tidemark.data.store import TidemarkStore
 from tidemark.journal.changes import detect_change
 from tidemark.journal.records import build_journal_entry
-from tidemark.notify.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,6 @@ def _candles_to_frame(candles: list[Candle]) -> pd.DataFrame:
 
 def run_pipeline(
     store: TidemarkStore,
-    notifier: TelegramNotifier,
     venue: str,
     symbols: list[str],
     now: dt.datetime | None = None,
@@ -89,7 +88,7 @@ def run_pipeline(
     status = "FAILED"
     outcomes: list[SymbolRunOutcome] = []
     try:
-        outcomes = [_run_symbol(store, notifier, venue, symbol, now) for symbol in symbols]
+        outcomes = [_run_symbol(store, venue, symbol, now) for symbol in symbols]
 
         fail_count = sum(1 for o in outcomes if o.error is not None)
         success_count = len(outcomes) - fail_count
@@ -112,7 +111,6 @@ def run_pipeline(
 
 def _run_symbol(
     store: TidemarkStore,
-    notifier: TelegramNotifier,
     venue: str,
     symbol: str,
     now: dt.datetime,
@@ -149,9 +147,10 @@ def _run_symbol(
         if reason is None:
             return SymbolRunOutcome(symbol, True, False, None, None)
 
-        sent = notifier.send_alert(record, reason, symbol)
-        store.record_alert_outcome(write_result.entry.id, alert_sent=sent, alert_reason=reason)
-        return SymbolRunOutcome(symbol, True, sent, reason, None)
+        # Journal the detector's decision and stop there. The alert enricher
+        # (`tidemark alert enrich`) composes and sends it, on its own timer.
+        store.record_alert_outcome(write_result.entry.id, alert_sent=False, alert_reason=reason)
+        return SymbolRunOutcome(symbol, True, False, reason, None)
     except Exception as exc:
         logger.error("run failed for symbol=%s error=%s", symbol, exc)
         return SymbolRunOutcome(symbol, False, False, None, str(exc))

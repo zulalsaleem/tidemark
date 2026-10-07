@@ -147,3 +147,21 @@ def read_section1(database_url: str, asset: str, now: dt.datetime) -> Section1Re
         evaluated_at=entry.evaluated_at,
         active_levels=tuple(entry.active_levels or ()),
     )
+
+
+def section1_from_entry(entry: JournalEntry) -> Section1Read:
+    """The Section 1 facts of one specific journal entry - an alert's own
+    payload. Not staleness-checked: an alert describes the entry it is sent
+    for, however many runs ago that was. Only `read_section1` (the latest
+    record, for references) applies the freshness guard.
+    """
+    return Section1Read(
+        asset=entry.asset,
+        available=True,
+        state=entry.state,
+        watch=entry.watch,
+        grade=entry.grade,
+        rule_version=entry.rule_version,
+        evaluated_at=entry.evaluated_at,
+        active_levels=tuple(entry.active_levels or ()),
+    )

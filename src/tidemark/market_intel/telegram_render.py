@@ -392,7 +392,7 @@ def render_snapshot(
 
 # No 15M/5M mention here: those layers are deferred, and the brief bars
 # naming them in any output.
-_MARKET_CONTEXT_FOOTER = "Market information only. Context only, not a trade signal."
+MARKET_CONTEXT_FOOTER = "Market information only. Context only, not a trade signal."
 
 
 def _closed_tag(metric, reference: dt.datetime) -> str:
@@ -623,7 +623,7 @@ def render_watch_alert(bundle: MarketContextBundle, reference: dt.datetime) -> s
         *_fmt_watch_lines(bundle),
         "",
         "Rulebooks: " + ", ".join(bundle.rulebook_versions),
-        _MARKET_CONTEXT_FOOTER,
+        MARKET_CONTEXT_FOOTER,
     ]
     return "\n".join(lines)
 
