@@ -76,9 +76,11 @@ from tidemark.market_intel.errors import (
 from tidemark.market_intel.evaluation_store import init_evaluation_store
 from tidemark.market_intel.evaluation_store import make_engine as make_evaluation_engine
 from tidemark.market_intel.future_markets import FutureMarketsCache
+from tidemark.market_intel.market_context import fetch_market_context
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
+from tidemark.market_intel.telegram_render import render_market_context_block, render_watch_alert
 from tidemark.market_intel.universe_context_store import (
     MetricSummaryFields,
     UniverseContextRecord,
@@ -1509,9 +1511,79 @@ def intel_market(
         typer.echo(json_module.dumps(_market_intel_snapshot_to_dict(snapshot), indent=2))
     else:
         _safe_echo(_render_market_intel_snapshot(snapshot))
+        if snapshot.market_status == OK:
+            bundle = fetch_market_context(
+                client, cache, snapshot, settings.venue, now, settings.database_url
+            )
+            _safe_echo("\n\n" + render_market_context_block(bundle, now))
 
     if snapshot.market_status != OK:
         raise typer.Exit(code=1)
+
+
+@intel_app.command("alert")
+def intel_alert(
+    symbol: str = typer.Option(
+        ..., "--symbol", help="ccxt unified perpetual symbol, e.g. TRUMP/USDT:USDT"
+    ),
+) -> None:
+    """Preview the Section 1 WATCH alert for one symbol, as it would read.
+
+    Prints the alert when a Section 1 WATCH is active for the symbol, and
+    says so when none is. It never sends anything - delivery is a separate
+    decision (see docs/adr/0011-market-intelligence-layer.md, Phase A).
+    """
+    settings = get_settings()
+    try:
+        client = _coinalyze_client(settings)
+    except MissingApiKeyError:
+        typer.echo("TIDEMARK_COINALYZE_API_KEY is not set. See .env.example.")
+        raise typer.Exit(code=1) from None
+
+    cache = FutureMarketsCache(client)
+    now = dt.datetime.now(dt.UTC)
+    snapshot = _fetch_snapshot_or_exit(client, cache, symbol, settings.venue, now)
+    if snapshot.market_status != OK:
+        typer.echo(f"{symbol}: not a Binance USDT-M perpetual market ({snapshot.market_status}).")
+        raise typer.Exit(code=1)
+
+    bundle = fetch_market_context(
+        client, cache, snapshot, settings.venue, now, settings.database_url
+    )
+    text = render_watch_alert(bundle, now)
+    if text is None:
+        typer.echo(
+            f"No Section 1 WATCH is active for {symbol}; no alert would be sent. "
+            f"Section 1 (4H): {_alert_state_summary(bundle.coin.section1)}."
+        )
+        return
+    _safe_echo(text)
+
+
+def _alert_state_summary(section1) -> str:
+    if not section1.available:
+        return f"UNAVAILABLE ({section1.reason})"
+    return f"{section1.state} / watch {section1.watch}"
+
+
+def _fetch_snapshot_or_exit(client, cache, symbol: str, venue: str, now: dt.datetime):
+    try:
+        return fetch_market_intel(client, cache, symbol, venue, now)
+    except UnsupportedVenueError as exc:
+        typer.echo(
+            f"No Coinalyze exchange-code mapping for venue {exc.venue!r}. "
+            "See docs/adr/0011-market-intelligence-layer.md."
+        )
+        raise typer.Exit(code=1) from None
+    except RateLimitedError as exc:
+        typer.echo(f"Coinalyze rate limited this request: {exc}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeHttpError as exc:
+        typer.echo(f"Coinalyze returned HTTP {exc.status_code}: {exc.detail}")
+        raise typer.Exit(code=1) from None
+    except CoinalyzeConnectionError as exc:
+        typer.echo(f"Could not reach Coinalyze: {exc.detail}")
+        raise typer.Exit(code=1) from None
 
 
 def _telegram_bot_client(settings: Settings) -> TelegramBotClient:
@@ -1572,6 +1644,7 @@ def intel_bot(
                 poll_timeout=0,
                 context_engine=context_engine,
                 context_stale_after=context_stale_after,
+                database_url=settings.database_url,
             )
         except TelegramHttpError as exc:
             typer.echo(f"Telegram returned HTTP {exc.status_code}: {exc.detail}")
@@ -1600,6 +1673,7 @@ def intel_bot(
             settings.venue,
             context_engine=context_engine,
             context_stale_after=context_stale_after,
+            database_url=settings.database_url,
         )
     except KeyboardInterrupt:
         typer.echo("Stopped.")
