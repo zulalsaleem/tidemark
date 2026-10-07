@@ -403,6 +403,13 @@ def _live_tag(metric, reference: dt.datetime) -> str:
     return f"LIVE, updated {_fmt_instant(metric.updated_at, reference)}"
 
 
+def _as_of_tag(metric, reference: dt.datetime) -> str:
+    """A point-in-time reading from the reference cache: fetched earlier in
+    the same closed period, so it is labelled "as of", never LIVE.
+    """
+    return f"as of {_fmt_instant(metric.updated_at, reference)}"
+
+
 def _metric_text(name: str, metric, fmt: Callable[[float], str], tag) -> str:
     if metric is None:
         return f"{name}: UNAVAILABLE"
@@ -427,7 +434,9 @@ def _fmt_section1_line(asset: AssetContext, reference: dt.datetime) -> str:
     )
 
 
-def _fmt_asset_block(label: str, asset: AssetContext, reference: dt.datetime) -> list[str]:
+def _fmt_asset_block(
+    label: str, asset: AssetContext, reference: dt.datetime, point_in_time_tag=_live_tag
+) -> list[str]:
     lines = [label, f"  {_fmt_section1_line(asset, reference)}"]
     if asset.status == UNAVAILABLE:
         lines.append(f"  Coinalyze: UNAVAILABLE ({asset.reason})")
@@ -444,8 +453,8 @@ def _fmt_asset_block(label: str, asset: AssetContext, reference: dt.datetime) ->
     lines.append(
         "  " + _metric_text("OI change (%)", asset.open_interest_change_pct, _signed_pct, closed)
     )
-    live = lambda m: _live_tag(m, reference)  # noqa: E731 - one-line tag adapter
-    lines.append("  " + _metric_text("Funding rate", asset.funding_rate, _fmt_pct, live))
+    point_in_time = lambda m: point_in_time_tag(m, reference)  # noqa: E731 - tag adapter
+    lines.append("  " + _metric_text("Funding rate", asset.funding_rate, _fmt_pct, point_in_time))
 
     ls = asset.long_short_ratio
     if ls.status != OK:
@@ -530,8 +539,14 @@ def render_market_context_block(bundle: MarketContextBundle, reference: dt.datet
     parts = [
         "MARKET CONTEXT",
         "\n".join(_fmt_asset_block(f"COIN ({bundle.coin.symbol})", bundle.coin, reference)),
-        "\n".join(_fmt_asset_block("BTC (primary reference)", bundle.market.btc, reference)),
-        "\n".join(_fmt_asset_block("ETH (secondary reference)", bundle.market.eth, reference)),
+        # BTC and ETH may come from the reference cache, fetched earlier in this
+        # closed period, so their point-in-time values are "as of", not LIVE.
+        "\n".join(
+            _fmt_asset_block("BTC (primary reference)", bundle.market.btc, reference, _as_of_tag)
+        ),
+        "\n".join(
+            _fmt_asset_block("ETH (secondary reference)", bundle.market.eth, reference, _as_of_tag)
+        ),
         "\n".join(
             [
                 _fmt_relative_strength(bundle, reference),
