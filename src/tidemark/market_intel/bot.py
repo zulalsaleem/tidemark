@@ -33,6 +33,8 @@ from tidemark.market_intel.errors import (
     UnsupportedVenueError,
 )
 from tidemark.market_intel.future_markets import FutureMarketsCache
+from tidemark.market_intel.market_context import fetch_market_context, reference_symbols_to_fetch
+from tidemark.market_intel.models import OK
 from tidemark.market_intel.position_flow import classify_snapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
@@ -52,6 +54,10 @@ logger = logging.getLogger(__name__)
 # client.py) is still caught as a fallback in case this estimate
 # undercounts.
 ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 7
+# Phase A (docs/adr/0011): with a database URL, the lookup also fetches
+# BTC and ETH as market reference points - one more `fetch_market_intel`
+# (ESTIMATED_CALL_COST_PER_COIN_LOOKUP each) per reference that isn't the
+# requested symbol itself. A non-BTC/ETH coin therefore costs up to 21.
 
 # Default when a caller doesn't pass its own (e.g. `settings.
 # universe_context_stale_after_hours` from the CLI) - a row older than
@@ -123,16 +129,19 @@ def _handle_coin(
     now: dt.datetime,
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
+    database_url: str | None = None,
 ) -> None:
     if not argument:
         telegram.send_message(chat_id, COIN_USAGE_TEXT)
         return
 
-    if coinalyze.calls_in_last_minute + ESTIMATED_CALL_COST_PER_COIN_LOOKUP > RATE_LIMIT_PER_MINUTE:
+    ccxt_symbol = normalize_coin_input(argument)
+    with_market_context = database_url is not None
+    cost = estimated_call_cost(ccxt_symbol, with_market_context)
+    if coinalyze.calls_in_last_minute + cost > RATE_LIMIT_PER_MINUTE:
         telegram.send_message(chat_id, RATE_LIMITED_TEXT)
         return
 
-    ccxt_symbol = normalize_coin_input(argument)
     try:
         snapshot = fetch_market_intel(coinalyze, cache, ccxt_symbol, venue, now)
     except RateLimitedError:
@@ -150,7 +159,24 @@ def _handle_coin(
 
     position_flow = classify_snapshot(snapshot)
 
-    telegram.send_message(chat_id, render_snapshot(snapshot, universe_context, position_flow))
+    market_context = None
+    if with_market_context and snapshot.market_status == OK:
+        market_context = fetch_market_context(coinalyze, cache, snapshot, venue, now, database_url)
+
+    telegram.send_message(
+        chat_id, render_snapshot(snapshot, universe_context, position_flow, market_context)
+    )
+
+
+def estimated_call_cost(ccxt_symbol: str, with_market_context: bool) -> int:
+    """Coinalyze call-units a `/coin` lookup will spend, for the pre-check.
+    Each snapshot costs `ESTIMATED_CALL_COST_PER_COIN_LOOKUP`; BTC and ETH
+    add one each when market context is on, minus whichever is the coin.
+    """
+    snapshots = 1
+    if with_market_context:
+        snapshots += len(reference_symbols_to_fetch(ccxt_symbol))
+    return ESTIMATED_CALL_COST_PER_COIN_LOOKUP * snapshots
 
 
 def _handle_message(
@@ -163,6 +189,7 @@ def _handle_message(
     now: dt.datetime,
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
+    database_url: str | None = None,
 ) -> None:
     parsed = _parse_command(text)
     if parsed is None:
@@ -181,6 +208,7 @@ def _handle_message(
             now,
             context_engine,
             context_stale_after,
+            database_url,
         )
     elif command in ("/help", "/start"):
         telegram.send_message(chat_id, HELP_TEXT)
@@ -209,6 +237,7 @@ def run_once(
     backlog_max_age: dt.timedelta = STARTUP_BACKLOG_MAX_AGE,
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
+    database_url: str | None = None,
 ) -> RunOnceOutcome:
     """Fetch whatever updates are pending, dispatch each, and persist the
     offset after every single one - so a crash mid-batch reprocesses at
@@ -249,6 +278,7 @@ def run_once(
             now,
             context_engine,
             context_stale_after,
+            database_url,
         )
         processed += 1
         state.save_offset(update_id + 1)
@@ -274,6 +304,7 @@ def run_forever(
     max_iterations: int | None = None,
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
+    database_url: str | None = None,
 ) -> None:
     """Poll forever. The first pass discards a stale startup backlog;
     every pass after that does not. A network failure (or a Telegram
@@ -302,6 +333,7 @@ def run_forever(
                 poll_timeout=poll_timeout,
                 context_engine=context_engine,
                 context_stale_after=context_stale_after,
+                database_url=database_url,
             )
             first_pass = False
             backoff = INITIAL_BACKOFF_SECONDS
