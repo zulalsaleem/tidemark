@@ -76,7 +76,7 @@ from tidemark.market_intel.errors import (
 from tidemark.market_intel.evaluation_store import init_evaluation_store
 from tidemark.market_intel.evaluation_store import make_engine as make_evaluation_engine
 from tidemark.market_intel.future_markets import FutureMarketsCache
-from tidemark.market_intel.market_context import fetch_market_context
+from tidemark.market_intel.market_context import ReferenceSnapshotCache, fetch_market_context
 from tidemark.market_intel.models import OK, MarketIntelSnapshot
 from tidemark.market_intel.service import fetch_market_intel
 from tidemark.market_intel.telegram_client import TelegramBotClient
@@ -1630,6 +1630,7 @@ def intel_bot(
     init_universe_context_store(context_engine)
     context_stale_after = dt.timedelta(hours=settings.universe_context_stale_after_hours)
 
+    reference_cache = ReferenceSnapshotCache()
     if once:
         try:
             outcome = run_once(
@@ -1645,6 +1646,7 @@ def intel_bot(
                 context_engine=context_engine,
                 context_stale_after=context_stale_after,
                 database_url=settings.database_url,
+                reference_cache=reference_cache,
             )
         except TelegramHttpError as exc:
             typer.echo(f"Telegram returned HTTP {exc.status_code}: {exc.detail}")
@@ -1674,6 +1676,7 @@ def intel_bot(
             context_engine=context_engine,
             context_stale_after=context_stale_after,
             database_url=settings.database_url,
+            reference_cache=reference_cache,
         )
     except KeyboardInterrupt:
         typer.echo("Stopped.")
