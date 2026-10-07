@@ -33,7 +33,11 @@ from tidemark.market_intel.errors import (
     UnsupportedVenueError,
 )
 from tidemark.market_intel.future_markets import FutureMarketsCache
-from tidemark.market_intel.market_context import fetch_market_context, reference_symbols_to_fetch
+from tidemark.market_intel.market_context import (
+    ReferenceSnapshotCache,
+    fetch_market_context,
+    uncached_reference_symbols,
+)
 from tidemark.market_intel.models import OK
 from tidemark.market_intel.position_flow import classify_snapshot
 from tidemark.market_intel.service import fetch_market_intel
@@ -54,10 +58,13 @@ logger = logging.getLogger(__name__)
 # client.py) is still caught as a fallback in case this estimate
 # undercounts.
 ESTIMATED_CALL_COST_PER_COIN_LOOKUP = 7
-# Phase A (docs/adr/0011): with a database URL, the lookup also fetches
-# BTC and ETH as market reference points - one more `fetch_market_intel`
-# (ESTIMATED_CALL_COST_PER_COIN_LOOKUP each) per reference that isn't the
-# requested symbol itself. A non-BTC/ETH coin therefore costs up to 21.
+# Phase A (docs/adr/0011): the constant above is the cost of ONE snapshot
+# fetch, and it is also the steady-state cost of a lookup. With a database
+# URL, BTC and ETH join the lookup as reference points, but their snapshots
+# are cached per closed 1H period (`ReferenceSnapshotCache`). So a lookup
+# costs ESTIMATED_CALL_COST_PER_COIN_LOOKUP x (1 + references not yet cached
+# this period): 7 when warm, 21 for a non-BTC/ETH coin that is the first
+# lookup in a new period. The pre-check counts only the uncached ones.
 
 # Default when a caller doesn't pass its own (e.g. `settings.
 # universe_context_stale_after_hours` from the CLI) - a row older than
@@ -130,6 +137,7 @@ def _handle_coin(
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
     database_url: str | None = None,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> None:
     if not argument:
         telegram.send_message(chat_id, COIN_USAGE_TEXT)
@@ -137,7 +145,7 @@ def _handle_coin(
 
     ccxt_symbol = normalize_coin_input(argument)
     with_market_context = database_url is not None
-    cost = estimated_call_cost(ccxt_symbol, with_market_context)
+    cost = estimated_call_cost(ccxt_symbol, with_market_context, now, reference_cache)
     if coinalyze.calls_in_last_minute + cost > RATE_LIMIT_PER_MINUTE:
         telegram.send_message(chat_id, RATE_LIMITED_TEXT)
         return
@@ -161,21 +169,28 @@ def _handle_coin(
 
     market_context = None
     if with_market_context and snapshot.market_status == OK:
-        market_context = fetch_market_context(coinalyze, cache, snapshot, venue, now, database_url)
+        market_context = fetch_market_context(
+            coinalyze, cache, snapshot, venue, now, database_url, reference_cache
+        )
 
     telegram.send_message(
         chat_id, render_snapshot(snapshot, universe_context, position_flow, market_context)
     )
 
 
-def estimated_call_cost(ccxt_symbol: str, with_market_context: bool) -> int:
-    """Coinalyze call-units a `/coin` lookup will spend, for the pre-check.
-    Each snapshot costs `ESTIMATED_CALL_COST_PER_COIN_LOOKUP`; BTC and ETH
-    add one each when market context is on, minus whichever is the coin.
+def estimated_call_cost(
+    ccxt_symbol: str,
+    with_market_context: bool,
+    now: dt.datetime,
+    reference_cache: ReferenceSnapshotCache | None = None,
+) -> int:
+    """Coinalyze call-units this `/coin` lookup will spend right now: the
+    coin's own snapshot, plus each BTC/ETH reference the cache doesn't hold
+    for the current closed period. See the note at the constant above.
     """
     snapshots = 1
     if with_market_context:
-        snapshots += len(reference_symbols_to_fetch(ccxt_symbol))
+        snapshots += len(uncached_reference_symbols(ccxt_symbol, now, reference_cache))
     return ESTIMATED_CALL_COST_PER_COIN_LOOKUP * snapshots
 
 
@@ -190,6 +205,7 @@ def _handle_message(
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
     database_url: str | None = None,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> None:
     parsed = _parse_command(text)
     if parsed is None:
@@ -209,6 +225,7 @@ def _handle_message(
             context_engine,
             context_stale_after,
             database_url,
+            reference_cache,
         )
     elif command in ("/help", "/start"):
         telegram.send_message(chat_id, HELP_TEXT)
@@ -238,6 +255,7 @@ def run_once(
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
     database_url: str | None = None,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> RunOnceOutcome:
     """Fetch whatever updates are pending, dispatch each, and persist the
     offset after every single one - so a crash mid-batch reprocesses at
@@ -279,6 +297,7 @@ def run_once(
             context_engine,
             context_stale_after,
             database_url,
+            reference_cache,
         )
         processed += 1
         state.save_offset(update_id + 1)
@@ -305,6 +324,7 @@ def run_forever(
     context_engine: Engine | None = None,
     context_stale_after: dt.timedelta = DEFAULT_CONTEXT_STALE_AFTER,
     database_url: str | None = None,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> None:
     """Poll forever. The first pass discards a stale startup backlog;
     every pass after that does not. A network failure (or a Telegram
@@ -334,6 +354,7 @@ def run_forever(
                 context_engine=context_engine,
                 context_stale_after=context_stale_after,
                 database_url=database_url,
+                reference_cache=reference_cache,
             )
             first_pass = False
             backoff = INITIAL_BACKOFF_SECONDS

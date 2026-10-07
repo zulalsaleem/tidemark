@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 
+from tidemark.market_intel.clamping import closed_period
 from tidemark.market_intel.client import CoinalyzeClient
 from tidemark.market_intel.context_read import Section1Read, read_section1
 from tidemark.market_intel.errors import (
@@ -41,7 +42,7 @@ from tidemark.market_intel.models import (
 )
 from tidemark.market_intel.position_flow import classify_snapshot
 from tidemark.market_intel.position_flow_classifier import RULEBOOK_VERSION, PositionFlowResult
-from tidemark.market_intel.service import fetch_market_intel
+from tidemark.market_intel.service import DEFAULT_INTERVAL, fetch_market_intel
 
 BTC_SYMBOL = "BTC/USDT:USDT"
 ETH_SYMBOL = "ETH/USDT:USDT"
@@ -369,6 +370,52 @@ def _unavailable_reason(exc: Exception) -> str:
     return "could not reach Coinalyze"
 
 
+class ReferenceSnapshotCache:
+    """In-memory BTC/ETH snapshots for ONE closed 1H period - the period the
+    coin's own data describes. A lookup in the same period reuses them; a
+    lookup in a new period finds nothing and refetches. Holding only the
+    current period bounds memory and means BTC, ETH and the coin never
+    describe different hours. Not persisted: it need not survive a restart.
+    """
+
+    def __init__(self) -> None:
+        self._period_start: dt.datetime | None = None
+        self._snapshots: dict[str, MarketIntelSnapshot] = {}
+
+    def get(self, symbol: str, period_start: dt.datetime) -> MarketIntelSnapshot | None:
+        if period_start != self._period_start:
+            return None
+        return self._snapshots.get(symbol)
+
+    def put(self, symbol: str, period_start: dt.datetime, snapshot: MarketIntelSnapshot) -> None:
+        if period_start != self._period_start:
+            self._period_start = period_start
+            self._snapshots = {}
+        self._snapshots[symbol] = snapshot
+
+
+def _period_start(now: dt.datetime) -> dt.datetime:
+    return closed_period(now, DEFAULT_INTERVAL).start
+
+
+def uncached_reference_symbols(
+    coin_symbol: str,
+    now: dt.datetime,
+    reference_cache: ReferenceSnapshotCache | None,
+) -> tuple[str, ...]:
+    """The reference snapshots a lookup would still have to fetch right now -
+    what the budget pre-check counts. With no cache, all of them.
+    """
+    if reference_cache is None:
+        return reference_symbols_to_fetch(coin_symbol)
+    period_start = _period_start(now)
+    return tuple(
+        symbol
+        for symbol in reference_symbols_to_fetch(coin_symbol)
+        if reference_cache.get(symbol, period_start) is None
+    )
+
+
 def _fetch_reference(
     client: CoinalyzeClient,
     cache: FutureMarketsCache,
@@ -376,12 +423,19 @@ def _fetch_reference(
     venue: str,
     now: dt.datetime,
     database_url: str,
+    reference_cache: ReferenceSnapshotCache | None,
 ) -> AssetContext:
     section1 = read_section1(database_url, symbol, now)
-    try:
-        snapshot = fetch_market_intel(client, cache, symbol, venue, now)
-    except (RateLimitedError, CoinalyzeHttpError, CoinalyzeConnectionError) as exc:
-        return unavailable_asset_context(symbol, _unavailable_reason(exc), section1)
+    period_start = _period_start(now)
+    snapshot = reference_cache.get(symbol, period_start) if reference_cache else None
+    if snapshot is None:
+        try:
+            snapshot = fetch_market_intel(client, cache, symbol, venue, now)
+        except (RateLimitedError, CoinalyzeHttpError, CoinalyzeConnectionError) as exc:
+            # Never cached: the next lookup in this period should try again.
+            return unavailable_asset_context(symbol, _unavailable_reason(exc), section1)
+        if reference_cache is not None and snapshot.market_status == OK:
+            reference_cache.put(symbol, period_start, snapshot)
     return asset_context_from_snapshot(snapshot, section1)
 
 
@@ -392,19 +446,26 @@ def fetch_market_context(
     venue: str,
     now: dt.datetime,
     database_url: str,
+    reference_cache: ReferenceSnapshotCache | None = None,
 ) -> MarketContextBundle:
     """Assembles the full bundle for one coin whose snapshot is already
-    fetched. Only the BTC/ETH snapshots not already in hand are fetched -
-    see `reference_symbols_to_fetch`. A failed reference fetch becomes that
-    asset's UNAVAILABLE context, never an error for the whole reply.
+    fetched. BTC/ETH come from `reference_cache` when it holds them for this
+    closed period; otherwise they are fetched and cached. The coin's own
+    snapshot is cached too when the coin is a reference symbol, so it
+    isn't fetched again in the same period. A failed reference fetch
+    becomes that asset's UNAVAILABLE context, never an error for the reply.
     """
+    period_start = _period_start(now)
     coin = asset_context_from_snapshot(
         coin_snapshot, read_section1(database_url, coin_snapshot.symbol, now)
     )
+    coin_is_reference = coin.symbol in REFERENCE_SYMBOLS
+    if reference_cache is not None and coin_is_reference and coin_snapshot.market_status == OK:
+        reference_cache.put(coin.symbol, period_start, coin_snapshot)
     btc = coin if coin.symbol == BTC_SYMBOL else None
     eth = coin if coin.symbol == ETH_SYMBOL else None
     if btc is None:
-        btc = _fetch_reference(client, cache, BTC_SYMBOL, venue, now, database_url)
+        btc = _fetch_reference(client, cache, BTC_SYMBOL, venue, now, database_url, reference_cache)
     if eth is None:
-        eth = _fetch_reference(client, cache, ETH_SYMBOL, venue, now, database_url)
+        eth = _fetch_reference(client, cache, ETH_SYMBOL, venue, now, database_url, reference_cache)
     return build_market_context(coin, btc, eth)
