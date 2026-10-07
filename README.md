@@ -156,8 +156,7 @@ uv run tidemark run --symbols BTC/USDT:USDT
 # including every WAIT.
 uv run tidemark journal list --symbol BTC/USDT:USDT
 
-# Journal rows flagged as sent. `run` no longer sends, so new alerts are not
-# listed here: the sent history is in the enricher's cursor tables (ADR 0012).
+# Alerts the enricher actually sent, with their send time (ADR 0012).
 uv run tidemark journal alerts
 
 # Send one fixed message to prove TIDEMARK_TELEGRAM_BOT_TOKEN /

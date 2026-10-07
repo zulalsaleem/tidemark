@@ -1039,6 +1039,6 @@ component that reads both the research engine and `market_intel`.
 Changes to this ADR's own decisions: none. The reference cache (7 warm, 21
 cold per lookup) and the point-in-time labelling are unchanged, and the
 `intel alert` preview still works as before. The enricher's own cost is one
-snapshot each for the coin, BTC and ETH per alerted entry (21 call-units),
-since it does not cache across alerts; see ADR 0012.
+snapshot for the coin per alerted entry, plus BTC and ETH once per closed
+period for the whole run (14 + 7N call-units for N alerts); see ADR 0012.
 

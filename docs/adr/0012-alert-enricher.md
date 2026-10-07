@@ -99,38 +99,61 @@ side can fail without silencing the structure.
   arrives only when the enricher runs. A missed enricher run delays
   alerts, but the cursor means nothing is lost: the next run picks up
   every entry in order.
-- **The `journal alerts` command shows nothing for new alerts.** It filters
-  on `journal_entries.alert_sent`, which the enricher cannot write (it may
-  not write research tables), and `run` now always leaves `alert_sent`
-  False. The sent history lives in `alert_enrich_sent` instead, and each
-  send run reports every alert it delivers. `journal alerts` should be
-  rebased onto that table in a follow-up, not patched here.
-- Coinalyze cost. Each alerted entry costs one snapshot for the coin plus
-  one for each of BTC and ETH, 21 call-units, because the enricher does
-  not cache across alerts. The cost is paid only for alerts, which are
-  rare, not for every 4H evaluation. Several alerts in one missed-run
-  catch-up each cost 21, which the client's own rate-limit handling
-  absorbs.
-- **At-least-once in one narrow window.** If Telegram accepts a message
-  and the local record write then fails, the next run will send it again.
-  The window is the gap between a successful `send_text` and the
-  transaction that records it. Closing it needs a two-phase outbox, which
-  this merge doesn't build. The enricher is designed to run as a single
-  scheduled process, so two invocations never overlap.
-- **Single writer assumption.** Two `alert enrich --send` processes running
-  at once could each send an entry before either records it. The systemd
-  timer in the README is a oneshot, which systemd never overlaps with
-  itself. Anyone running it some other way must keep it to one process.
+- **`journal alerts` lists the enricher's sent alerts.** It reads
+  `alert_enrich_sent`, joined back to the journal row each alert describes,
+  and shows the send time. The join lives in `tidemark.enrich`, not in the
+  research store, so the research engine still never imports market_intel.
+  Alerts sent by `tidemark run` before this change are not in the sent
+  table, so they no longer appear in the listing. Their journal rows still
+  carry `alert_sent=True`, and the research store's own `journal_alerts`
+  still returns them.
+- **Coinalyze cost.** One enrich run shares a single `ReferenceSnapshotCache`
+  across its alerts, so BTC and ETH are fetched once per closed period.
+  A catch-up of N alerts in one period costs 7 (coin) x N plus 7 (BTC) plus
+  7 (ETH), which is 14 + 7N call-units, not 21N. Alerts in different closed
+  periods each fetch the references again. An alert is rare, so the cost is
+  paid rarely, not on every 4H evaluation.
 - Section 1 and Section 2 rules, parameters, and thresholds are unchanged.
   The change detector's logic is unchanged; the enricher sends what it
   already decided.
 
+## Accepted limitation: at-least-once delivery in one narrow window
+
+If Telegram accepts a message and the local write that records it then
+fails, the next run sends that alert again. The window is the gap between a
+successful `send_text` returning and the transaction that writes the sent
+record and advances the checkpoint.
+
+**Why this is accepted rather than closed:**
+
+- Telegram's `sendMessage` has no idempotency key, so the enricher cannot
+  ask Telegram whether a message it sent earlier arrived. A two-phase
+  outbox (write "sending", send, then mark "sent") would still leave the
+  same window open, because the mark-sent write can fail after the send
+  succeeds. The only real fix would be a message-side identifier that the
+  recipient could dedupe on. That is a larger design, and it is not needed
+  to meet the goal here.
+- The two failure modes are not equally bad. Losing an alert is worse for a
+  human making decisions than seeing one twice. The window is the few
+  milliseconds between an HTTP 200 and a local commit, and it needs a
+  database write to fail at exactly that moment. A duplicate is visible to
+  the reader, while a lost alert is silent.
+- If the local database stays unwritable, every later run also fails to
+  read or record, so the enricher stops rather than sending repeatedly. The
+  repeat risk exists only for the single failed write, not for a persistent
+  outage.
+
+Mitigation available if it is ever needed: put the journal entry id in the
+message text, so a reader can see a duplicate is the same entry. It is not
+added now, because it would change every alert's text for a rare failure.
+
+**Single writer assumption.** Two `alert enrich --send` processes running at
+once could each send an entry before either records it. The systemd timer
+in the README is a oneshot, which systemd never overlaps with itself. Anyone
+running it some other way must keep it to one process.
+
 ## Open decisions
 
-1. Rebase `journal alerts` onto `alert_enrich_sent` (see Consequences).
-2. Whether the enricher should cache BTC and ETH context across the alerts
-   of a single catch-up run, which would drop the 21-unit cost to 7 per
-   alert after the first. ADR 0011's period cache is the obvious shape, but
-   a catch-up run is rare, so it is not built here.
-3. Whether a send-then-record outbox is worth its complexity, given the
-   narrow window described above.
+1. Whether to put the journal entry id in the message text, so a duplicate
+   from the window above can be recognised by a reader (see the accepted
+   limitation).
