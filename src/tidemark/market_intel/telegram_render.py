@@ -25,8 +25,15 @@ import datetime as dt
 from collections.abc import Callable
 
 from tidemark.market_intel.coin_universe_context import CoinUniverseContext, MetricContext
+from tidemark.market_intel.market_context import (
+    LONG_WATCH,
+    UNAVAILABLE,
+    AssetContext,
+    DerivedResult,
+    MarketContextBundle,
+)
 from tidemark.market_intel.models import MARKET_NOT_FOUND, OK, MarketIntelSnapshot
-from tidemark.market_intel.position_flow_classifier import PositionFlowResult
+from tidemark.market_intel.position_flow_classifier import NO_MATCH, PositionFlowResult
 
 FOOTER = "Data: Coinalyze (Binance USDT-M perpetuals). Market info only — not a trade signal."
 
@@ -261,6 +268,7 @@ def render_snapshot(
     snapshot: MarketIntelSnapshot,
     universe_context: CoinUniverseContext | None = None,
     position_flow: PositionFlowResult | None = None,
+    market_context: MarketContextBundle | None = None,
 ) -> str:
     """Everything `/coin` replies with for one symbol, in three layers.
 
@@ -281,6 +289,11 @@ def render_snapshot(
     than/equal) - never a label like BULLISH/BEARISH/CROWDED. Shown
     only alongside Layer 2, since it exists to accompany the
     classification, not to duplicate Layer 1's own lines.
+
+    MARKET CONTEXT (Phase A): BTC and ETH alongside the coin, relative
+    strength, BTC alignment, liquidation imbalance, and WHAT TO WATCH,
+    appended only when `market_context` is given. `None` (the default)
+    renders exactly as before.
     """
     if snapshot.market_status == MARKET_NOT_FOUND:
         return (
@@ -363,8 +376,241 @@ def render_snapshot(
         context_lines = ["SUPPORTING CONTEXT", ""] + _fmt_supporting_context(snapshot)
         groups.append("\n".join(context_lines))
 
+    if market_context is not None:
+        groups.append(render_market_context_block(market_context, reference))
+
     body = "\n\n".join(groups)
     return f"{snapshot.symbol} ({snapshot.coinalyze_symbol})\n\n{body}\n\n{FOOTER}"
+
+
+# -- market context (Phase A) -------------------------------------------------
+#
+# Every value below is read off a `MarketContextBundle` that
+# `market_context.py` already built. Nothing here compares, classifies, or
+# picks a value - it only states what the bundle says, with each value's
+# LIVE or CLOSED period tag.
+
+# No 15M/5M mention here: those layers are deferred, and the brief bars
+# naming them in any output.
+_MARKET_CONTEXT_FOOTER = "Market information only. Context only, not a trade signal."
+
+
+def _closed_tag(metric, reference: dt.datetime) -> str:
+    return f"CLOSED 1H {_fmt_range(metric.period_start, metric.period_close, reference)}"
+
+
+def _live_tag(metric, reference: dt.datetime) -> str:
+    return f"LIVE, updated {_fmt_instant(metric.updated_at, reference)}"
+
+
+def _metric_text(name: str, metric, fmt: Callable[[float], str], tag) -> str:
+    if metric is None:
+        return f"{name}: UNAVAILABLE"
+    if metric.status != OK:
+        return f"{name}: UNAVAILABLE ({metric.status}: {metric.reason})"
+    return f"{name}: {fmt(metric.value)} ({tag(metric)})"
+
+
+def _signed_pct(value: float) -> str:
+    return f"{value:+.3f}%"
+
+
+def _fmt_section1_line(asset: AssetContext, reference: dt.datetime) -> str:
+    s1 = asset.section1
+    if not s1.available:
+        return f"Section 1 (4H): UNAVAILABLE ({s1.reason})"
+    grade = f" / Grade {s1.grade}" if s1.grade else ""
+    window = _fmt_range(s1.window_start, s1.evaluated_at, reference)
+    return (
+        f"Section 1 (4H): {s1.state} / Watch: {s1.watch}{grade} "
+        f"(CLOSED 4H {window}) · rule {s1.rule_version}"
+    )
+
+
+def _fmt_asset_block(label: str, asset: AssetContext, reference: dt.datetime) -> list[str]:
+    lines = [label, f"  {_fmt_section1_line(asset, reference)}"]
+    if asset.status == UNAVAILABLE:
+        lines.append(f"  Coinalyze: UNAVAILABLE ({asset.reason})")
+        return lines
+
+    pf = asset.position_flow
+    if pf.result == NO_MATCH:
+        lines.append(f"  Position flow (1H): NO_MATCH ({pf.reason})")
+    else:
+        lines.append(f"  Position flow (1H): {pf.result}")
+
+    closed = lambda m: _closed_tag(m, reference)  # noqa: E731 - one-line tag adapter
+    lines.append("  " + _metric_text("Price change", asset.price_change, _signed_pct, closed))
+    lines.append(
+        "  " + _metric_text("OI change (%)", asset.open_interest_change_pct, _signed_pct, closed)
+    )
+    live = lambda m: _live_tag(m, reference)  # noqa: E731 - one-line tag adapter
+    lines.append("  " + _metric_text("Funding rate", asset.funding_rate, _fmt_pct, live))
+
+    ls = asset.long_short_ratio
+    if ls.status != OK:
+        lines.append(f"  Long/short ratio: UNAVAILABLE ({ls.status}: {ls.reason})")
+    else:
+        lines.append(f"  Long/short ratio: {_fmt_ratio(ls.ratio)} ({closed(ls)})")
+
+    liq = asset.liquidations
+    if liq.status != OK:
+        lines.append(f"  Liquidations: UNAVAILABLE ({liq.status}: {liq.reason})")
+    else:
+        lines.append(
+            f"  Liquidations: long={_fmt_usd(liq.long_usd)} / short={_fmt_usd(liq.short_usd)} "
+            f"({closed(liq)})"
+        )
+    return lines
+
+
+def _fmt_relative_strength(bundle: MarketContextBundle, reference: dt.datetime) -> str:
+    rs = bundle.derived.relative_strength
+    if rs.reason is not None:
+        return f"Relative strength vs BTC: {rs.label} ({rs.reason})"
+    coin_pc = bundle.coin.price_change
+    btc_pc = bundle.market.btc.price_change
+    return (
+        f"Relative strength vs BTC: {rs.label} "
+        f"(coin {_signed_pct(coin_pc.value)} vs BTC {_signed_pct(btc_pc.value)}, "
+        f"{_closed_tag(coin_pc, reference)})"
+    )
+
+
+def _fmt_alignment_line(result: DerivedResult) -> str:
+    if result.reason is None:
+        return f"BTC alignment: {result.label}"
+    return f"BTC alignment: {result.label} ({result.reason})"
+
+
+def _fmt_liquidation_imbalance_line(bundle: MarketContextBundle, reference: dt.datetime) -> str:
+    result = bundle.derived.liquidation_imbalance
+    if result.label == UNAVAILABLE:
+        return f"Liquidation imbalance: UNAVAILABLE ({result.reason})"
+    return (
+        f"Liquidation imbalance: {result.label} "
+        f"({_closed_tag(bundle.coin.liquidations, reference)})"
+    )
+
+
+def _fmt_watch_lines(bundle: MarketContextBundle) -> list[str]:
+    """Summarises the layers above. Names only what Section 1 stored and
+    the alignment label, and says 1H behaviour at that level is what to
+    observe. Introduces no rule: no sweeps, reclaims, 15M or 5M layers,
+    no entries.
+    """
+    watch = bundle.watch
+    s1 = bundle.coin.section1
+    if not s1.available:
+        return [f"Section 1 (4H) UNAVAILABLE ({s1.reason}). No 4H WATCH to summarise."]
+    if not watch.active:
+        return [
+            f"No Section 1 WATCH is active for {bundle.coin.symbol} "
+            f"(state {s1.state}, watch {s1.watch}). Nothing to summarise at 1H."
+        ]
+    if watch.level_price is not None:
+        level = f"stored level {watch.level_price:,.2f} ({watch.level_touches} touches)"
+    else:
+        level = "no held level named in the stored record"
+    grade = f" (grade {watch.grade})" if watch.grade else ""
+    observe = (
+        "Observe 1H behaviour at that level."
+        if watch.level_price is not None
+        else "Observe 1H behaviour under this WATCH."
+    )
+    return [
+        f"Section 1 {s1.watch}{grade}, {level}.",
+        f"BTC alignment: {watch.btc_alignment}.",
+        observe,
+    ]
+
+
+def render_market_context_block(bundle: MarketContextBundle, reference: dt.datetime) -> str:
+    """The MARKET CONTEXT section for `/coin` and `intel market`."""
+    parts = [
+        "MARKET CONTEXT",
+        "\n".join(_fmt_asset_block(f"COIN ({bundle.coin.symbol})", bundle.coin, reference)),
+        "\n".join(_fmt_asset_block("BTC (primary reference)", bundle.market.btc, reference)),
+        "\n".join(_fmt_asset_block("ETH (secondary reference)", bundle.market.eth, reference)),
+        "\n".join(
+            [
+                _fmt_relative_strength(bundle, reference),
+                _fmt_alignment_line(bundle.derived.btc_alignment),
+                _fmt_liquidation_imbalance_line(bundle, reference),
+            ]
+        ),
+        "WHAT TO WATCH\n" + "\n".join(_fmt_watch_lines(bundle)),
+    ]
+    return "\n\n".join(parts)
+
+
+def render_watch_alert(bundle: MarketContextBundle, reference: dt.datetime) -> str | None:
+    """The Section 1 WATCH alert in the Phase A format: 4H structure, market
+    context, position flow, key derivatives, WHAT TO WATCH, rulebook
+    versions, and the context-only disclaimer. `None` when no WATCH is
+    active, since no alert exists to send. Concise by design: /coin carries
+    the full detail.
+    """
+    if not bundle.watch.active:
+        return None
+    coin = bundle.coin
+    s1 = coin.section1
+    emoji = "\U0001f7e2" if s1.watch == LONG_WATCH else "\U0001f534"
+    direction = "LONG WATCH" if s1.watch == LONG_WATCH else "SHORT WATCH"
+    grade = f" (Grade {s1.grade})" if s1.grade else ""
+    display = coin.symbol.split(":")[0]
+
+    pf = coin.position_flow
+    if pf.result == NO_MATCH:
+        flow_line = f"NO_MATCH ({pf.reason})"
+    else:
+        flow_line = (
+            f"{pf.result} · price {_signed_pct(pf.price.change_pct)} · "
+            f"OI change {_signed_pct(pf.open_interest.change_pct)}"
+        )
+
+    def short_section1(asset: AssetContext) -> str:
+        if not asset.section1.available:
+            return f"UNAVAILABLE ({asset.section1.reason})"
+        return f"{asset.section1.state} ({asset.section1.watch})"
+
+    funding_line = _metric_text(
+        "Funding", coin.funding_rate, _fmt_pct, lambda m: _live_tag(m, reference)
+    )
+
+    ls = coin.long_short_ratio
+    if ls.status == OK:
+        ls_line = f"Long/short ratio: {_fmt_ratio(ls.ratio)} ({_closed_tag(ls, reference)})"
+    else:
+        ls_line = f"Long/short ratio: UNAVAILABLE ({ls.reason})"
+
+    lines = [
+        f"{emoji} {direction} — {display}{grade}",
+        "",
+        f"4H structure: {s1.state} · CLOSED 4H "
+        f"{_fmt_range(s1.window_start, s1.evaluated_at, reference)}",
+        "",
+        "MARKET CONTEXT",
+        f"BTC 4H: {short_section1(bundle.market.btc)}",
+        f"ETH 4H: {short_section1(bundle.market.eth)}",
+        _fmt_relative_strength(bundle, reference),
+        _fmt_alignment_line(bundle.derived.btc_alignment),
+        _fmt_liquidation_imbalance_line(bundle, reference),
+        "",
+        f"POSITION FLOW ({_closed_tag(coin.price_change, reference)})",
+        flow_line,
+        "",
+        "KEY DERIVATIVES",
+        funding_line,
+        ls_line,
+        "",
+        "WHAT TO WATCH",
+        *_fmt_watch_lines(bundle),
+        "",
+        "Rulebooks: " + ", ".join(bundle.rulebook_versions),
+        _MARKET_CONTEXT_FOOTER,
+    ]
+    return "\n".join(lines)
 
 
 # -- hourly BTC briefing (Merge 3) -------------------------------------------
